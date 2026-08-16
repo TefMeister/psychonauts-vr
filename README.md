@@ -6,7 +6,7 @@ This repo holds the readable, curated write-ups: what was tried, what was learne
 
 ## Status
 
-See `00-status.md` for the current state of the project. As of the latest update: DirectX 9 confirmed, `Direct3DCreate9`/`CreateDevice`/`Present` hook addresses confirmed live via debugger, proxy-DLL injection mechanism in progress.
+See `00-status.md` for the current state of the project. As of the latest update: a first working side-by-side stereo render of the title screen, with a per-eye camera correction confirmed (via a controlled offset comparison) to reach the GPU and visibly change what's rendered — see `14-shader-constant-stereo-hook.md` for the full writeup and honest caveats.
 
 ## Credits
 
