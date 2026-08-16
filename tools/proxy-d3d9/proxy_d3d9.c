@@ -44,10 +44,28 @@
  * addresses/byte dumps used to design the inline hooks, and empirical
  * results.
  *
+ * Milestone 4 (this revision, notes/14): notes/13 found the CPU-side
+ * BuildViewMatrix rewrite above never reached the GPU. This session located
+ * the actual per-draw shader-constant upload responsible
+ * (IDirect3DDevice9::SetVertexShaderConstantF, StartRegister=6,
+ * Vector4fCount=4, one consistent call site exe+0x51D33E) and hooks it (new
+ * COM vtable hook, slot 94) to apply a closed-form clip-space correction -
+ * adding (-d*xScale) to the matrix's row3.x - equivalent to inserting a
+ * view-space translation of d along the camera's local right axis between
+ * View and Proj in a row-vector v*World*View*Proj pipeline, regardless of
+ * what World/View individually were. Also adds a BuildProjectionMatrix
+ * inline hook purely to compute the live xScale (replicating the exact
+ * rawFov->fovy conversion notes/07 disassembled) needed by that correction.
+ * See notes/14-shader-constant-stereo-hook.md for the full derivation,
+ * the register-identification methodology (including a live matrix-
+ * decomposition test that ruled out several other candidate registers), and
+ * empirical results.
+ *
  * Vtable indices used (0-based, standard COM: slot 0/1/2 are always
  * QueryInterface/AddRef/Release):
- *   IDirect3D9::CreateDevice        = slot 16
- *   IDirect3DDevice9::Present       = slot 17
+ *   IDirect3D9::CreateDevice                    = slot 16
+ *   IDirect3DDevice9::Present                   = slot 17
+ *   IDirect3DDevice9::SetVertexShaderConstantF  = slot 94
  * These are NOT guessed - they come from two independent, cross-checked
  * sources: (1) counting fields in the IDirect3D9Vtbl / IDirect3DDevice9Vtbl
  * struct definitions in mingw-w64's own d3d9.h (bundled with the LLVM-MinGW
@@ -85,11 +103,17 @@ typedef HRESULT (STDMETHODCALLTYPE *Present_t)(
     CONST RECT *pDestRect,
     HWND hDestWindowOverride,
     CONST RGNDATA *pDirtyRegion);
+typedef HRESULT (STDMETHODCALLTYPE *SetVertexShaderConstantF_t)(
+    IDirect3DDevice9 *This,
+    UINT StartRegister,
+    CONST float *pConstantData,
+    UINT Vector4fCount);
 
 static HMODULE g_hRealD3D9 = NULL;
 static Direct3DCreate9_t g_pRealDirect3DCreate9 = NULL;
 static CreateDevice_t g_pRealCreateDevice = NULL;
 static Present_t g_pRealPresent = NULL;
+static SetVertexShaderConstantF_t g_pRealSetVSConstF = NULL;
 static BOOL g_d3d9Hooked = FALSE;      /* IDirect3D9::CreateDevice patched? */
 static BOOL g_deviceHooked = FALSE;    /* IDirect3DDevice9::Present patched? */
 static volatile LONG g_frameCounter = 0;
@@ -195,6 +219,7 @@ typedef struct { float x, y, z; } Vec3;
  * this session's own raw-file byte dump (notes/13) which re-confirmed the
  * exact prologue bytes used below to size each inline patch. */
 #define ADDR_BUILDVIEWMATRIX ((BYTE *)0x00692480u)
+#define ADDR_BUILDPROJMATRIX ((BYTE *)0x006924D0u)
 #define ADDR_CANDB           ((BYTE *)0x004FEDA0u)
 
 /* Both prologues are a clean, fully-relocatable 6-byte instruction run
@@ -230,6 +255,33 @@ static BOOL g_frameCamCached = FALSE;
 static Vec3 g_baseEye, g_baseAt, g_baseUp, g_rightVec;
 static void *g_camPOutMatrix = NULL;
 
+/* notes/14: the raw view-matrix rewrite from notes/13 never reached the GPU
+ * because it happens after that frame's ONE shader-constant upload already
+ * ran. This session found the actual per-draw matrix upload:
+ * SetVertexShaderConstantF(StartRegister=6, Vector4fCount=4) - a per-draw
+ * clip-space composite matrix (its caller, exe+0x51D2xx, computes it via two
+ * chained matrix-helper calls, exe+0x433E50 and exe+0x42E2A0, before the
+ * upload). The correction math below needs the live projection matrix's
+ * xScale (Proj[0][0]) - an EARLIER attempt this session cached
+ * BuildProjectionMatrix's pOutMatrix POINTER (mirroring how
+ * g_camPOutMatrix works for the view matrix) and read *pOutMatrix from the
+ * SetVertexShaderConstantF hook, but that produced wildly inconsistent
+ * values (1.0, 0.0, 0.0849 across consecutive reads) - live evidence that,
+ * unlike BuildViewMatrix's pEye/pAt/pUp (confirmed persistent object fields
+ * in notes/09), BuildProjectionMatrix's pOutMatrix is frequently a
+ * SHORT-LIVED caller stack temp: valid only while that caller's own frame is
+ * still on the stack, and BuildProjectionMatrix fires only once or twice
+ * total per session (notes/07), so by the time a later frame's
+ * SetVertexShaderConstantF hook reads it, that stack region has long since
+ * been reused by unrelated code. Fixed by computing xScale directly from
+ * BuildProjectionMatrix's ENTRY ARGUMENTS (rawFov, Aspect) instead, using
+ * the exact conversion formula already disassembled in notes/07 -
+ * eliminates any dependency on the output buffer's lifetime. */
+#define ADDR_FOV_DIV_CONST ((double *)0x00703698u) /* rawFov -> fovy: divide by this... */
+#define ADDR_FOV_MUL_CONST ((float  *)0x00793444u) /* ...then multiply by this (notes/07 disasm) */
+static float g_projXScale = 0.0f;
+static BOOL g_projXScaleValid = FALSE;
+
 /* Trampoline entry points (allocated executable memory, filled in by
  * InstallInlineHooks). Calling through these runs the REAL, unmodified
  * original function body exactly as if the inline patch had never been
@@ -237,6 +289,7 @@ static void *g_camPOutMatrix = NULL;
  * the `asm("name")` GCC/clang extension) so the naked hook functions below
  * can reference them by a guaranteed, un-mangled symbol name. */
 static void *BVM_Trampoline_asm asm("BVM_Trampoline_asm") = NULL;
+static void *BPM_Trampoline_asm asm("BPM_Trampoline_asm") = NULL;
 static void *CandB_Trampoline_asm asm("CandB_Trampoline_asm") = NULL;
 /* Only ever written/read from the raw asm blocks below (never referenced
  * from C code), so the compiler's dead-store elimination would otherwise
@@ -307,33 +360,81 @@ void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
     }
 }
 
+/* Fires on every real BuildProjectionMatrix call (rare - notes/07/13 both
+ * found this fires only when FOV/aspect/resolution actually change, not once
+ * per frame). Computes and caches xScale (the value D3DXMatrixPerspectiveFovRH
+ * would put in the projection matrix's [0][0]) directly from the entry
+ * arguments, replicating the exact rawFov->fovy conversion already
+ * disassembled in notes/07 (fovy = rawFov/ADDR_FOV_DIV_CONST*ADDR_FOV_MUL_CONST,
+ * then xScale = cot(fovy/2)/Aspect) - see the comment on g_projXScale above
+ * for why this replaced an earlier pointer-caching approach. */
+void __cdecl BPM_OnEntry_asm(float rawFov, float aspect) asm("BPM_OnEntry_asm");
+void __cdecl BPM_OnEntry_asm(float rawFov, float aspect)
+{
+    double divConst = *ADDR_FOV_DIV_CONST;
+    float mulConst = *ADDR_FOV_MUL_CONST;
+    float fovy;
+
+    if (aspect <= 0.0f || divConst == 0.0) return;
+
+    fovy = (float)((double)rawFov / divConst) * mulConst;
+    if (fovy <= 0.0f || fovy >= 3.14159265f) return; /* sanity guard */
+
+    g_projXScale = 1.0f / (tanf(fovy * 0.5f) * aspect);
+    g_projXScaleValid = TRUE;
+
+    {
+        static DWORD s_lastLog = 0;
+        DWORD now = GetTickCount();
+        if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
+            LogLine("BPM cache SET: rawFov=%.3f aspect=%.4f fovy=%.4f xScale=%.4f",
+                    rawFov, aspect, fovy, g_projXScale);
+            s_lastLog = now;
+        }
+    }
+}
+
 /* Switches the active render target to the given eye's dedicated offscreen
  * surface and overwrites the cached camera's view matrix in place by
  * directly re-invoking BuildViewMatrix's real, unmodified body (through its
  * trampoline) with a fresh eye position computed from the cached clean base
  * - never from a read-back already-offset value. */
-static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf)
+static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf, BOOL explicitClear)
 {
     if (!g_stereoReady || !g_pDevice || !targetSurf) return;
 
     g_pDevice->lpVtbl->SetRenderTarget(g_pDevice, 0, targetSurf);
+
+    /* notes/14 background-layer-bug investigation: both eyes' offscreen
+     * targets share the device's single auto depth-stencil surface (never
+     * reassigned via SetDepthStencilSurface) - if CandB's own internal
+     * Clear() calls somehow don't unconditionally reset depth/stencil on
+     * every invocation, eye 2's background draws could silently fail a
+     * depth test against eye 1's leftover depth values. Explicitly clearing
+     * color+depth+stencil here, before CandB's real body runs for THIS eye,
+     * tests that cheaply regardless of whatever CandB does internally.
+     * Empirically (this session): clearing BOTH eyes flipped which eye's
+     * background was missing (eye1 went blank, eye2's fixed itself) rather
+     * than fixing both - clearing is gated per-eye by the caller so this can
+     * be isolated/compared; see notes/14 for the full experiment log. */
+    if (explicitClear) {
+        g_pDevice->lpVtbl->Clear(g_pDevice, 0, NULL,
+                                  D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
+                                  D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
+    }
 
     if (g_frameCamCached && g_camPOutMatrix && g_realBuildViewMatrix) {
         Vec3 eye;
         eye.x = g_baseEye.x + g_rightVec.x * STEREO_HALF_IPD * sign;
         eye.y = g_baseEye.y + g_rightVec.y * STEREO_HALF_IPD * sign;
         eye.z = g_baseEye.z + g_rightVec.z * STEREO_HALF_IPD * sign;
-        /* NOTE (see notes/13): this write was empirically confirmed to land
-         * correctly in *pOutMatrix (verified via read-back during this
-         * session's diagnostic pass), but was ALSO confirmed to have no
-         * visible effect on the rendered image even at 18x the realistic
-         * offset magnitude - almost certainly because the actual camera
-         * data consumed by CandB's draws is vertex shader constants
-         * uploaded once earlier in the frame (before CandB runs), not a
-         * live re-read of this matrix buffer. Left in place as the
-         * documented, structurally-correct injection call; the real fix
-         * needs the shader-constant upload call site (notes/07 flagged
-         * this gap and it's still open - see notes/13 "what's next"). */
+        /* This CPU-side matrix rewrite (confirmed by notes/13 to land
+         * correctly in *pOutMatrix) is kept as a structurally-correct,
+         * belt-and-suspenders injection alongside notes/14's real fix (the
+         * SetVertexShaderConstantF correction below) - it has no confirmed
+         * effect on its own (notes/13), since the actual per-draw matrix the
+         * GPU uses is uploaded via shader constants, not re-read from this
+         * buffer at draw time. */
         g_realBuildViewMatrix(g_camPOutMatrix, &eye, &g_baseAt, &g_baseUp);
     }
 }
@@ -365,14 +466,14 @@ void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
 {
     g_stereoPhase = STEREO_PHASE_EYE1;
-    SetEyeAndTarget(-1.0f, g_pEye1Surf);
+    SetEyeAndTarget(-1.0f, g_pEye1Surf, FALSE);
 }
 
 void __cdecl CandB_BeforeEye2_asm(void) asm("CandB_BeforeEye2_asm");
 void __cdecl CandB_BeforeEye2_asm(void)
 {
     g_stereoPhase = STEREO_PHASE_EYE2;
-    SetEyeAndTarget(+1.0f, g_pEye2Surf);
+    SetEyeAndTarget(+1.0f, g_pEye2Surf, TRUE);
 }
 
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
@@ -427,6 +528,24 @@ __attribute__((naked)) void Hook_BuildViewMatrix(void)
         "call BVM_OnEntry_asm\n\t"
         "addl $16, %esp\n\t"
         "jmp *BVM_Trampoline_asm\n\t"
+    );
+}
+
+/* Same tail-jmp shape as Hook_BuildViewMatrix, adapted for
+ * BuildProjectionMatrix(pOutMatrix, rawFov, Aspect, zn, zf) - only rawFov
+ * and Aspect (both raw 4-byte float stack args - pushed/read as plain
+ * 32-bit values here, exactly how __cdecl already represents them on the
+ * stack) are needed. */
+__attribute__((naked)) void Hook_BuildProjectionMatrix(void)
+{
+    __asm__ __volatile__(
+        "movl 8(%esp), %eax\n\t"   /* rawFov */
+        "movl 12(%esp), %ecx\n\t"  /* Aspect */
+        "pushl %ecx\n\t"
+        "pushl %eax\n\t"
+        "call BPM_OnEntry_asm\n\t"
+        "addl $8, %esp\n\t"
+        "jmp *BPM_Trampoline_asm\n\t"
     );
 }
 
@@ -499,22 +618,25 @@ static BOOL PatchJump(BYTE *originalFuncAddr, int patchLen, void *hookFuncAddr)
 static BOOL InstallInlineHooks(void)
 {
     void *bvmTrampoline = MakeTrampoline(ADDR_BUILDVIEWMATRIX, INLINE_PATCH_LEN);
+    void *bpmTrampoline = MakeTrampoline(ADDR_BUILDPROJMATRIX, INLINE_PATCH_LEN);
     void *candbTrampoline = MakeTrampoline(ADDR_CANDB, INLINE_PATCH_LEN);
 
-    if (!bvmTrampoline || !candbTrampoline) {
-        LogLine("ERROR: MakeTrampoline failed (bvm=%p candb=%p)", bvmTrampoline, candbTrampoline);
+    if (!bvmTrampoline || !bpmTrampoline || !candbTrampoline) {
+        LogLine("ERROR: MakeTrampoline failed (bvm=%p bpm=%p candb=%p)", bvmTrampoline, bpmTrampoline, candbTrampoline);
         return FALSE;
     }
 
     BVM_Trampoline_asm = bvmTrampoline;
+    BPM_Trampoline_asm = bpmTrampoline;
     CandB_Trampoline_asm = candbTrampoline;
     g_realBuildViewMatrix = (BuildViewMatrixFn)bvmTrampoline;
 
     if (!PatchJump(ADDR_BUILDVIEWMATRIX, INLINE_PATCH_LEN, (void *)Hook_BuildViewMatrix)) return FALSE;
+    if (!PatchJump(ADDR_BUILDPROJMATRIX, INLINE_PATCH_LEN, (void *)Hook_BuildProjectionMatrix)) return FALSE;
     if (!PatchJump(ADDR_CANDB, INLINE_PATCH_LEN, (void *)Hook_CandB)) return FALSE;
 
-    LogLine("Installed inline hooks: BuildViewMatrix @0x%p (trampoline=0x%p), CandB @0x%p (trampoline=0x%p)",
-            (void *)ADDR_BUILDVIEWMATRIX, bvmTrampoline, (void *)ADDR_CANDB, candbTrampoline);
+    LogLine("Installed inline hooks: BuildViewMatrix @0x%p (trampoline=0x%p), BuildProjectionMatrix @0x%p (trampoline=0x%p), CandB @0x%p (trampoline=0x%p)",
+            (void *)ADDR_BUILDVIEWMATRIX, bvmTrampoline, (void *)ADDR_BUILDPROJMATRIX, bpmTrampoline, (void *)ADDR_CANDB, candbTrampoline);
     return TRUE;
 }
 
@@ -546,6 +668,85 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
                     g_pRealBackBuffer && g_pEye1Surf && g_pEye2Surf;
 
     LogLine("Stereo ready = %d", g_stereoReady ? 1 : 0);
+}
+
+/* Register that carries the per-draw clip-space composite matrix identified
+ * this session (notes/14) - StartRegister=6, always Vector4fCount=4,
+ * consistently uploaded from one call site (exe+0x51D33E). Verified NOT to
+ * be a simple World*View*Proj derivable from the tracked BuildViewMatrix
+ * output (16 sampled uploads across 2 different live camera states all
+ * failed a matrix-decomposition sanity check - see notes/14 for the full
+ * derivation), so this correction is applied as an experiment: a uniform
+ * additive shift to the matrix's row3 (translation row, the last 4 floats)
+ * X component. This is the closed-form result of inserting a view-space
+ * translation T(-d,0,0,0) between View and Proj in a row-vector v*World*
+ * View*Proj pipeline - IF this matrix truly ends in Proj as demonstrated by
+ * xScale below, that shift is exactly the right correction for a rigid
+ * (non-toe-in) eye offset of d along the camera's local right axis,
+ * regardless of what World/View individually were (see notes/14 derivation).
+ * If the matrix's structure differs from that assumption, this simply has no
+ * effect (or an inconsistent one) - which is itself the point of testing it
+ * live rather than only reasoning about it further. */
+#define STEREO_WVP_REGISTER 6
+
+static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
+    IDirect3DDevice9 *This,
+    UINT StartRegister,
+    CONST float *pConstantData,
+    UINT Vector4fCount)
+{
+    if (g_stereoPhase != STEREO_PHASE_IDLE &&
+        StartRegister == STEREO_WVP_REGISTER && Vector4fCount == 4 &&
+        pConstantData != NULL && g_projXScaleValid) {
+
+        float patched[16];
+        float xScale = g_projXScale;
+        float sign = (g_stereoPhase == STEREO_PHASE_EYE1) ? -1.0f : 1.0f;
+        float d = STEREO_HALF_IPD * sign;
+
+        memcpy(patched, pConstantData, sizeof(patched));
+        patched[12] += (-d) * xScale;
+
+        {
+            static DWORD s_lastLog = 0;
+            DWORD now = GetTickCount();
+            if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
+                LogLine("SVSCF stereo-correct: reg=%u phase=%ld xScale=%.4f d=%.3f delta=%.4f",
+                        StartRegister, g_stereoPhase, xScale, d, (-d) * xScale);
+                s_lastLog = now;
+            }
+        }
+
+        return g_pRealSetVSConstF(This, StartRegister, patched, Vector4fCount);
+    }
+
+    return g_pRealSetVSConstF(This, StartRegister, pConstantData, Vector4fCount);
+}
+
+/* Patch IDirect3DDevice9::SetVertexShaderConstantF (vtbl slot 94). Same
+ * VirtualProtect-then-restore pattern as InstallPresentHook; deliberately a
+ * SEPARATE VirtualProtect call (not folded into InstallPresentHook) so the
+ * two hooks stay independently diagnosable/removable. */
+static void InstallSetVSConstFHook(IDirect3DDevice9 *pDevice)
+{
+    IDirect3DDevice9Vtbl *vtbl;
+    DWORD oldProtect;
+
+    if (g_pRealSetVSConstF != NULL || pDevice == NULL) return;
+
+    vtbl = (IDirect3DDevice9Vtbl *)pDevice->lpVtbl;
+
+    if (!VirtualProtect(vtbl, sizeof(*vtbl), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        LogLine("ERROR: VirtualProtect failed patching SetVertexShaderConstantF, err=%lu", GetLastError());
+        return;
+    }
+
+    g_pRealSetVSConstF = vtbl->SetVertexShaderConstantF;
+    vtbl->SetVertexShaderConstantF = Hook_SetVertexShaderConstantF;
+
+    VirtualProtect(vtbl, sizeof(*vtbl), oldProtect, &oldProtect);
+
+    LogLine("Hooked IDirect3DDevice9::SetVertexShaderConstantF (vtable slot 94), original=0x%p", (void *)g_pRealSetVSConstF);
 }
 
 /* ---- Present hook (IDirect3DDevice9 vtable slot 17) -------------------- */
@@ -690,6 +891,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
 
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
         InstallPresentHook(*ppReturnedDeviceInterface);
+        InstallSetVSConstFHook(*ppReturnedDeviceInterface);
         if (pPresentationParameters) {
             SetupStereoSurfaces(*ppReturnedDeviceInterface, pPresentationParameters);
         }
