@@ -6,6 +6,7 @@
 $ErrorActionPreference = "Stop"
 
 $candidates = @(
+    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-20260616-ucrt-x86_64\bin\i686-w64-mingw32-clang.exe",
     "$env:LOCALAPPDATA\Programs\llvm-mingw\bin\i686-w64-mingw32-clang.exe",
     "C:\Program Files\llvm-mingw\bin\i686-w64-mingw32-clang.exe"
 )
@@ -37,4 +38,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Built: $out"
-& file $out 2>$null
+Get-Item $out | Select-Object Name, Length, LastWriteTime
