@@ -1,8 +1,48 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (keystate-mechanism trace + register-6 transpose confirmation session)
+Last updated: 2026-08-16 (stereo-correction index-bug fix + action-slot-4 ruled-out session)
 
 ## Latest status (read this first)
+
+**Two leads worked this session, picking up exactly where notes/17 left off — a fix for a real
+mathematical bug in the stereo correction (Lead 2), and a live direct-write test that rules out a
+strong input-blocker candidate (Lead 1).** Full detail in
+`notes/18-stereo-index-bug-fix-and-input-slot4-ruled-out.md`. Headline findings:
+
+- **Lead 2: a real, confirmed bug found and fixed in the stereo correction, re-verified with full
+  notes/14-grade rigor, and pushed to the mod repo.** notes/17 confirmed the register-6 upload is
+  `Transpose(WVP)`, computed in-place before `SetVertexShaderConstantF` is ever called. Re-deriving
+  notes/14's correction against that confirmed structure found the derivation itself was sound, but
+  the code was patching the wrong flat index — `floats[12]` (which in the transposed upload buffer is
+  `WVP[0][3]`, an unrelated element that distorts the perspective divide as a function of each vertex's
+  own object-space X) instead of `floats[3]` (`WVP[3][0]`, the actual translation-row element that
+  produces a clean uniform clip-space shift). Fixed with a one-line index change in
+  `tools/proxy-d3d9/proxy_d3d9.c`. Re-verified via the same controlled 0/3.25/60-unit screenshot
+  comparison notes/14 used (all three landed on the same deterministic attract-mode camera shot,
+  confirmed via matching logged eye/at values): matches at zero, diverges reproducibly at 3.25 with a
+  now more coherent signature (same shapes, differing brightness/prominence, rather than the old bug's
+  differing pattern character), and the logged correction delta scales exactly with magnitude
+  (4.9976→92.2637, ratio 18.458 = 60/3.25 exactly) at the 60-unit diagnostic. Pushed to the public mod
+  repo this session.
+- **Lead 1: real further narrowing, still not behavior-changing.** Fully disassembled the next
+  consumer layer down from notes/17's stopping point: `IsActionJustPressed(actionSlot)` (loops the 3
+  keybinding categories for a given abstracted slot) and a top-level "confirm"/"cancel" UI dispatcher
+  that ORs `RETURN`/`SPACE`/a virtual gamepad-code/`actionSlot==4` for confirm. Live-confirmed
+  `actionSlot==4` is actively polled every frame at the idle title screen with real keybindings
+  (`SPACE` plus DIK `0x19`). **Directly forced its return value to `TRUE` 35 times over an 18-second
+  window (essentially every poll) at its own `ret` instruction** — the exact "write into the
+  consumption point" technique the task called for — and the title screen did not move (screenshots
+  identical before/during/after). This is a clean negative result that rules out this specific
+  consumer (distinct from notes/17's null-callback finding, which was about a different mechanism
+  entirely). A follow-up attempt to test the top-level dispatcher directly was inconclusive, honestly
+  flagged as confounded by accumulated live-session state (several stray debugger/python processes
+  from rapid attach/detach cycles) rather than a real finding either way — stopped rather than chased
+  further, per the task's own methodological-discipline guidance. Three concrete next steps identified
+  in notes/18 §2d.
+- **Mod repo: pushed this session** (Lead 2's confirmed fix only — Lead 1 did not reach a behavior
+  change). Workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (keystate-mechanism trace + register-6 transpose confirmation session, still valid)
 
 **Two leads worked this session — a deep live trace of the real keyboard-input mechanism (Lead 1),
 and a decisive live stack trace settling the register-6 transpose mystery (Lead 2).** Full detail in
