@@ -1,32 +1,43 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (proxy-DLL validation session)
+Last updated: 2026-08-16 (CreateDevice/Present vtable-hook session)
 
 ## Latest status (read this first)
 
-The minimal logging proxy `d3d9.dll` is **built and validated end-to-end**. No C/C++ compiler
-existed on this machine; installed LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`)
-to get an `i686-w64-mingw32-clang` 32-bit target compiler (game is 32-bit). The proxy
-(`tools/proxy-d3d9/`) exports `Direct3DCreate9`, loads the real `C:\Windows\system32\d3d9.dll`
-by full path (never a bare `LoadLibraryA("d3d9.dll")`, to avoid recursively loading itself),
-forwards the call unmodified, and logs to `%TEMP%\psychonautsvr_proxy.log`. Copied into the game
-directory, launched `Psychonauts.exe` directly (no debugger needed for this test), and confirmed
-the log file was written with the real call captured — proving the injection mechanism works and
-the game accepts a proxy DLL with no anti-tamper pushback. The real `Direct3DCreate9` address
-resolved by the proxy (`d3d9.dll base + 0x64B20`) exactly matches the offset independently found
-via x64dbg in the prior session — good cross-confirmation. Test DLL was removed from the game
-directory and the game process killed immediately after validating; only `tools/proxy-d3d9/`
-in the workspace retains a copy. Full detail: `notes/05-proxy-dll-validation.md`.
+The proxy `d3d9.dll` (`tools/proxy-d3d9/`) now **vtable-hooks `IDirect3D9::CreateDevice` (slot 16)
+and `IDirect3DDevice9::Present` (slot 17)**, in addition to the previously-validated
+`Direct3DCreate9` forwarding — still pure observation, every hook calls straight through to the
+real implementation and returns its result unmodified. Both slot indices were cross-checked two
+ways (counting fields in mingw-w64's own `d3d9.h` vtbl structs, and the prior live x64dbg session
+that read the same slots out of live process memory) and patched by assigning the named vtbl
+struct fields (`lpVtbl->CreateDevice = ...`, `lpVtbl->Present = ...`) rather than raw pointer-index
+math, so the compiler — not manual offset arithmetic — guarantees the correct slot. Live-validated
+by copying into the game dir and launching `Psychonauts.exe` directly: `CreateDevice` fired once
+with full `D3DPRESENT_PARAMETERS` logged (640×480 windowed, `D3DFMT_A8R8G8B8` backbuffer,
+`D3DFMT_D24S8` depth/stencil, `BehaviorFlags=0x46` matching the live-debug session exactly), and
+`Present` fired repeatedly at a steady ~30 fps (frame counter `1→29→59→89→119→149` across six
+~1-second-apart throttled log lines) — proving the per-frame hook point is real and durable, not a
+one-shot artifact. Test DLL removed from the game directory and the game process killed
+immediately after validating, exactly as before. Full detail:
+`notes/06-createdevice-present-hooks.md`.
 
-**Proposed next milestone**: extend the same proxy DLL to hook `IDirect3D9::CreateDevice` and
-`IDirect3DDevice9::Present` via vtable patching (addresses already known from the live-debug
-session: `d3d9.dll+0x6F750` / `d3d9.dll+0xE6120`), logging `D3DPRESENT_PARAMETERS` and per-frame
-`Present` calls — still observation only, no rendering changes. That builds the actual
-infrastructure (a live device handle + a hook that fires every frame) needed before the real
-work: use x64dbg to disassemble the callers of the `D3DXMatrixPerspectiveFovRH`/
-`D3DXMatrixLookAtRH` call sites (`exe+0x292525`/`exe+0x2924B1`, found in the live-debug session)
-to find the actual per-eye view/projection injection point, then create a second render target
-for the other eye.
+**Proposed next milestone**: use x64dbg to disassemble the functions *containing* the
+`D3DXMatrixPerspectiveFovRH` (`exe+0x292525`) / `D3DXMatrixLookAtRH` (`exe+0x2924B1`) call sites
+(already located, not yet disassembled) to find where FOV/aspect ratio and view matrices are
+actually computed — the real per-eye injection point. In parallel/afterward, use the now-hooked
+`CreateDevice` to create a second render target (`CreateRenderTarget`/`CreateTexture`, sized to
+match the backbuffer) purely to prove a second surface can be stood up against this device/driver
+— still no compositing/stereo logic yet, just infrastructure.
+
+## Prior milestone (proxy-DLL validation session, still valid)
+
+The minimal logging proxy `d3d9.dll` was **built and validated end-to-end** as plain
+load-and-forward (no vtable hooking yet at that point). No C/C++ compiler existed on this machine;
+installed LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`) to get an
+`i686-w64-mingw32-clang` 32-bit target compiler (game is 32-bit). The real `Direct3DCreate9`
+address resolved by the proxy (`d3d9.dll base + 0x64B20`) exactly matched the offset independently
+found via x64dbg in the live-debug session — good cross-confirmation. Full detail:
+`notes/05-proxy-dll-validation.md`.
 
 ## Prior milestone (live-debug session, still valid)
 

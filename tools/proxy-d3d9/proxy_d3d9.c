@@ -4,20 +4,64 @@
  * Purpose: validate that a DLL dropped into the game directory as "d3d9.dll"
  * gets loaded by the game and that its single imported entry point,
  * Direct3DCreate9, gets called - WITHOUT changing any game behavior. It loads
- * the real system d3d9.dll and forwards the call unmodified. No vtable
- * hooking, no interface wrapping yet - that's the next milestone.
+ * the real system d3d9.dll and forwards the call unmodified.
+ *
+ * Milestone 2 (this revision): also vtable-hooks IDirect3D9::CreateDevice and
+ * IDirect3DDevice9::Present, purely to observe (log) D3DPRESENT_PARAMETERS and
+ * confirm Present fires every frame. Still no behavior changes - every hook
+ * calls straight through to the real implementation and returns its result
+ * unmodified.
+ *
+ * Vtable indices used (0-based, standard COM: slot 0/1/2 are always
+ * QueryInterface/AddRef/Release):
+ *   IDirect3D9::CreateDevice        = slot 16
+ *   IDirect3DDevice9::Present       = slot 17
+ * These are NOT guessed - they come from two independent, cross-checked
+ * sources: (1) counting fields in the IDirect3D9Vtbl / IDirect3DDevice9Vtbl
+ * struct definitions in mingw-w64's own d3d9.h (bundled with the LLVM-MinGW
+ * toolchain used to build this DLL - see the STDMETHOD() ordering in that
+ * header), and (2) a prior live x64dbg session that read the *actual* vtable
+ * out of process memory and breakpointed both slots successfully (see
+ * notes/04-live-debug-findings.md, "vtable slot 16 read live + breakpoint
+ * hit" / "slot 17 read live + ... breakpoint hit confirmed"). Rather than
+ * hardcode raw slot numbers into pointer arithmetic (easy to get subtly
+ * wrong), the hooks below patch the named function-pointer fields of the
+ * real d3d9.h vtbl structs directly (This->lpVtbl->CreateDevice = ...,
+ * ->lpVtbl->Present = ...) so the compiler - not manual offset math -
+ * guarantees the correct slot is patched.
  *
  * Build target: 32-bit (i686), matching the 32-bit Psychonauts.exe.
  */
 
 #include <windows.h>
+#include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
 
-typedef void *(WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
+typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
+typedef HRESULT (STDMETHODCALLTYPE *CreateDevice_t)(
+    IDirect3D9 *This,
+    UINT Adapter,
+    D3DDEVTYPE DeviceType,
+    HWND hFocusWindow,
+    DWORD BehaviorFlags,
+    D3DPRESENT_PARAMETERS *pPresentationParameters,
+    IDirect3DDevice9 **ppReturnedDeviceInterface);
+typedef HRESULT (STDMETHODCALLTYPE *Present_t)(
+    IDirect3DDevice9 *This,
+    CONST RECT *pSourceRect,
+    CONST RECT *pDestRect,
+    HWND hDestWindowOverride,
+    CONST RGNDATA *pDirtyRegion);
 
 static HMODULE g_hRealD3D9 = NULL;
 static Direct3DCreate9_t g_pRealDirect3DCreate9 = NULL;
+static CreateDevice_t g_pRealCreateDevice = NULL;
+static Present_t g_pRealPresent = NULL;
+static BOOL g_d3d9Hooked = FALSE;      /* IDirect3D9::CreateDevice patched? */
+static BOOL g_deviceHooked = FALSE;    /* IDirect3DDevice9::Present patched? */
+static volatile LONG g_frameCounter = 0;
+static DWORD g_lastPresentLogTick = 0;
 static CRITICAL_SECTION g_logLock;
 static BOOL g_logLockInit = FALSE;
 
@@ -108,10 +152,141 @@ static BOOL LoadRealD3D9(void)
     return TRUE;
 }
 
-/* The one and only export the game imports from d3d9.dll. */
-__declspec(dllexport) void *WINAPI Direct3DCreate9(UINT SDKVersion)
+/* ---- Present hook (IDirect3DDevice9 vtable slot 17) -------------------- */
+/*
+ * Fires once per frame. Logging every single call would spam the log file
+ * and add per-frame disk I/O under the same critical section other hooks
+ * use, so this throttles to roughly once per second (wall-clock, via
+ * GetTickCount - robust to any framerate) while still incrementing a total
+ * frame counter every call, so the log shows real elapsed-frame deltas.
+ */
+static HRESULT STDMETHODCALLTYPE Hook_Present(
+    IDirect3DDevice9 *This,
+    CONST RECT *pSourceRect,
+    CONST RECT *pDestRect,
+    HWND hDestWindowOverride,
+    CONST RGNDATA *pDirtyRegion)
 {
-    void *result;
+    LONG frame = InterlockedIncrement(&g_frameCounter);
+    DWORD now = GetTickCount();
+
+    if (g_lastPresentLogTick == 0 || (DWORD)(now - g_lastPresentLogTick) >= 1000) {
+        LogLine("Present() hit - total frame #%ld (throttled ~1 log/sec)", frame);
+        g_lastPresentLogTick = now;
+    }
+
+    return g_pRealPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+}
+
+/* Patch IDirect3DDevice9::Present (vtbl slot 17) to point at our hook.
+ * The vtable pointed to by This->lpVtbl is a single shared, normally
+ * read-only structure (typically in the real d3d9.dll's .rdata), so it must
+ * be made writable with VirtualProtect before patching and restored after.
+ * Guarded by g_deviceHooked so a second CreateDevice call (should one ever
+ * happen) doesn't re-patch an already-patched vtable. */
+static void InstallPresentHook(IDirect3DDevice9 *pDevice)
+{
+    IDirect3DDevice9Vtbl *vtbl;
+    DWORD oldProtect;
+
+    if (g_deviceHooked || pDevice == NULL) return;
+
+    vtbl = (IDirect3DDevice9Vtbl *)pDevice->lpVtbl;
+
+    if (!VirtualProtect(vtbl, sizeof(*vtbl), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        LogLine("ERROR: VirtualProtect failed patching IDirect3DDevice9 vtable, err=%lu", GetLastError());
+        return;
+    }
+
+    g_pRealPresent = vtbl->Present;
+    vtbl->Present = Hook_Present;
+
+    VirtualProtect(vtbl, sizeof(*vtbl), oldProtect, &oldProtect);
+
+    g_deviceHooked = TRUE;
+    LogLine("Hooked IDirect3DDevice9::Present (vtable slot 17), original=0x%p", (void *)g_pRealPresent);
+}
+
+/* ---- CreateDevice hook (IDirect3D9 vtable slot 16) ---------------------- */
+static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
+    IDirect3D9 *This,
+    UINT Adapter,
+    D3DDEVTYPE DeviceType,
+    HWND hFocusWindow,
+    DWORD BehaviorFlags,
+    D3DPRESENT_PARAMETERS *pPresentationParameters,
+    IDirect3DDevice9 **ppReturnedDeviceInterface)
+{
+    HRESULT hr;
+
+    LogLine("CreateDevice() called: Adapter=%u DeviceType=%d hFocusWindow=0x%p BehaviorFlags=0x%lX",
+            Adapter, (int)DeviceType, (void *)hFocusWindow, (unsigned long)BehaviorFlags);
+
+    if (pPresentationParameters) {
+        LogLine("  D3DPRESENT_PARAMETERS: Windowed=%d BackBufferWidth=%u BackBufferHeight=%u "
+                "BackBufferFormat=%d BackBufferCount=%u hDeviceWindow=0x%p SwapEffect=%d "
+                "EnableAutoDepthStencil=%d AutoDepthStencilFormat=%d "
+                "FullScreen_RefreshRateInHz=%u PresentationInterval=0x%X Flags=0x%lX",
+                pPresentationParameters->Windowed,
+                pPresentationParameters->BackBufferWidth,
+                pPresentationParameters->BackBufferHeight,
+                (int)pPresentationParameters->BackBufferFormat,
+                pPresentationParameters->BackBufferCount,
+                (void *)pPresentationParameters->hDeviceWindow,
+                (int)pPresentationParameters->SwapEffect,
+                pPresentationParameters->EnableAutoDepthStencil,
+                (int)pPresentationParameters->AutoDepthStencilFormat,
+                pPresentationParameters->FullScreen_RefreshRateInHz,
+                pPresentationParameters->PresentationInterval,
+                (unsigned long)pPresentationParameters->Flags);
+    } else {
+        LogLine("  WARNING: pPresentationParameters is NULL");
+    }
+
+    hr = g_pRealCreateDevice(This, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
+                              pPresentationParameters, ppReturnedDeviceInterface);
+
+    LogLine("Real CreateDevice returned hr=0x%08lX, IDirect3DDevice9*=0x%p",
+            (unsigned long)hr,
+            (ppReturnedDeviceInterface && SUCCEEDED(hr)) ? (void *)*ppReturnedDeviceInterface : NULL);
+
+    if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
+        InstallPresentHook(*ppReturnedDeviceInterface);
+    }
+
+    return hr;
+}
+
+/* Patch IDirect3D9::CreateDevice (vtbl slot 16) to point at our hook. Same
+ * VirtualProtect-then-restore pattern and same-object idempotency guard as
+ * InstallPresentHook above. */
+static void InstallCreateDeviceHook(IDirect3D9 *pD3D9)
+{
+    IDirect3D9Vtbl *vtbl;
+    DWORD oldProtect;
+
+    if (g_d3d9Hooked || pD3D9 == NULL) return;
+
+    vtbl = (IDirect3D9Vtbl *)pD3D9->lpVtbl;
+
+    if (!VirtualProtect(vtbl, sizeof(*vtbl), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        LogLine("ERROR: VirtualProtect failed patching IDirect3D9 vtable, err=%lu", GetLastError());
+        return;
+    }
+
+    g_pRealCreateDevice = vtbl->CreateDevice;
+    vtbl->CreateDevice = Hook_CreateDevice;
+
+    VirtualProtect(vtbl, sizeof(*vtbl), oldProtect, &oldProtect);
+
+    g_d3d9Hooked = TRUE;
+    LogLine("Hooked IDirect3D9::CreateDevice (vtable slot 16), original=0x%p", (void *)g_pRealCreateDevice);
+}
+
+/* The one and only export the game imports from d3d9.dll. */
+__declspec(dllexport) IDirect3D9 *WINAPI Direct3DCreate9(UINT SDKVersion)
+{
+    IDirect3D9 *result;
 
     LogLine("Direct3DCreate9(SDKVersion=0x%X) called - forwarding to real d3d9.dll", SDKVersion);
 
@@ -122,7 +297,11 @@ __declspec(dllexport) void *WINAPI Direct3DCreate9(UINT SDKVersion)
 
     result = g_pRealDirect3DCreate9(SDKVersion);
 
-    LogLine("Real Direct3DCreate9 returned IDirect3D9* = 0x%p", result);
+    LogLine("Real Direct3DCreate9 returned IDirect3D9* = 0x%p", (void *)result);
+
+    if (result) {
+        InstallCreateDeviceHook(result);
+    }
 
     return result;
 }
