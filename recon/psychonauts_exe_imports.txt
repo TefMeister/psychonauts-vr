@@ -1,0 +1,71 @@
+﻿=== PE HEADER SUMMARY ===
+File: D:\Program Files (x86)\Steam\steamapps\common\Psychonauts\Psychonauts.exe
+Machine: IMAGE_FILE_MACHINE_I386 (x86, 32-bit)
+PE Type: PE32 (32-bit)
+Subsystem: IMAGE_SUBSYSTEM_WINDOWS_GUI
+Linker Version: 9.0
+Number of Sections: 6
+TimeDateStamp (raw): 1452038002  ->  01/05/2016 23:53:22
+
+=== SECTIONS ===
+
+Name     VirtAddr VirtSize  RawPtr RawSize
+----     -------- --------  ------ -------
+.text        4096  3124639    1024 3124736
+.dfluatx  3129344    15694 3125760   15872
+.rdata    3145728   513074 3141632  513536
+.data     3661824    98652 3655168   16384
+.dflua    3764224    44644 3671552   45056
+.rsrc     3809280   433228 3716608  433664
+
+
+
+=== IMPORTED DLLs AND SELECTED FUNCTIONS ===
+  -- DINPUT8.dll
+     (1 functions) e.g. DirectInput8Create
+  -- d3d9.dll
+     [FULL FUNCTION LIST - 1 funcs]
+       Direct3DCreate9
+  -- d3dx9_40.dll
+     [FULL FUNCTION LIST - 15 funcs]
+       D3DXVec4Transform
+       D3DXQuaternionMultiply
+       D3DXQuaternionRotationMatrix
+       D3DXMatrixInverse
+       D3DXMatrixRotationQuaternion
+       D3DXMatrixReflect
+       D3DXMatrixOrthoRH
+       D3DXMatrixPerspectiveFovRH
+       D3DXSaveSurfaceToFileA
+       D3DXAssembleShader
+       D3DXMatrixLookAtRH
+       D3DXCreateBuffer
+       D3DXCompileShader
+       D3DXFilterTexture
+       D3DXGetShaderConstantTable
+  -- WINMM.dll
+     (1 functions) e.g. timeGetTime
+  -- DSOUND.dll
+     (1 functions) e.g. Ordinal#1
+  -- binkw32.dll
+     (11 functions) e.g. _BinkSetSoundSystem@8, _BinkOpenDirectSound@4, _BinkOpen@8, _BinkGetTrackID@8, _BinkSetVolume@12, _BinkWait@4
+  -- isactwin.dll
+     (1 functions) e.g. Ordinal#2
+  -- AudioDrv.dll
+     (1 functions) e.g. Ordinal#3
+  -- XINPUT1_3.dll
+     (2 functions) e.g. Ordinal#2, Ordinal#3
+  -- steam_api.dll
+     (9 functions) e.g. SteamAPI_WriteMiniDump, SteamAPI_Init, SteamAPI_UnregisterCallback, SteamRemoteStorage, SteamFriends, SteamUserStats
+  -- KERNEL32.dll
+     (68 functions) e.g. SetUnhandledExceptionFilter, GetStartupInfoA, InterlockedCompareExchange, InterlockedExchange, UnhandledExceptionFilter, OutputDebugStringW
+  -- USER32.dll
+     (36 functions) e.g. MapVirtualKeyExA, SendInput, SetCursor, LoadCursorA, GetKeyboardLayout, MessageBoxW
+  -- SHELL32.dll
+     (1 functions) e.g. SHGetFolderPathA
+  -- ole32.dll
+     (4 functions) e.g. CoUninitialize, CoCreateInstance, CoSetProxyBlanket, CoInitialize
+  -- OLEAUT32.dll
+     (5 functions) e.g. Ordinal#8, Ordinal#9, Ordinal#7, Ordinal#2, Ordinal#6
+  -- MSVCR90.dll
+     (138 functions) e.g. _strnicmp, _invoke_watson, _except_handler4_common, ?_type_info_dtor_internal_method@type_info@@QAEXXZ, ?terminate@@YAXXZ, __set_app_type
