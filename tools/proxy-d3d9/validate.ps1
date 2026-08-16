@@ -35,8 +35,18 @@ try {
     }
 
     if ($found) {
-        Start-Sleep -Seconds 2  # let a few more lines flush
-        Write-Host "=== Log file found: $logPath ==="
+        # Let the game run long enough to reach its render loop and hit
+        # Present many times (throttled to ~1 log line/sec in the DLL).
+        # Poll for a few "Present() hit" lines rather than a fixed sleep.
+        $presentHits = 0
+        $extraWaited = 0
+        while ($extraWaited -lt 30) {
+            Start-Sleep -Seconds 3
+            $extraWaited += 3
+            $presentHits = (Select-String -Path $logPath -Pattern "Present\(\) hit" -SimpleMatch:$false).Count
+            if ($presentHits -ge 5) { break }
+        }
+        Write-Host "=== Log file found: $logPath (Present hits observed: $presentHits) ==="
         Get-Content $logPath
     } else {
         Write-Host "=== No log file appeared after $waited seconds ==="
