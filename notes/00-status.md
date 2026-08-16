@@ -1,10 +1,40 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (render-loop structure session)
+Last updated: 2026-08-16 (render-function classification session)
 
 ## Latest status (read this first)
 
-**The frame's render-loop structure is now mapped, closing out the "how does the game
+**The dual-render open question is resolved: the candidate "render one eye's scene" wrapper
+function is classified as pure-render-only, with converging static and empirical evidence, and
+the concrete next step is now "attempt the dual-render hook."** Two launch-then-attach x64dbg
+captures this session (see `notes/11-render-function-classification.md` for full detail):
+
+- **Corrected notes/10's two candidate addresses**: `exe+0x115F36`/`exe+0xFEFEE` were return
+  addresses (mid-function), not entry points. Their real entry points were found by backward
+  prologue scan + forward-alignment verification: **`exe+0x115610`** (695-instruction body) and
+  **`exe+0xFEDA0`** (282-instruction body). **`exe+0xFEDA0` directly calls `exe+0x115610`**
+  (confirmed via the exact call/return-address byte offset) — this is the true, fully-confirmed
+  call hierarchy, not just an EBP-depth guess. Both fire **exactly once per real Present frame**.
+- **Full disassembly of both function bodies (695 + 282 instructions) found zero D3D API calls**
+  (all drawing is delegated to nested helpers, matching notes/10's deeper EBP frames) and only 21
+  non-stack memory writes total, **none floating-point, none increment/accumulate** — all
+  single-shot literal-constant resets or transient-pointer set/clear pairs.
+- **Empirical live-memory watch across 8 real frames** (register-resolved effective addresses,
+  fixing a first attempt's broken address-parsing) confirmed every write site fires **at most
+  once per frame** (not a loop) and targets a **different memory address almost every frame** —
+  the opposite of what a persistent game-state variable (timer, position) would look like; that
+  would live at one stable address.
+- **Verdict: leans safe to call twice**, not airtight (89 nested helper calls were identified by
+  address but not individually disassembled — judged not worth a full manual audit this
+  session). **Recommended next step, not another investigation**: hook `exe+0xFEDA0` and do the
+  actual double-call experiment (call it twice with unchanged matrices first, watch for
+  double-simulation symptoms over a sustained window) as the cheapest way to close the remaining
+  gap, then proceed to the real stereo hook (per-eye offset + second render target + composite)
+  using every already-proven primitive from notes 06/07/09/10.
+
+## Prior milestone (render-loop structure session, still valid)
+
+**The frame's render-loop structure was mapped, closing out the "how does the game
 structure a frame" unknown flagged at the end of the write-hook session.** Live x64dbg capture
 (three failed/diagnostic attempts plus one fully successful one — see
 `notes/10-render-loop-structure.md` §1 for two reusable debugging-harness bugs found and fixed
