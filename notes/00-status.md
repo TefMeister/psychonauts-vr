@@ -1,10 +1,37 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (camera-matrix injection-point session)
+Last updated: 2026-08-16 (live-camera-data session)
 
 ## Latest status (read this first)
 
-**The camera-matrix injection point is now identified with concrete, live-confirmed addresses.**
+**Both camera-matrix hook points are now confirmed carrying real, live, changing data — the
+observation-only phase is done.** Breakpoints on `BuildViewMatrix` (`exe+0x292480`) and
+`BuildProjectionMatrix` (`exe+0x2924D0`) were hit repeatedly (15 + 45 hits over ~15s) with real
+`pEye`/`pAt`/`pUp` vectors that drift smoothly frame-to-frame (proving a live, moving camera, not
+a cached one-shot value) and a stable, plausible `rawFov=104.0` / `aspect=1.3333` (4:3) /
+`zn=10.0` / `zf=50000.0`. This used the title/attract screen's own animated 3D camera (a real
+`D3DXMatrixLookAtRH` scene, unlike the static post-title menu observed previously) rather than
+player-controlled gameplay — **reaching actual gameplay was blocked this session by a simulated-input
+problem**: `SendInput` (VK and scan-code), legacy `keybd_event`, and `PostMessage` all failed to
+dismiss the title screen's "press any key" prompt, despite confirmed-correct OS-level window
+focus and a validated-working injection mechanism (control-tested against Notepad). Root cause
+narrowed to the game's `DIEmWin` DirectInput hook-based input path not reacting to synthetic
+input in this environment — not a debugger, hook, or config problem (full diagnostic trail in
+`notes/08-live-camera-data-gameplay.md`).
+
+**Proposed next milestone**: prototype an actual write-hook — install a real inline/detour hook
+at `exe+0x292480`, compute the camera's right vector (`cross(normalize(at-eye), up)`), and offset
+`pEye` by a small fixed distance along it before letting the real function run, then confirm
+visually that the rendered scene shifts sideways. This is the first behavior-modifying experiment
+(short of full stereo) and can be validated against the title screen's own camera, sidestepping
+the gameplay-input blocker above. In parallel, revisit reaching real gameplay: try driving input
+from inside the process via the debugger (write directly into DirectInput's keyboard state
+buffer) rather than OS-level `SendInput`, since actual player camera control will eventually be
+needed to validate a stereo hook under real movement, not just an attract-mode animation.
+
+## Prior milestone (camera-matrix injection-point session, still valid)
+
+**The camera-matrix injection point is identified with concrete, live-confirmed addresses.**
 Two small wrapper functions were fully disassembled — `exe+0x292480` (builds the view matrix,
 `BuildViewMatrix(pOut, pEye, pAt, pUp)`, all three vector args passed as pointers straight
 through to `D3DXMatrixLookAtRH`) and `exe+0x2924D0` (builds the projection matrix,
