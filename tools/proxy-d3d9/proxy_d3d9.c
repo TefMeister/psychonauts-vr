@@ -677,16 +677,36 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
  * output (16 sampled uploads across 2 different live camera states all
  * failed a matrix-decomposition sanity check - see notes/14 for the full
  * derivation), so this correction is applied as an experiment: a uniform
- * additive shift to the matrix's row3 (translation row, the last 4 floats)
- * X component. This is the closed-form result of inserting a view-space
- * translation T(-d,0,0,0) between View and Proj in a row-vector v*World*
- * View*Proj pipeline - IF this matrix truly ends in Proj as demonstrated by
- * xScale below, that shift is exactly the right correction for a rigid
- * (non-toe-in) eye offset of d along the camera's local right axis,
- * regardless of what World/View individually were (see notes/14 derivation).
- * If the matrix's structure differs from that assumption, this simply has no
- * effect (or an inconsistent one) - which is itself the point of testing it
- * live rather than only reasoning about it further. */
+ * additive shift to WVP's row3 (translation row) X component. This is the
+ * closed-form result of inserting a view-space translation T(-d,0,0,0)
+ * between View and Proj in a row-vector v*World*View*Proj pipeline - IF this
+ * matrix truly ends in Proj as demonstrated by xScale below, that shift is
+ * exactly the right correction for a rigid (non-toe-in) eye offset of d
+ * along the camera's local right axis, regardless of what World/View
+ * individually were, PROVIDED World*View itself is affine (true for any
+ * ordinary rigid/scale model+view transform, i.e. its own column-3 is
+ * [0,0,0,1] - see notes/18 for the full re-derivation that checks this).
+ *
+ * notes/18 CORRECTION (bug found and fixed this session): notes/17's live
+ * stack trace proved this register's upload is not the raw row-major WVP
+ * described above - it is Transpose(WVP), with the transpose happening
+ * in-place in the game's own compositing code BEFORE SetVertexShaderConstantF
+ * is ever called (so this hook only ever sees the already-transposed
+ * matrix). The derivation above targets WVP's row3/col0 element
+ * (flat index 4*3+0 = 12 in an UN-transposed row-major buffer), but since
+ * upload[r][c] = WVP[c][r], that element lives at upload[0][3] = flat index
+ * 4*0+3 = 3 in the buffer this hook actually receives - NOT index 12.
+ * Index 12 in the transposed buffer is upload[3][0] = WVP[0][3], an
+ * unrelated element that (in a standard row-vector-convention perspective
+ * pipeline) contributes to the homogeneous W output scaled by the vertex's
+ * OWN object-space X coordinate, not a uniform per-vertex clip-space shift -
+ * i.e. the prior code was perturbing the perspective-divide term as a
+ * function of each vertex's local X position, not translating the camera.
+ * This plausibly explains notes/14's "texture/pattern changes with
+ * magnitude" character (a real, reproducible, magnitude-scaling effect, but
+ * the wrong effect) rather than clean lateral parallax. Fixed by patching
+ * flat index 3, not 12. Re-verified per notes/18's controlled 0/3.25
+ * screenshot comparison. */
 #define STEREO_WVP_REGISTER 6
 
 static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
@@ -705,7 +725,12 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         float d = STEREO_HALF_IPD * sign;
 
         memcpy(patched, pConstantData, sizeof(patched));
-        patched[12] += (-d) * xScale;
+        /* notes/18: index 3, NOT 12 - see the derivation comment above
+         * STEREO_WVP_REGISTER. The uploaded buffer is Transpose(WVP)
+         * (confirmed live, notes/17), so WVP's row3/col0 element (the one
+         * the closed-form correction targets) lives at flat index 3 in
+         * this already-transposed buffer, not index 12. */
+        patched[3] += (-d) * xScale;
 
         {
             static DWORD s_lastLog = 0;
