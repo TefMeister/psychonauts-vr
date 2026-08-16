@@ -7,12 +7,25 @@ confirms Psychonauts.exe can be hooked via the standard proxy-DLL injection tech
 change any game behavior** — no VR, no stereo rendering yet. This is purely a validated
 foothold for the hooking work to come.
 
+**Update:** the proxy now also vtable-hooks `IDirect3D9::CreateDevice` and
+`IDirect3DDevice9::Present` — still pure observation. Both hooks log their arguments
+(the full `D3DPRESENT_PARAMETERS` for `CreateDevice`, a throttled ~1/sec frame counter
+for `Present`) and then call straight through to the real implementation, returning its
+result unmodified. Confirmed live: `CreateDevice` logs the real device parameters once,
+and `Present` fires every frame (~30 fps observed at the main menu). See
+[modding-notes/06-createdevice-present-hooks.md](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/06-createdevice-present-hooks.md)
+for the full validation log, the exact vtable slot numbers used (16 and 17) and how they
+were verified.
+
 ## What it proves
 
 Dropping a DLL named `d3d9.dll` into the Psychonauts install directory causes the game
 to load it in preference to the system one (standard Windows DLL search order), and the
 game calls into its exported `Direct3DCreate9` exactly as expected, with no anti-tamper
-pushback. See the [dev-archive](https://github.com/TefMeister/psychonauts-vr-dev-archive)
+pushback. The returned `IDirect3D9`/`IDirect3DDevice9` COM vtables can also be patched
+in-place with no pushback, giving a durable per-frame hook (`Present`) and a one-shot
+device-creation hook (`CreateDevice`) to build real rendering changes on top of later.
+See the [dev-archive](https://github.com/TefMeister/psychonauts-vr-dev-archive)
 and [modding-notes](https://github.com/TefMeister/psychonauts-vr-modding-notes) repos for
 the full validation log and cross-checks against independent debugger findings.
 
@@ -23,19 +36,21 @@ the full validation log and cross-checks against independent debugger findings.
 2. Copy `d3d9.dll` from this folder into the Psychonauts install directory (next to
    `Psychonauts.exe`).
 3. Launch the game normally.
-4. Check `%TEMP%\psychonautsvr_proxy.log` for a line-by-line log proving the proxy loaded
-   and intercepted `Direct3DCreate9`.
+4. Check `%TEMP%\psychonautsvr_proxy.log` for a line-by-line log proving the proxy loaded,
+   intercepted `Direct3DCreate9`/`CreateDevice`, and is hooking `Present` every frame.
 5. Remove the copied `d3d9.dll` when done — the game will fall back to the system DLL.
 
 ## Building from source
 
 Requires a 32-bit-capable MinGW/clang toolchain (this project uses LLVM-MinGW,
-`i686-w64-mingw32-clang`, since Psychonauts.exe is a 32-bit executable). Run
-`build.ps1` in this folder; it searches common LLVM-MinGW winget install locations and
-falls back to whatever `i686-w64-mingw32-clang.exe` is on `PATH`.
+`i686-w64-mingw32-clang`, since Psychonauts.exe is a 32-bit executable) with its bundled
+`d3d9.h`. Run `build.ps1` in this folder; it searches common LLVM-MinGW winget install
+locations and falls back to whatever `i686-w64-mingw32-clang.exe` is on `PATH`.
 
 ## Next milestone
 
-Hook `IDirect3D9::CreateDevice` and `IDirect3DDevice9::Present` via vtable patching from
-inside this same proxy, still observation-only, as the next step toward the real
-per-eye stereo rendering work.
+Disassemble the functions containing the `D3DXMatrixPerspectiveFovRH`/
+`D3DXMatrixLookAtRH` call sites to find where FOV/aspect ratio and view matrices are
+actually computed — the real per-eye injection point — and/or use the now-hooked
+`CreateDevice` to stand up a second render target as infrastructure for the other eye.
+Still no compositing/stereo logic yet.
