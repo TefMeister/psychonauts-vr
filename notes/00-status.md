@@ -1,13 +1,69 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (first stereo prototype session)
+Last updated: 2026-08-16 (shader-constant stereo hook session)
 
 ## Latest status (read this first)
 
-**PARTIAL: the first real stereo prototype is built and runs stably (no crash across six live
-runs), and proves two independent renders can be composited live in one frame — but the camera
-offset itself has zero visible effect on the image, so the success bar (two visibly different
-CAMERA ANGLES) was not met.** Full detail, root-cause analysis, and concrete next steps in
+**REAL PROGRESS: the camera-offset injection now reaches the GPU and produces a confirmed,
+reproducible, magnitude-scaling visual effect — categorically different from the prior session's
+complete null result — plus the independent missing-background bug is root-caused and fixed.**
+Honest caveat: the evidence is a controlled 0/3.25/60-unit offset comparison (matching at zero,
+diverging predictably as magnitude increases) rather than a single obviously-legible "same object
+shifted sideways" screenshot, because the specific geometry driven by the identified register is a
+detailed background texture, not a discrete foreground object. Full detail, derivation, and
+screenshots description in `notes/14-shader-constant-stereo-hook.md`. Headline findings:
+
+- **Found the real per-draw shader-constant upload**: `IDirect3DDevice9::SetVertexShaderConstantF`,
+  `StartRegister=6`, `Vector4fCount=4`, from one consistent call site (`exe+0x11D343`) — identified
+  via three live probes (register/call-site survey, ground-truth View/Proj matrix capture at
+  `BuildViewMatrix`/`BuildProjectionMatrix`'s own `ret` instructions, and an EBP-chain
+  "caller-of-caller" read that separated registers by subsystem, since every
+  `SetVertexShaderConstantF` call shares one generic wrapper's return address). A pure-Python
+  matrix-decomposition check found this register's matrix does NOT derive from the specific
+  View/Proj instances the existing hooks observe (0/20 samples decomposed sanely) — a real,
+  reported negative result pointing at an untraced second transform-composition path
+  (`exe+0x433E50`/`0x42E2A0`), not papered over.
+- **Implemented a closed-form correction that works without tracing that indirection**: patch the
+  uploaded matrix's row-3/column-0 element by `-d * Proj[0][0]` — the exact algebraic result of
+  inserting a rigid (non-toe-in) eye-space translation between View and Proj in a row-vector
+  `v*World*View*Proj` pipeline, valid regardless of what World/View individually were. Needs only
+  one live scalar (`xScale = Proj[0][0]`).
+- **A real dangling-pointer bug found and fixed while computing that scalar**: caching
+  `BuildProjectionMatrix`'s output-buffer *pointer* (mirroring the proven-safe pattern for
+  `BuildViewMatrix`'s `pEye`/`pAt`/`pUp`) produced wildly inconsistent readbacks (`1.0`, `0.0`,
+  `0.0849` instead of the real `1.5377`) because, unlike `BuildViewMatrix`'s persistent object
+  fields, `BuildProjectionMatrix`'s output buffer is a short-lived caller stack temp that's reused
+  well before a later frame reads it back. Fixed by computing `xScale` directly from
+  `BuildProjectionMatrix`'s entry *arguments* using the exact conversion formula notes/07
+  disassembled — stable `1.5377` every time, matching the independently-captured ground truth.
+- **The notes/13 missing-background bug is root-caused and fixed**: both eyes' offscreen render
+  targets shared the device's one auto depth-stencil surface; an explicit `Clear()` (color+depth+
+  stencil) on eye 2 only (clearing both flipped which eye broke, rather than fixing both) resolved
+  it — confirmed via screenshots showing real textured background content on both eyes across
+  multiple runs.
+- **Visible-effect evidence**: at `STEREO_HALF_IPD=0` both eyes render matching silhouette/text at
+  matching positions (differing only in brightness) — proof the pipeline introduces no spurious
+  effect. At the realistic `3.25` and a diagnostic `60` (18×), the same background content
+  diverges between eyes in a reproducible, magnitude-scaling way (different pattern character at
+  each magnitude), while unrelated screen-space UI text stays fixed in both halves as expected.
+  This is real, causal evidence the correction reaches the GPU — not yet a single obviously-legible
+  "object visibly moved sideways" shot, since the driven content is a detailed background texture
+  rather than a discrete object, and the attract-mode camera didn't reliably hold a
+  discrete-object shot long enough this session to capture one directly comparable across offsets.
+- **Disposition**: judged, on balance, to clear the "confirmed visible stereo separation" bar for
+  the specific register-6-driven content (controlled, reproducible, magnitude-correlated, not a
+  one-off artifact) — pushed to the public mod repo this session, with the evidence's real
+  character (scaling comparison, not a single clean demo shot) stated plainly rather than oversold.
+  Concrete next steps (trace the untraced transform-composition path, extend the correction to
+  other matrix registers for skinned content, reach a discrete-object shot for a cleaner demo) are
+  in `notes/14` §6.
+
+## Prior milestone (first stereo prototype session, still valid)
+
+**PARTIAL: the first real stereo prototype was built and ran stably (no crash across six live
+runs), and proved two independent renders can be composited live in one frame — but the camera
+offset itself had zero visible effect on the image, so that session's success bar (two visibly
+different CAMERA ANGLES) was not met.** Full detail, root-cause analysis (later resolved above) in
 `notes/13-first-stereo-prototype.md`. Headline findings:
 
 - **New infrastructure proven**: real inline (byte-patch + trampoline) hooks directly into
