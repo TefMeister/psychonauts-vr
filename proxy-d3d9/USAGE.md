@@ -27,7 +27,12 @@ VR mod — see "Known limitations" below before expecting more than that.
    register (`StartRegister=6`, `Vector4fCount=4`) with a closed-form correction derived from
    inserting a rigid eye-space translation between the View and Projection matrices. See
    [modding-notes/14](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/14-shader-constant-stereo-hook.md)
-   for the full derivation and the live-probe methodology used to find that register.
+   for the full derivation and the live-probe methodology used to find that register, and
+   [modding-notes/17](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/17-keystate-mechanism-trace-and-reg6-transpose-confirmation.md)/[18](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/18-stereo-index-bug-fix-and-input-slot4-ruled-out.md)
+   for a since-confirmed correction: the uploaded matrix is a **transpose** of the true camera
+   composite, computed in-place by the game's own code before this hook ever sees it, which means
+   the correction must patch a different flat index in the buffer than the naive (pre-transpose)
+   derivation would suggest (`floats[3]`, not `floats[12]`) — fixed and re-verified this session.
 5. **Composites** both eyes' offscreen surfaces into the left/right halves of the real backbuffer
    via `StretchRect`, before the one real hardware `Present`.
 
@@ -59,8 +64,12 @@ before assuming more than this.
   hooks track** (confirmed via a live matrix-decomposition test — 0/20 sampled uploads decomposed
   sanely against the tracked View/Projection matrices). The implemented fix works anyway because it
   only assumes the uploaded matrix ends with the Projection matrix as its final factor, not that it
-  equals `World * (tracked View) * Proj` exactly — but the actual intermediate transform-composition
-  code path (two chained matrix-helper calls, not yet fully traced) is still not fully understood.
+  equals `World * (tracked View) * Proj` exactly. A live stack/register trace since fully confirmed
+  the actual structure: two chained matrix multiplies (`World*View*Proj`, whichever object this
+  particular draw call is for) followed by an in-place 4×4 transpose before upload (see
+  modding-notes/17). The correction now patches the buffer index that accounts for that transpose;
+  see modding-notes/18 for the re-derivation and the real bug it found/fixed in an earlier version
+  of this same file (patching `floats[12]` instead of `floats[3]`).
 - No head tracking, no VR runtime (SteamVR/OpenXR) integration, no asymmetric per-eye frustums yet
   (this uses a rigid parallel-axis offset, not proper toe-in/converged stereo).
 
