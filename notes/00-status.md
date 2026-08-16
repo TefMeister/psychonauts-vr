@@ -1,10 +1,39 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (CreateDevice/Present vtable-hook session)
+Last updated: 2026-08-16 (camera-matrix injection-point session)
 
 ## Latest status (read this first)
 
-The proxy `d3d9.dll` (`tools/proxy-d3d9/`) now **vtable-hooks `IDirect3D9::CreateDevice` (slot 16)
+**The camera-matrix injection point is now identified with concrete, live-confirmed addresses.**
+Two small wrapper functions were fully disassembled — `exe+0x292480` (builds the view matrix,
+`BuildViewMatrix(pOut, pEye, pAt, pUp)`, all three vector args passed as pointers straight
+through to `D3DXMatrixLookAtRH`) and `exe+0x2924D0` (builds the projection matrix,
+`BuildProjectionMatrix(pOut, rawFov, aspect, zn, zf)`, feeding a FOV unit conversion into
+`D3DXMatrixPerspectiveFovRH`) — both are the actual hook points for per-eye view/projection
+matrix injection. Also resolved, with live evidence: **the game uses the shader-constant
+pipeline, not the fixed-function pipeline** — `IDirect3DDevice9::SetTransform` was never called
+by the game's own code across ~75 seconds of live observation (zero hits on a real breakpoint at
+its resolved address, versus 300+ hits on `SetVertexShaderConstantF` and 40+ `Present` frames in
+the same window); the `SetTransform` hits that did occur came from the D3D9 runtime's own
+`CreateDevice` bootstrap, not the game. The specific `SetVertexShaderConstantF` call/register
+range carrying the actual camera matrix wasn't pinned down yet — the observation window was the
+main menu (no active 3D camera), so `D3DXMatrixLookAtRH` never fired live and the
+`SetVertexShaderConstantF` hits observed all looked like 2D UI/screen-space constants from one
+call site (`exe+0x27EF03`). Full detail, full disassembly listings, and the concrete next step
+(reach real gameplay, watch for a `Vector4fCount=4` constant upload) are in
+`notes/07-camera-matrix-injection-point.md`.
+
+**Proposed next milestone**: get the debugger past the main menu into actual gameplay (simulated
+input or attach-after-manual-launch) and repeat the `SetVertexShaderConstantF` observation to
+find the exact call site/register range for the camera matrix upload — that's the second,
+possibly primary, injection point alongside the two wrapper functions already found. In
+parallel/afterward, use the already-hooked `CreateDevice` (`notes/06-createdevice-present-hooks.md`)
+to create a second render target, purely to prove a second surface can be stood up against this
+device/driver — still no compositing/stereo logic yet, just infrastructure.
+
+## Prior milestone (CreateDevice/Present vtable-hook session, still valid)
+
+The proxy `d3d9.dll` (`tools/proxy-d3d9/`) **vtable-hooks `IDirect3D9::CreateDevice` (slot 16)
 and `IDirect3DDevice9::Present` (slot 17)**, in addition to the previously-validated
 `Direct3DCreate9` forwarding — still pure observation, every hook calls straight through to the
 real implementation and returns its result unmodified. Both slot indices were cross-checked two
@@ -20,14 +49,6 @@ with full `D3DPRESENT_PARAMETERS` logged (640×480 windowed, `D3DFMT_A8R8G8B8` b
 one-shot artifact. Test DLL removed from the game directory and the game process killed
 immediately after validating, exactly as before. Full detail:
 `notes/06-createdevice-present-hooks.md`.
-
-**Proposed next milestone**: use x64dbg to disassemble the functions *containing* the
-`D3DXMatrixPerspectiveFovRH` (`exe+0x292525`) / `D3DXMatrixLookAtRH` (`exe+0x2924B1`) call sites
-(already located, not yet disassembled) to find where FOV/aspect ratio and view matrices are
-actually computed — the real per-eye injection point. In parallel/afterward, use the now-hooked
-`CreateDevice` to create a second render target (`CreateRenderTarget`/`CreateTexture`, sized to
-match the backbuffer) purely to prove a second surface can be stood up against this device/driver
-— still no compositing/stereo logic yet, just infrastructure.
 
 ## Prior milestone (proxy-DLL validation session, still valid)
 
@@ -123,6 +144,6 @@ and the live analysis results. Superseded by "Latest status" at the top of this 
 
 ## Proposed next milestone
 
-See "Latest status" at the top of this file — build the minimal proxy `d3d9.dll` in `tools/`
-next (doesn't need x64dbg), then use x64dbg to disassemble the camera-matrix call sites found
-this session.
+See "Latest status" at the top of this file for the current one — this section is left as
+historical context from the first live-debug session; each subsequent session's "Latest status"
+supersedes it.
