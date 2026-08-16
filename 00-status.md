@@ -1,8 +1,53 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (buffered-input chase + transpose decomposition retry session)
+Last updated: 2026-08-16 (keystate-mechanism trace + register-6 transpose confirmation session)
 
 ## Latest status (read this first)
+
+**Two leads worked this session — a deep live trace of the real keyboard-input mechanism (Lead 1),
+and a decisive live stack trace settling the register-6 transpose mystery (Lead 2).** Full detail in
+`notes/17-keystate-mechanism-trace-and-reg6-transpose-confirmation.md`. Headline findings:
+
+- **Lead 1: notes/16's buffered-`GetDeviceData` hypothesis REFUTED with hard evidence, then the real
+  keyboard-input mechanism fully traced live.** A device-identity check (capturing both keyboard AND
+  mouse device pointers, then classifying every `GetDeviceData`/`GetDeviceState` hit by `this`) found
+  `GetDeviceData` fires ONLY on the mouse device (42/42 hits) and never once on the keyboard across an
+  80s window — notes/16's "lockstep" evidence was actually about the mouse, not the keyboard as
+  assumed; the "flakiness" was a real negative, not flaky tooling. In its place, a hardware (DR-
+  register) READ breakpoint on the DIK_SPACE byte — a technique not used before in this project —
+  found and fully disassembled the real consumer chain: the polled buffer is read by a function that
+  scans a 3×21 keybinding table plus three hardcoded DIK_RETURN/SPACE/ESCAPE checks, each calling a
+  `SetKeyState(dikCode, pressed)` function that maintains a proper per-key edge-detection state array
+  (`keyState[dik]`, bit0=held/bit1=just-pressed/bit2=just-released) and fires a registered one-shot
+  global callback pointer on a fresh press/release edge. Re-testing the already-proven buffer-patch
+  technique while watching this callback pointer live showed it correctly reaches
+  `SetKeyState(SPACE, pressed=1)` (state byte transitions exactly as predicted, 0x00→0x03) but the
+  global callback slot is **null** throughout — no listener is armed at the observed title-screen
+  state, which is the real, now-understood reason two sessions of correctly-delivered synthetic input
+  produce no visible effect. A further hardware-watch found a second consumer layer outside
+  `SetKeyState` itself: a per-frame edge-bit-clearing sweep and a keybinding-table-driven translator
+  converting raw DIK codes into abstracted 0x00/0xFF "digital button" output bytes, plus simple
+  `IsKeyHeld`/`IsKeyJustPressed` query helpers — a real, generic input-abstraction system. Identifying
+  which specific binding slot the title screen reads is the well-scoped next step, not yet done.
+- **Lead 2: FULLY CONFIRMED (upgraded from notes/16's "partial support")**: a clean 4-breakpoint live
+  stack/register trace (8/8 samples, both pointer identity and raw-float content compared at each
+  stage) proves the register-6 upload is the in-place TRANSPOSE of the second matrix-multiply's
+  result — the transpose call overwrites multiply #2's own output buffer, so the pointer never
+  changes but the content does. Manually verified by hand against one sample's raw numbers (transposing
+  the captured pre-transpose matrix exactly reproduces the uploaded matrix). Bonus: the same trace
+  independently confirms notes/16's "non-identity World" interpretation — multiply #1 reduces to a
+  bare projection matrix, multiply #2 then carries a real, non-trivial object-space translation.
+- **Two reusable x64dbg-automate tooling gotchas found and fixed**: (1) `wait_for_debug_event`'s
+  single-check pattern can silently lose a targeted single-shot breakpoint's event when an unrelated,
+  high-frequency breakpoint (here, an unconditional `SetKeyState` breakpoint firing ~66x/poll) is also
+  active — fixed with a proper drain-and-retry `wait_for_named_breakpoint()` helper, confirmed fixed
+  by a clean rerun; (2) hardware and memory breakpoints persist across `start_session()` calls
+  independently of software breakpoints — `clear_breakpoint(None)` does not clear them,
+  `clear_hardware_breakpoint(None)`/`clear_memory_breakpoint(None)` are needed too.
+- **Mod repo untouched this session** (Lead 1 didn't reach gameplay; Lead 2 is analysis/confirmation,
+  not a code change). Workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (buffered-input chase + transpose decomposition retry session, still valid)
 
 **Two independent leads worked in parallel this session — a deeper chase of the DirectInput input
 blocker, and a re-run of the matrix-decomposition mystery against the transposed candidate matrix.**
