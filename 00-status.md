@@ -1,8 +1,41 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (write-hook proof-of-concept session)
+Last updated: 2026-08-16 (render-loop structure session)
 
 ## Latest status (read this first)
+
+**The frame's render-loop structure is now mapped, closing out the "how does the game
+structure a frame" unknown flagged at the end of the write-hook session.** Live x64dbg capture
+(three failed/diagnostic attempts plus one fully successful one — see
+`notes/10-render-loop-structure.md` §1 for two reusable debugging-harness bugs found and fixed
+along the way: launching directly under x64dbg hit a persistent access-violation retry loop this
+session, worked around by launching the game normally and attaching after ~15s; and the
+automation library's event-queue helper pops newest-first (LIFO) which silently corrupted a live
+pointer read until fixed to drain strictly oldest-first) confirmed:
+
+- **Frame order**: `[BuildProjectionMatrix x8, BuildViewMatrix x3] → [~89 draw calls across
+  multiple SetRenderTarget/Clear/BeginScene/EndScene brackets] → Present`, every frame, camera
+  matrices always built before any draw calls, `Present` always last.
+- **The engine already calls `SetRenderTarget` (8x) and `Clear` (3x) multiple times per single
+  frame**, with a `SetRenderTarget` burst immediately followed by `EndScene`→`BeginScene`→`Clear`
+  — strong evidence of an existing multi-pass structure (most plausibly a shadow/render-to-texture
+  pass) that a stereo second-eye pass could piggyback on the same mechanism.
+- **A candidate "draw the whole scene" wrapper was identified via an 8-level EBP frame-pointer
+  walk from the first live `DrawIndexedPrimitive` hit**: `exe+0x115F36` and `exe+0xFEFEE` are the
+  two outermost/best candidates (no symbols, not yet disassembled).
+- **Open risk, not yet resolved**: whether that candidate wrapper's call chain does *only*
+  rendering or also touches per-frame game-logic/animation state that would double-advance if
+  called twice — this is the concrete next step (disassemble those two addresses and check),
+  not a new open-ended unknown. Full plan in `notes/10-render-loop-structure.md` §6.
+
+**Proposed next milestone**: disassemble `exe+0x115F36`/`exe+0xFEFEE` to confirm one is a clean
+render-only entry point, then attempt the actual dual-render hook: call it twice per frame (once
+per eye, using the already-proven per-eye matrix offset from notes/09) into two render targets
+stood up via the already-hooked `CreateDevice` (notes/06), compositing before the real `Present`.
+If the split turns out not to be clean, fall back to single-render + post-process
+reprojection/warp instead of fighting a tangled call graph.
+
+## Prior milestone (write-hook proof-of-concept session, still valid)
 
 **The write-hook mechanism is proven end-to-end — this is the first behavior-modifying
 experiment, and it worked.** A real live write was installed at `BuildViewMatrix`
