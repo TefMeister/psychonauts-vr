@@ -1,13 +1,50 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (render-function classification session)
+Last updated: 2026-08-16 (double-call safety test session)
 
 ## Latest status (read this first)
 
-**The dual-render open question is resolved: the candidate "render one eye's scene" wrapper
-function is classified as pure-render-only, with converging static and empirical evidence, and
-the concrete next step is now "attempt the dual-render hook."** Two launch-then-attach x64dbg
-captures this session (see `notes/11-render-function-classification.md` for full detail):
+**GO: the double-call safety test passed cleanly — green light to attempt the real stereo
+matrix injection / dual-render hook next session, no further investigation recommended first.**
+This closes the last open empirical question from notes/11 by actually doing the thing (call
+`exe+0xFEDA0` twice per frame with unmodified state) instead of continuing to reason about it
+statically. Full detail, methodology, and two reusable x64dbg-automate tooling gotchas found
+along the way are in `notes/12-double-call-safety-test.md`:
+
+- **15/15 consecutive double-invokes of CandB (`exe+0xFEDA0`) succeeded cleanly** over a
+  sustained real-frame window: every one landed at the correct return address with the stack
+  pointer byte-identical before/after both calls, entry register state was bit-identical across
+  all 15 real hits, and the second call's return value (`eax=1`) exactly matched the first's on
+  every hit (no sign of an "already rendered this frame" reentrancy guard silently short-circuiting
+  the second call).
+- **Baseline frame cadence immediately before and after the double-call window is statistically
+  identical** (~0.204s/hit both times) — no lasting corruption, no growing lag, no delayed crash
+  once double-invoking stopped.
+- **Zero crashes, hangs, or unresolved exceptions** across the whole test. (Two earlier attempts
+  this session failed for tooling reasons unrelated to CandB itself — an event-queue
+  desynchronization bug, and x64dbg's `rtr`/"run to return" command not being reliably
+  call-depth-aware across CandB's ~90-deep nested call tree, landing short and cascading into a
+  self-inflicted bad state after 4 iterations — both diagnosed, fixed by switching to a targeted
+  single-shot breakpoint at the known return address, and confirmed fixed by the clean 15/15 run
+  that followed. Neither failure mode implicated CandB's own safety.)
+- **Honest limitation carried forward**: no visual/screenshot confirmation of animation speed was
+  performed (verdict rests on stack/register/return-value/timing consistency, not a direct look
+  at the screen); six brief, non-repeating, unexplained debugger stops in unrelated-looking DLL
+  address space were observed once mid-test and are noted but not folded into the verdict either
+  way (didn't correlate with any double-invoke failure, never recurred). Neither limitation was
+  judged to block proceeding.
+- **Next session**: attempt the actual dual-render hook (per the plan already laid out in
+  notes/10 §6 / notes/11 §4) — hook `exe+0xFEDA0`, call it twice per real frame (once per eye,
+  proven per-eye `BuildViewMatrix` offset from notes/09) into two render targets stood up via the
+  already-hooked `CreateDevice` (notes/06), compositing before the real `Present`. No remaining
+  *unscoped* unknowns block this.
+
+## Prior milestone (render-function classification session, still valid)
+
+**The dual-render open question was resolved via static + empirical analysis: the candidate
+"render one eye's scene" wrapper function was classified as pure-render-only, converging with
+this session's actual double-call test above.** Two launch-then-attach x64dbg captures (see
+`notes/11-render-function-classification.md` for full detail):
 
 - **Corrected notes/10's two candidate addresses**: `exe+0x115F36`/`exe+0xFEFEE` were return
   addresses (mid-function), not entry points. Their real entry points were found by backward
