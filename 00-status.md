@@ -1,31 +1,46 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (live-debug session)
+Last updated: 2026-08-16 (proxy-DLL validation session)
 
 ## Latest status (read this first)
 
-The x64dbg blocker from the first session is **resolved**: x64dbg, a real Python 3.12, the
-`x64dbg_automate[mcp]` pip package, and the (separately-downloaded, not bundled) x64dbg-automate
-debugger plugin are all installed and working. First live/dynamic analysis pass is done and
-**fully confirms the static-recon hook plan**: `Direct3DCreate9` (`d3d9.dll+0x64B20`) →
-`IDirect3D9::CreateDevice` (`d3d9.dll+0x6F750`, called from `exe+0x27BD52` with
-`D3DCREATE_HARDWARE_VERTEXPROCESSING`) → `IDirect3DDevice9::Present` (`d3d9.dll+0xE6120`, called
-from `exe+0x27E755`) were all hit live with a debugger and their addresses read from real process
-memory, not guessed. Camera matrix call sites (`D3DXMatrixPerspectiveFovRH` /
-`D3DXMatrixLookAtRH`, both called from the `exe+0x2925xx` region) were also located. No
-anti-debug/anti-tamper behavior encountered. Full detail, exact addresses, and two non-obvious
-debugger gotchas (default entry breakpoint; first-chance-AV loop when launching outside Steam)
-are in `notes/04-live-debug-findings.md`. Debugger and game were both fully closed at the end of
-the session — verified no stray processes or lockfiles remain.
+The minimal logging proxy `d3d9.dll` is **built and validated end-to-end**. No C/C++ compiler
+existed on this machine; installed LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`)
+to get an `i686-w64-mingw32-clang` 32-bit target compiler (game is 32-bit). The proxy
+(`tools/proxy-d3d9/`) exports `Direct3DCreate9`, loads the real `C:\Windows\system32\d3d9.dll`
+by full path (never a bare `LoadLibraryA("d3d9.dll")`, to avoid recursively loading itself),
+forwards the call unmodified, and logs to `%TEMP%\psychonautsvr_proxy.log`. Copied into the game
+directory, launched `Psychonauts.exe` directly (no debugger needed for this test), and confirmed
+the log file was written with the real call captured — proving the injection mechanism works and
+the game accepts a proxy DLL with no anti-tamper pushback. The real `Direct3DCreate9` address
+resolved by the proxy (`d3d9.dll base + 0x64B20`) exactly matches the offset independently found
+via x64dbg in the prior session — good cross-confirmation. Test DLL was removed from the game
+directory and the game process killed immediately after validating; only `tools/proxy-d3d9/`
+in the workspace retains a copy. Full detail: `notes/05-proxy-dll-validation.md`.
 
-**Proposed next milestone**: build the minimal proxy `d3d9.dll` in `tools/` (hand-rolled or via
-dxwrapper) that forwards every call to the real system `d3d9.dll` with logging, and confirm it
-loads and the game runs identically with it in place — before writing any actual stereo-rendering
-logic. This doesn't require x64dbg at all and is safe/reversible (proxy DLL lives in `tools/`,
-only copied into the game folder for an explicit, user-visible test run). Once that's confirmed,
-use the now-working x64dbg toolchain to disassemble the two functions containing the
-`D3DXMatrixPerspectiveFovRH`/`D3DXMatrixLookAtRH` call sites found this session, to find the
-actual per-eye view/projection injection point.
+**Proposed next milestone**: extend the same proxy DLL to hook `IDirect3D9::CreateDevice` and
+`IDirect3DDevice9::Present` via vtable patching (addresses already known from the live-debug
+session: `d3d9.dll+0x6F750` / `d3d9.dll+0xE6120`), logging `D3DPRESENT_PARAMETERS` and per-frame
+`Present` calls — still observation only, no rendering changes. That builds the actual
+infrastructure (a live device handle + a hook that fires every frame) needed before the real
+work: use x64dbg to disassemble the callers of the `D3DXMatrixPerspectiveFovRH`/
+`D3DXMatrixLookAtRH` call sites (`exe+0x292525`/`exe+0x2924B1`, found in the live-debug session)
+to find the actual per-eye view/projection injection point, then create a second render target
+for the other eye.
+
+## Prior milestone (live-debug session, still valid)
+
+x64dbg, a real Python 3.12, the `x64dbg_automate[mcp]` pip package, and the
+(separately-downloaded, not bundled) x64dbg-automate debugger plugin are all installed and
+working. First live/dynamic analysis pass **fully confirmed the static-recon hook plan**:
+`Direct3DCreate9` (`d3d9.dll+0x64B20`) → `IDirect3D9::CreateDevice` (`d3d9.dll+0x6F750`, called
+from `exe+0x27BD52` with `D3DCREATE_HARDWARE_VERTEXPROCESSING`) → `IDirect3DDevice9::Present`
+(`d3d9.dll+0xE6120`, called from `exe+0x27E755`) were all hit live with a debugger and their
+addresses read from real process memory, not guessed. Camera matrix call sites
+(`D3DXMatrixPerspectiveFovRH` / `D3DXMatrixLookAtRH`, both called from the `exe+0x2925xx`
+region) were also located. No anti-debug/anti-tamper behavior encountered. Full detail, exact
+addresses, and two non-obvious debugger gotchas (default entry breakpoint; first-chance-AV loop
+when launching outside Steam under x64dbg) are in `notes/04-live-debug-findings.md`.
 
 ## Summary
 
