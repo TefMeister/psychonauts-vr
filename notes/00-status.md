@@ -1,33 +1,68 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (live-camera-data session)
+Last updated: 2026-08-16 (write-hook proof-of-concept session)
 
 ## Latest status (read this first)
 
-**Both camera-matrix hook points are now confirmed carrying real, live, changing data — the
-observation-only phase is done.** Breakpoints on `BuildViewMatrix` (`exe+0x292480`) and
-`BuildProjectionMatrix` (`exe+0x2924D0`) were hit repeatedly (15 + 45 hits over ~15s) with real
-`pEye`/`pAt`/`pUp` vectors that drift smoothly frame-to-frame (proving a live, moving camera, not
-a cached one-shot value) and a stable, plausible `rawFov=104.0` / `aspect=1.3333` (4:3) /
-`zn=10.0` / `zf=50000.0`. This used the title/attract screen's own animated 3D camera (a real
-`D3DXMatrixLookAtRH` scene, unlike the static post-title menu observed previously) rather than
-player-controlled gameplay — **reaching actual gameplay was blocked this session by a simulated-input
-problem**: `SendInput` (VK and scan-code), legacy `keybd_event`, and `PostMessage` all failed to
-dismiss the title screen's "press any key" prompt, despite confirmed-correct OS-level window
-focus and a validated-working injection mechanism (control-tested against Notepad). Root cause
-narrowed to the game's `DIEmWin` DirectInput hook-based input path not reacting to synthetic
-input in this environment — not a debugger, hook, or config problem (full diagnostic trail in
-`notes/08-live-camera-data-gameplay.md`).
+**The write-hook mechanism is proven end-to-end — this is the first behavior-modifying
+experiment, and it worked.** A real live write was installed at `BuildViewMatrix`
+(`exe+0x292480`): on each hit, `pEye`/`pAt`/`pUp` were read, a right vector was computed
+(`normalize(cross(normalize(at-eye), up))`), and `*pEye` was overwritten with `eye + right*40.0`
+before letting the real function proceed. A second breakpoint directly on the
+`call D3DXMatrixLookAtRH` instruction (`exe+0x2924AC`) re-read `*pEye` immediately before the
+call executed, to prove the write wasn't overwritten before use. Result: **40/40 writes
+succeeded, 39/39 call-site checks matched the written value exactly, 0 mismatches**, sustained
+across ~25 seconds / ~40 frames on the title screen's live camera — not a one-frame flicker. No
+crash, no anti-tamper reaction. Full detail, exact values, and one important surprise (below) in
+`notes/09-write-hook-proof-of-concept.md`.
 
-**Proposed next milestone**: prototype an actual write-hook — install a real inline/detour hook
-at `exe+0x292480`, compute the camera's right vector (`cross(normalize(at-eye), up)`), and offset
-`pEye` by a small fixed distance along it before letting the real function run, then confirm
-visually that the rendered scene shifts sideways. This is the first behavior-modifying experiment
-(short of full stereo) and can be validated against the title screen's own camera, sidestepping
-the gameplay-input blocker above. In parallel, revisit reaching real gameplay: try driving input
-from inside the process via the debugger (write directly into DirectInput's keyboard state
-buffer) rather than OS-level `SendInput`, since actual player camera control will eventually be
-needed to validate a stereo hook under real movement, not just an attract-mode animation.
+**Important surprise**: `*pEye` is a live pointer into the camera's own persistent state, not a
+fresh copy each call — writes on one hit partially carry forward into what the next hit on the
+same pointer reads as its "original" value. This produced **bounded compounding**: the first few
+writes on a given pointer stack close to additively, then the game's own camera smoothing visibly
+damps it and the value converges to a stable offset rather than diverging unboundedly or being
+cleanly reset. This is a concrete, actionable finding for the stereo work, not just a curiosity —
+see the recommendation below.
+
+**Proposed next milestone (the real stereo-rendering step)**: this is the big one and will likely
+need its own dedicated deep-dive session. Two parts:
+1. **Per-eye matrix math**: duplicate the offset logic proven this session for two eyes with
+   opposite-sign offsets, but **cache/derive a fresh unmodified base eye position each frame**
+   rather than reading back an already-offset `*pEye` (to sidestep the compounding behavior found
+   above) — either by capturing the pre-write value once per real frame and computing both eyes
+   from that cached base, or by not mutating the shared pointer in place at all and instead
+   calling `D3DXMatrixLookAtRH` (or the `BuildViewMatrix` wrapper) twice into two separate output
+   buffers.
+2. **Actual dual rendering** (the hard, unscoped part): the game's main render loop needs to run
+   *twice* per frame — once per eye — into two separate render targets, then composite. This
+   needs its own investigation into how the game's frame/draw-call loop is structured (where
+   `Present` is called relative to the full scene draw, whether the render path can be
+   re-entered cleanly a second time with a different view/projection matrix and target surface,
+   whether any per-frame state would need resetting between the two passes). The already-hooked
+   `CreateDevice`/`Present` proxy (`notes/06-createdevice-present-hooks.md`) is the natural place
+   to stand up a second render target, but nothing about invoking the render path twice has been
+   explored yet.
+
+Revisit the gameplay-input blocker (`notes/08`) in parallel/afterward — real player camera
+movement will eventually be needed to validate the stereo hook, not just the title screen's
+attract-mode animation.
+
+## Prior milestone (live-camera-data session, still valid)
+
+Both camera-matrix hook points were confirmed carrying real, live, changing data. Breakpoints on
+`BuildViewMatrix` (`exe+0x292480`) and `BuildProjectionMatrix` (`exe+0x2924D0`) were hit
+repeatedly (15 + 45 hits over ~15s) with real `pEye`/`pAt`/`pUp` vectors that drift smoothly
+frame-to-frame (proving a live, moving camera, not a cached one-shot value) and a stable,
+plausible `rawFov=104.0` / `aspect=1.3333` (4:3) / `zn=10.0` / `zf=50000.0`. This used the
+title/attract screen's own animated 3D camera (a real `D3DXMatrixLookAtRH` scene, unlike the
+static post-title menu observed previously) rather than player-controlled gameplay — **reaching
+actual gameplay was blocked this session by a simulated-input problem**: `SendInput` (VK and
+scan-code), legacy `keybd_event`, and `PostMessage` all failed to dismiss the title screen's
+"press any key" prompt, despite confirmed-correct OS-level window focus and a validated-working
+injection mechanism (control-tested against Notepad). Root cause narrowed to the game's `DIEmWin`
+DirectInput hook-based input path not reacting to synthetic input in this environment — not a
+debugger, hook, or config problem (full diagnostic trail in
+`notes/08-live-camera-data-gameplay.md`).
 
 ## Prior milestone (camera-matrix injection-point session, still valid)
 
