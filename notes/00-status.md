@@ -1,8 +1,50 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (shader-constant stereo hook session)
+Last updated: 2026-08-16 (input-blocker retry + stereo robustness/quality session)
 
 ## Latest status (read this first)
+
+**This session split into two parts — an honest partial result on the long-standing gameplay-input
+blocker, followed by a pivot to concrete quality/robustness work on the existing stereo prototype.**
+Full detail in `notes/15-input-blocker-retry-and-stereo-robustness.md`. Headline findings:
+
+- **Input blocker (notes/08), retried via a DirectInput device-state poke as suggested — partial,
+  unresolved, but genuinely refines the prior diagnosis.** Live capture proved synthetic
+  `PostMessage`/`SendInput` keystrokes **do** correctly arrive in the game's own real message queue
+  (`WM_KEYDOWN`/`WM_CHAR`/`WM_KEYUP`, correct `hwnd`/`VK_SPACE`/scancode, retrieved by the game's own
+  `PeekMessageA`) — refining notes/08's broader "messages don't get through" framing. `GetAsyncKeyState`
+  (never called), `GetKeyState`/`GetKeyboardState` (called only by `msctf.dll`/IME, not game logic),
+  and Steam Overlay hooking (not loaded in-process) were all ruled out as the actual gate. The
+  `DIEmWin` window (confirming *some* DirectInput keyboard device exists) was found, but the
+  specific `IDirectInput8::CreateDevice` call that created it could not be pinned down consistently
+  across two fresh process launches (inconsistent stack/caller behavior each time) within this
+  session's budget — stopped and pivoted per the task's own explicit guidance, rather than
+  continuing to chase diminishing signal. Concrete next-session leads are in notes/15 §1d.
+- **Stereo prototype robustness: 4/4 clean consecutive full launch cycles**, using the exact
+  unmodified `d3d9.dll` from notes/14 (no code changes this session) — no crashes, `Stereo ready = 1`
+  every run, identical `xScale`/correction values every run, and pixel-identical left/right-divergence
+  screenshots across all 4 runs (the title screen's attract-mode camera turns out to be a fully
+  deterministic scripted playback, not random). This is a materially stronger robustness claim than
+  notes/14's single session.
+- **IPD value cross-validated on comfort grounds, kept at `3.25` (no code change)**: an independent
+  world-scale estimate (from `zNear`/`zFar` plausibility, "1 world unit ≈ 1cm") converges within 3%
+  of both the shipped value and notes/13's original proportional-to-distance estimate — and maps the
+  current value to **≈6.5cm real-world separation, within 1mm of average adult human IPD (63mm)**,
+  the standard comfort target for VR stereo. The proportional-to-shot-distance derivation method
+  itself is flagged as a real limitation (framing-dependent, not fixed like real human IPD) that
+  should be replaced with a fixed, scale-calibrated constant once real gameplay is reachable.
+- **Untraced transform-path (notes/14 §6.1): real static-disassembly progress.** `exe+0x433E50`
+  confirmed as a matrix-multiply helper with an SSE/FPU-dispatch flag; `exe+0x42E2A0` newly
+  confirmed as a **4×4 matrix transpose** (previously unknown). Recovered the register-6 upload's
+  actual call sequence: multiply → multiply → transpose → upload. New, concrete (not yet confirmed)
+  hypothesis: the transpose step plausibly explains notes/14's matrix-decomposition negative result,
+  since a naive row-major decomposition check would fail exactly as observed against a transposed
+  matrix. Cheap, no-live-debugging next step identified: rerun the decomposition check against
+  `Transpose(candidate)` too.
+- **Mod repo untouched this session** (no functional code change — the robustness test exercised the
+  already-pushed notes/14 binary); workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (shader-constant stereo hook session, still valid)
 
 **REAL PROGRESS: the camera-offset injection now reaches the GPU and produces a confirmed,
 reproducible, magnitude-scaling visual effect — categorically different from the prior session's
