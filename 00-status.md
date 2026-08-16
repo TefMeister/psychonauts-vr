@@ -1,8 +1,50 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (input-blocker retry + stereo robustness/quality session)
+Last updated: 2026-08-16 (buffered-input chase + transpose decomposition retry session)
 
 ## Latest status (read this first)
+
+**Two independent leads worked in parallel this session — a deeper chase of the DirectInput input
+blocker, and a re-run of the matrix-decomposition mystery against the transposed candidate matrix.**
+Full detail in `notes/16-buffered-input-chase-and-transpose-decomposition.md`. Headline findings:
+
+- **Input blocker: real infrastructure breakthrough, but the behavioral goal still not achieved.**
+  This session finally resolved and hooked the actual live `IDirectInputDevice8` keyboard object (both
+  `GetDeviceState` and `GetDeviceData`), closing out notes/15's exact open item, via one concrete fix
+  (arm the `DirectInput8Create` breakpoint *before* resuming past startup, not after) plus two reusable
+  debugger-tooling bugs found and fixed (x64dbg persists breakpoints across `start_session()` calls
+  and needs an explicit `clear_breakpoint(None)`; `wait_for_debug_event` silently discards non-matching
+  events and needs a drain-and-retry wrapper). Patching `GetDeviceState`'s polled output buffer
+  (`DIK_SPACE` forced to "pressed") initially looked like a genuine win — a real "Loading" screen with
+  the game's falling-Raz vortex animation appeared shortly after — **but this was investigated further
+  and found to be a false positive**: a clean, fine-grained-timed control launch (no debugger, no
+  input at all) showed that exact same Loading screen appears naturally at ~4.5s into *any* launch,
+  input or no input. A longer, rigorous re-test (13 press/release cycles over ~2 minutes at the
+  confirmed-idle title screen) found zero further effect. A new, better-motivated hypothesis was found
+  instead: the game also polls **buffered** `GetDeviceData` (`DIDEVICEOBJECTDATA2`-sized records) in
+  lockstep with `GetDeviceState`, strongly suggesting the title screen's actual gate reads buffered
+  transition events, not polled state — a forged-event fix for this was implemented but not yet
+  confirmed working, blocked by a reproduced cross-run flakiness in hitting that specific call (the
+  same kind of flakiness notes/15 first flagged for `CreateDevice`, now understood but not fully tamed).
+  Opportunistically confirmed the stereo hook (unmodified notes/14 binary) stayed robust through ~2
+  minutes of concurrent debugger/DirectInput-hooking activity, and found a new nuance: the natural
+  Loading-transition screen renders as a single non-split image (the hooked render path apparently
+  isn't invoked for it), while the title screen itself continues to show correct split-screen
+  divergence throughout.
+- **Transform-path mystery: real, partial progress, not fully resolved.** Live-captured View/Proj/
+  register-6 data (fresh, since no raw floats from notes/14's session survived) was re-run through the
+  decomposition check against 4 hypotheses (transpose or not, on each side). The transpose hypothesis
+  measurably and substantially improves the result — several samples now show row lengths within a few
+  percent of 1.0, a qualitatively saner signature than notes/14's original "thousands to hundreds of
+  thousands" — but no sample fully resolves (the `[3][3]` homogeneous element and column-3 residuals
+  remain non-trivial), so this is partial support for the transpose hypothesis, not full confirmation.
+  Leading interpretation: the transpose is very likely real; the remaining gap is most likely a
+  genuine non-identity "World" component for whatever specific object register 6's draw call renders,
+  which the original check never actually assumed away correctly in the first place.
+- **Mod repo untouched this session** (neither lead reached a confirmed functional improvement).
+  Workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (input-blocker retry + stereo robustness/quality session, still valid)
 
 **This session split into two parts — an honest partial result on the long-standing gameplay-input
 blocker, followed by a pivot to concrete quality/robustness work on the existing stereo prototype.**
