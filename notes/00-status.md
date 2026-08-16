@@ -1,13 +1,53 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (double-call safety test session)
+Last updated: 2026-08-16 (first stereo prototype session)
 
 ## Latest status (read this first)
 
-**GO: the double-call safety test passed cleanly — green light to attempt the real stereo
-matrix injection / dual-render hook next session, no further investigation recommended first.**
-This closes the last open empirical question from notes/11 by actually doing the thing (call
-`exe+0xFEDA0` twice per frame with unmodified state) instead of continuing to reason about it
+**PARTIAL: the first real stereo prototype is built and runs stably (no crash across six live
+runs), and proves two independent renders can be composited live in one frame — but the camera
+offset itself has zero visible effect on the image, so the success bar (two visibly different
+CAMERA ANGLES) was not met.** Full detail, root-cause analysis, and concrete next steps in
+`notes/13-first-stereo-prototype.md`. Headline findings:
+
+- **New infrastructure proven**: real inline (byte-patch + trampoline) hooks directly into
+  `Psychonauts.exe`'s own code now exist and work — `BuildViewMatrix` (`exe+0x292480`) and `CandB`
+  (`exe+0xFEDA0`) are both hooked with a naked-asm detour mechanism (not just COM vtable patching,
+  which was all prior sessions used). `CandB`'s hook genuinely invokes the real function body
+  twice per frame in the live, undebugged game process (extending notes/12's 15-frame debugger
+  test to a real sustained in-process double-call) into two separate offscreen render targets,
+  composited via `StretchRect` into the left/right halves of the real backbuffer before the one
+  real `Present` — all `S_OK`, every frame, six separate runs, zero crashes/hangs.
+- **New discovery**: `CandB`'s own nested call tree (not `CandB`/`CandA` themselves — notes/11
+  found zero D3D calls at that level) calls the real `Present` internally, partway through
+  rendering. Proven via a reentrancy flag read back `TRUE` from inside the Present hook while
+  still nested inside `CandB`'s double-call region. Worked around this session with a 3-state
+  phase (suppress eye 1's premature internal Present; repurpose eye 2's internal Present as the
+  real "both eyes done, composite and flip" signal) — this fix is real and necessary, not
+  speculative.
+- **Camera offset doesn't reach the screen**: tested at both a realistic ~3.25-unit half-IPD and,
+  diagnostically, at 60 units (18x larger) — zero visible parallax either way, even though the
+  CPU-side matrix write was confirmed (byte-level read-back) to land correctly. Leading
+  explanation: the camera flows to the GPU via `SetVertexShaderConstantF` (established in
+  notes/07) at an upload call site that was never pinned down, most likely firing once per frame
+  *before* `CandB` runs — rewriting the CPU-side matrix buffer afterward has no path back to the
+  GPU. This is the single highest-value next step (see notes/13 §7).
+- **Second, independent, unexplained finding**: the second `CandB` invocation's render is missing
+  its background layer (near-white instead of the game's textured backdrop) even with the
+  Present-reentrancy bug fixed — a materially different open question from "is it safe to call
+  twice" (notes/12 already answered that for stack/register/return-value/timing; this is about
+  whether every individual draw call fires identically on a second invocation, which turns out to
+  be a different, unanswered question).
+- **Disposition**: proxy DLL source/build synced to modding-notes and dev-archive as a detailed
+  record of real working infrastructure plus a well-diagnosed partial result. **Not** pushed to
+  the public mod repo this session, since the literal success criterion (two different camera
+  angles) wasn't met — per the task's own explicit instruction not to oversell partial results.
+
+## Prior milestone (double-call safety test session, still valid)
+
+**GO: the double-call safety test passed cleanly** — this closed the last open empirical question
+from notes/11 by actually doing the thing (call `exe+0xFEDA0` twice per frame with unmodified state)
+instead of continuing to reason about it
 statically. Full detail, methodology, and two reusable x64dbg-automate tooling gotchas found
 along the way are in `notes/12-double-call-safety-test.md`:
 

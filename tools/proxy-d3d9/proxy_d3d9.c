@@ -6,11 +6,43 @@
  * Direct3DCreate9, gets called - WITHOUT changing any game behavior. It loads
  * the real system d3d9.dll and forwards the call unmodified.
  *
- * Milestone 2 (this revision): also vtable-hooks IDirect3D9::CreateDevice and
+ * Milestone 2: also vtable-hooks IDirect3D9::CreateDevice and
  * IDirect3DDevice9::Present, purely to observe (log) D3DPRESENT_PARAMETERS and
- * confirm Present fires every frame. Still no behavior changes - every hook
- * calls straight through to the real implementation and returns its result
- * unmodified.
+ * confirm Present fires every frame. Still no behavior changes there - both
+ * COM hooks call straight through to the real implementation.
+ *
+ * Milestone 3 (this revision): first real stereo-rendering prototype. Adds
+ * TWO inline (byte-patch/trampoline) hooks directly into Psychonauts.exe's
+ * own code, at fixed addresses proven stable across every prior session
+ * (no ASLR on the main module):
+ *
+ *   - BuildViewMatrix   (exe+0x292480 / 0x00692480) - notes/07, notes/09
+ *   - CandB             (exe+0xFEDA0  / 0x004FEDA0) - notes/10, notes/11,
+ *                         notes/12 ("draw one eye's worth of the scene",
+ *                         confirmed safe to invoke twice per frame)
+ *
+ * On every real per-frame BuildViewMatrix call, the FIRST call of the frame
+ * has its clean (unmodified) eye/at/up cached and a camera right-vector
+ * computed - the real call is then let through completely unmodified (no
+ * write-in-place, sidestepping the "*pEye is a persistent pointer, writes
+ * carry forward frame-to-frame" compounding gotcha documented in notes/09).
+ *
+ * On every real per-frame CandB call, the hook invokes the real CandB body
+ * TWICE (proven safe in notes/12): once with the cached camera nudged left
+ * along its right-vector into an offscreen "eye 1" render target, once
+ * nudged right into an offscreen "eye 2" render target. The per-eye view
+ * matrix is applied by directly re-invoking BuildViewMatrix's own real,
+ * unmodified body (through its trampoline) with a fresh eye position
+ * computed from the cached clean base each time - never a read-back of an
+ * already-offset value.
+ *
+ * Present is extended to composite both offscreen eye surfaces into the left
+ * and right halves of the real backbuffer (two StretchRect calls) before
+ * calling through to the real Present - a side-by-side stereo image.
+ *
+ * See notes/13-first-stereo-prototype.md for the full writeup, exact
+ * addresses/byte dumps used to design the inline hooks, and empirical
+ * results.
  *
  * Vtable indices used (0-based, standard COM: slot 0/1/2 are always
  * QueryInterface/AddRef/Release):
@@ -22,12 +54,10 @@
  * toolchain used to build this DLL - see the STDMETHOD() ordering in that
  * header), and (2) a prior live x64dbg session that read the *actual* vtable
  * out of process memory and breakpointed both slots successfully (see
- * notes/04-live-debug-findings.md, "vtable slot 16 read live + breakpoint
- * hit" / "slot 17 read live + ... breakpoint hit confirmed"). Rather than
- * hardcode raw slot numbers into pointer arithmetic (easy to get subtly
- * wrong), the hooks below patch the named function-pointer fields of the
- * real d3d9.h vtbl structs directly (This->lpVtbl->CreateDevice = ...,
- * ->lpVtbl->Present = ...) so the compiler - not manual offset math -
+ * notes/04-live-debug-findings.md). Rather than hardcode raw slot numbers
+ * into pointer arithmetic, the hooks below patch the named function-pointer
+ * fields of the real d3d9.h vtbl structs directly (This->lpVtbl->CreateDevice
+ * = ..., ->lpVtbl->Present = ...) so the compiler - not manual offset math -
  * guarantees the correct slot is patched.
  *
  * Build target: 32-bit (i686), matching the 32-bit Psychonauts.exe.
@@ -37,6 +67,8 @@
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
+#include <math.h>
 
 typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
 typedef HRESULT (STDMETHODCALLTYPE *CreateDevice_t)(
@@ -152,6 +184,370 @@ static BOOL LoadRealD3D9(void)
     return TRUE;
 }
 
+/* ======================================================================
+ * Stereo prototype: inline hooks into Psychonauts.exe's own code
+ * ====================================================================== */
+
+typedef struct { float x, y, z; } Vec3;
+
+/* Fixed addresses, confirmed stable (no ASLR on the main module) across
+ * every prior session - see notes/07, notes/10, notes/11, notes/12, and
+ * this session's own raw-file byte dump (notes/13) which re-confirmed the
+ * exact prologue bytes used below to size each inline patch. */
+#define ADDR_BUILDVIEWMATRIX ((BYTE *)0x00692480u)
+#define ADDR_CANDB           ((BYTE *)0x004FEDA0u)
+
+/* Both prologues are a clean, fully-relocatable 6-byte instruction run
+ * (push ebp; mov ebp,esp; <one more 3-byte instruction>) - confirmed via a
+ * raw file byte dump this session (notes/13):
+ *   BuildViewMatrix: 55 8B EC 83 E4 F0  (push ebp; mov ebp,esp; and esp,0xFFFFFFF0)
+ *   CandB:           55 8B EC 83 EC 20  (push ebp; mov ebp,esp; sub esp,0x20)
+ * 6 bytes is enough room for a 5-byte E9 rel32 jump + 1 NOP pad, and neither
+ * instruction is position-dependent (no relative jmp/call inside), so both
+ * can be safely copied byte-for-byte into a trampoline. */
+#define INLINE_PATCH_LEN 6
+
+/* Half interpupillary-distance offset applied along the camera's right
+ * vector for each eye (full separation = 2x this value). Reasoning: the
+ * title screen's live camera eye->at distance was measured at ~190-200
+ * world units (notes/08, notes/09). Scaling a real human IPD (~6.3cm)
+ * proportionally against a plausible ~2m real-world viewing distance for a
+ * similarly-framed shot gives a ratio of ~0.0315; applied to ~195 world
+ * units that is ~6.1 units full separation, i.e. ~3.05 half-offset - very
+ * close to the task's own suggested "~6-7 world units" ballpark. 3.25 (6.5
+ * full) was chosen as a round number in that range. */
+#define STEREO_HALF_IPD 3.25f
+
+static IDirect3DDevice9 *g_pDevice = NULL;
+static IDirect3DSurface9 *g_pRealBackBuffer = NULL;
+static IDirect3DSurface9 *g_pEye1Surf = NULL;
+static IDirect3DSurface9 *g_pEye2Surf = NULL;
+static UINT g_bbWidth = 0;
+static UINT g_bbHeight = 0;
+static BOOL g_stereoReady = FALSE; /* device + both offscreen surfaces created OK */
+
+static BOOL g_frameCamCached = FALSE;
+static Vec3 g_baseEye, g_baseAt, g_baseUp, g_rightVec;
+static void *g_camPOutMatrix = NULL;
+
+/* Trampoline entry points (allocated executable memory, filled in by
+ * InstallInlineHooks). Calling through these runs the REAL, unmodified
+ * original function body exactly as if the inline patch had never been
+ * applied - see MakeTrampoline(). Declared with exact asm-label names (via
+ * the `asm("name")` GCC/clang extension) so the naked hook functions below
+ * can reference them by a guaranteed, un-mangled symbol name. */
+static void *BVM_Trampoline_asm asm("BVM_Trampoline_asm") = NULL;
+static void *CandB_Trampoline_asm asm("CandB_Trampoline_asm") = NULL;
+/* Only ever written/read from the raw asm blocks below (never referenced
+ * from C code), so the compiler's dead-store elimination would otherwise
+ * strip it entirely - __attribute__((used)) forces it to be kept and
+ * emitted with external linkage under its exact asm-label name. */
+__attribute__((used)) DWORD CandB_This_asm asm("CandB_This_asm") = 0;
+
+typedef void (__cdecl *BuildViewMatrixFn)(void *pOut, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp);
+static BuildViewMatrixFn g_realBuildViewMatrix = NULL;
+
+/* ---- small vector helpers ---- */
+static Vec3 Vec3Sub(Vec3 a, Vec3 b) { Vec3 r; r.x = a.x - b.x; r.y = a.y - b.y; r.z = a.z - b.z; return r; }
+static Vec3 Vec3Cross(Vec3 a, Vec3 b)
+{
+    Vec3 r;
+    r.x = a.y * b.z - a.z * b.y;
+    r.y = a.z * b.x - a.x * b.z;
+    r.z = a.x * b.y - a.y * b.x;
+    return r;
+}
+static Vec3 Vec3Normalize(Vec3 v)
+{
+    float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+    Vec3 r;
+    if (len < 1e-6f) { r.x = 1.0f; r.y = 0.0f; r.z = 0.0f; return r; }
+    r.x = v.x / len; r.y = v.y / len; r.z = v.z / len;
+    return r;
+}
+
+/* ---- C-side helpers called from the naked asm hooks (asm-labeled so the
+ * raw asm blocks below can `call` them by an exact, guaranteed name) ---- */
+
+/* Fires on every real BuildViewMatrix call. Only the FIRST call of each
+ * real Present frame does anything: caches a clean (never mutated) copy of
+ * eye/at/up plus the pOutMatrix pointer the game's own pipeline reads from,
+ * and computes the camera's right vector. The real call is always let
+ * through completely unmodified - deliberately NOT mutating *pEye in place,
+ * to sidestep the "persistent pointer, writes carry forward frame-to-frame"
+ * compounding behavior documented in notes/09. */
+void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp) asm("BVM_OnEntry_asm");
+void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
+{
+    if (g_frameCamCached) return;
+    if (!pEye || !pAt || !pUp) return;
+
+    g_baseEye = *pEye;
+    g_baseAt = *pAt;
+    g_baseUp = *pUp;
+    g_camPOutMatrix = pOutMatrix;
+
+    {
+        Vec3 fwd = Vec3Normalize(Vec3Sub(g_baseAt, g_baseEye));
+        g_rightVec = Vec3Normalize(Vec3Cross(fwd, g_baseUp));
+    }
+
+    g_frameCamCached = TRUE;
+
+    {
+        static DWORD s_lastLog = 0;
+        DWORD now = GetTickCount();
+        if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
+            LogLine("BVM cache SET: pOut=0x%p eye=(%.2f,%.2f,%.2f) at=(%.2f,%.2f,%.2f) right=(%.4f,%.4f,%.4f)",
+                    pOutMatrix, g_baseEye.x, g_baseEye.y, g_baseEye.z,
+                    g_baseAt.x, g_baseAt.y, g_baseAt.z,
+                    g_rightVec.x, g_rightVec.y, g_rightVec.z);
+            s_lastLog = now;
+        }
+    }
+}
+
+/* Switches the active render target to the given eye's dedicated offscreen
+ * surface and overwrites the cached camera's view matrix in place by
+ * directly re-invoking BuildViewMatrix's real, unmodified body (through its
+ * trampoline) with a fresh eye position computed from the cached clean base
+ * - never from a read-back already-offset value. */
+static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf)
+{
+    if (!g_stereoReady || !g_pDevice || !targetSurf) return;
+
+    g_pDevice->lpVtbl->SetRenderTarget(g_pDevice, 0, targetSurf);
+
+    if (g_frameCamCached && g_camPOutMatrix && g_realBuildViewMatrix) {
+        Vec3 eye;
+        eye.x = g_baseEye.x + g_rightVec.x * STEREO_HALF_IPD * sign;
+        eye.y = g_baseEye.y + g_rightVec.y * STEREO_HALF_IPD * sign;
+        eye.z = g_baseEye.z + g_rightVec.z * STEREO_HALF_IPD * sign;
+        /* NOTE (see notes/13): this write was empirically confirmed to land
+         * correctly in *pOutMatrix (verified via read-back during this
+         * session's diagnostic pass), but was ALSO confirmed to have no
+         * visible effect on the rendered image even at 18x the realistic
+         * offset magnitude - almost certainly because the actual camera
+         * data consumed by CandB's draws is vertex shader constants
+         * uploaded once earlier in the frame (before CandB runs), not a
+         * live re-read of this matrix buffer. Left in place as the
+         * documented, structurally-correct injection call; the real fix
+         * needs the shader-constant upload call site (notes/07 flagged
+         * this gap and it's still open - see notes/13 "what's next"). */
+        g_realBuildViewMatrix(g_camPOutMatrix, &eye, &g_baseAt, &g_baseUp);
+    }
+}
+
+/* IMPORTANT DISCOVERY (this session, see notes/13): CandB's own nested call
+ * tree - not CandB/CandA's own bodies (notes/11 found zero D3D-vtable-
+ * pattern calls at THAT level), but one of the 89 combined un-individually-
+ * disassembled nested helpers - itself calls the real Present internally.
+ * Confirmed empirically: a re-entrancy flag read back TRUE from inside
+ * Hook_Present while execution was still nested inside CandB's own
+ * double-call region. This means each CandB invocation is really a
+ * "render this eye AND flip it to the screen" unit, not a pure render-only
+ * unit as notes/11's CandB/CandA-level-only analysis assumed - the flip
+ * just happens too deep in the call tree for that pass to have seen it.
+ *
+ * Fix: track which of the two calls is in flight with a 3-state phase
+ * instead of a boolean. During eye 1's call, its internal Present is fully
+ * suppressed (no composite, no real present - eye 2 hasn't been drawn yet,
+ * presenting now would just flip stale/partial content). During eye 2's
+ * call, ITS internal Present is repurposed as the actual "both eyes are
+ * now done" signal: that's where the real composite (StretchRect eye1+eye2
+ * into backbuffer halves) and the one real hardware Present happen. */
+#define STEREO_PHASE_IDLE  0
+#define STEREO_PHASE_EYE1  1
+#define STEREO_PHASE_EYE2  2
+static volatile LONG g_stereoPhase = STEREO_PHASE_IDLE;
+
+void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
+void __cdecl CandB_BeforeEye1_asm(void)
+{
+    g_stereoPhase = STEREO_PHASE_EYE1;
+    SetEyeAndTarget(-1.0f, g_pEye1Surf);
+}
+
+void __cdecl CandB_BeforeEye2_asm(void) asm("CandB_BeforeEye2_asm");
+void __cdecl CandB_BeforeEye2_asm(void)
+{
+    g_stereoPhase = STEREO_PHASE_EYE2;
+    SetEyeAndTarget(+1.0f, g_pEye2Surf);
+}
+
+void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
+void __cdecl CandB_AfterBoth_asm(void)
+{
+    g_stereoPhase = STEREO_PHASE_IDLE;
+    if (!g_stereoReady || !g_pDevice || !g_pRealBackBuffer) return;
+    g_pDevice->lpVtbl->SetRenderTarget(g_pDevice, 0, g_pRealBackBuffer);
+}
+
+/* ---- naked inline-hook entry points -----------------------------------
+ *
+ * Both are entered via a JMP planted at the target function's own first
+ * INLINE_PATCH_LEN bytes (see PatchJump), so at entry the CPU state is
+ * EXACTLY what it would be at the real function's own entry point: no
+ * prologue has run yet, ESP points at the return address the real caller's
+ * `call` instruction pushed, and any incoming registers the real function
+ * itself reads (BuildViewMatrix reads none; CandB reads ECX as a "this"-like
+ * context pointer - confirmed by its own first instruction, `mov
+ * [ebp-0x20],ecx`, in the raw byte dump in notes/13) are exactly as the game
+ * set them up.
+ *
+ * Hook_BuildViewMatrix: a plain "observe via a C helper, then tail-JMP into
+ * the trampoline" hook. Since it ends in a JMP (not a CALL) to the
+ * trampoline, the trampoline's own eventual `ret` pops the REAL original
+ * return address and resumes the game's own caller directly - transparent,
+ * single real invocation, our C helper never mutates the stack region past
+ * reading it.
+ *
+ * Hook_CandB: a "call the real body twice" hook. It uses CALL (not JMP) to
+ * invoke the trampoline both times, which means each invocation pushes our
+ * own return address on top of whatever's already on the stack; the real
+ * function's own standard epilogue (mov esp,ebp; pop ebp; ret) pops exactly
+ * that top return address and hands control straight back to us - the real
+ * original return address (pushed by the game's own `call CandB`) sits
+ * untouched further down the stack the entire time, and our own final `ret`
+ * pops it, returning control to the game exactly once, after both eye
+ * passes have completed. This two-tier "call resolves inward" trick is what
+ * lets the game's own render-dispatch function be invoked twice per frame
+ * from a single interception point.
+ */
+__attribute__((naked)) void Hook_BuildViewMatrix(void)
+{
+    __asm__ __volatile__(
+        "movl 4(%esp), %eax\n\t"   /* pOutMatrix */
+        "movl 8(%esp), %ecx\n\t"   /* pEye */
+        "movl 12(%esp), %edx\n\t"  /* pAt */
+        "pushl 16(%esp)\n\t"       /* pUp (esp unchanged so far, offset still valid) */
+        "pushl %edx\n\t"
+        "pushl %ecx\n\t"
+        "pushl %eax\n\t"
+        "call BVM_OnEntry_asm\n\t"
+        "addl $16, %esp\n\t"
+        "jmp *BVM_Trampoline_asm\n\t"
+    );
+}
+
+__attribute__((naked)) void Hook_CandB(void)
+{
+    __asm__ __volatile__(
+        "movl %ecx, CandB_This_asm\n\t"
+        "call CandB_BeforeEye1_asm\n\t"
+        "movl CandB_This_asm, %ecx\n\t"
+        "call *CandB_Trampoline_asm\n\t"
+        "call CandB_BeforeEye2_asm\n\t"
+        "movl CandB_This_asm, %ecx\n\t"
+        "call *CandB_Trampoline_asm\n\t"
+        "call CandB_AfterBoth_asm\n\t"
+        "ret\n\t"
+    );
+}
+
+/* Allocate an executable trampoline stub: a byte-for-byte copy of the
+ * original function's first `patchLen` bytes, followed by a JMP back to
+ * (originalFuncAddr + patchLen) to resume the function's own unpatched
+ * body. Calling this stub (via `call`) behaves exactly like calling the
+ * real, never-hooked function - it's the mechanism used both to let each
+ * hook's own "real" invocation proceed, and to let arbitrary other code
+ * (e.g. SetEyeAndTarget re-invoking BuildViewMatrix) call the pristine
+ * original directly. */
+static void *MakeTrampoline(BYTE *originalFuncAddr, int patchLen)
+{
+    BYTE *stub = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    DWORD relTarget;
+
+    if (!stub) return NULL;
+
+    memcpy(stub, originalFuncAddr, (size_t)patchLen);
+
+    stub[patchLen] = 0xE9; /* JMP rel32 */
+    relTarget = (DWORD)(originalFuncAddr + patchLen) - (DWORD)(stub + patchLen + 5);
+    memcpy(stub + patchLen + 1, &relTarget, 4);
+
+    return stub;
+}
+
+/* Overwrite the first `patchLen` (>=5) bytes of originalFuncAddr with
+ * E9 <rel32 to hookFuncAddr>, padded with NOPs to patchLen bytes. */
+static BOOL PatchJump(BYTE *originalFuncAddr, int patchLen, void *hookFuncAddr)
+{
+    DWORD oldProtect;
+    DWORD relTarget;
+    int i;
+
+    if (!VirtualProtect(originalFuncAddr, (SIZE_T)patchLen, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        LogLine("ERROR: VirtualProtect failed patching 0x%p, err=%lu", (void *)originalFuncAddr, GetLastError());
+        return FALSE;
+    }
+
+    originalFuncAddr[0] = 0xE9;
+    relTarget = (DWORD)hookFuncAddr - (DWORD)(originalFuncAddr + 5);
+    memcpy(originalFuncAddr + 1, &relTarget, 4);
+    for (i = 5; i < patchLen; i++) originalFuncAddr[i] = 0x90;
+
+    VirtualProtect(originalFuncAddr, (SIZE_T)patchLen, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), originalFuncAddr, (SIZE_T)patchLen);
+    return TRUE;
+}
+
+/* Installs both inline hooks. Pure code-patching, needs no live D3D device,
+ * so it's called once from DllMain(DLL_PROCESS_ATTACH) - the target
+ * addresses are inside Psychonauts.exe's own already-loaded .text section
+ * from the moment the process starts. */
+static BOOL InstallInlineHooks(void)
+{
+    void *bvmTrampoline = MakeTrampoline(ADDR_BUILDVIEWMATRIX, INLINE_PATCH_LEN);
+    void *candbTrampoline = MakeTrampoline(ADDR_CANDB, INLINE_PATCH_LEN);
+
+    if (!bvmTrampoline || !candbTrampoline) {
+        LogLine("ERROR: MakeTrampoline failed (bvm=%p candb=%p)", bvmTrampoline, candbTrampoline);
+        return FALSE;
+    }
+
+    BVM_Trampoline_asm = bvmTrampoline;
+    CandB_Trampoline_asm = candbTrampoline;
+    g_realBuildViewMatrix = (BuildViewMatrixFn)bvmTrampoline;
+
+    if (!PatchJump(ADDR_BUILDVIEWMATRIX, INLINE_PATCH_LEN, (void *)Hook_BuildViewMatrix)) return FALSE;
+    if (!PatchJump(ADDR_CANDB, INLINE_PATCH_LEN, (void *)Hook_CandB)) return FALSE;
+
+    LogLine("Installed inline hooks: BuildViewMatrix @0x%p (trampoline=0x%p), CandB @0x%p (trampoline=0x%p)",
+            (void *)ADDR_BUILDVIEWMATRIX, bvmTrampoline, (void *)ADDR_CANDB, candbTrampoline);
+    return TRUE;
+}
+
+/* Creates the two offscreen "per-eye" render targets, matching the real
+ * backbuffer's dimensions/format, and grabs+retains a reference to the real
+ * backbuffer surface (needed by Hook_Present's composite step and by
+ * CandB_AfterBoth_asm to restore the render target after both eye passes). */
+static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS *pp)
+{
+    HRESULT hrBB, hrE1, hrE2;
+
+    g_pDevice = pDevice;
+    g_bbWidth = pp->BackBufferWidth;
+    g_bbHeight = pp->BackBufferHeight;
+
+    hrBB = pDevice->lpVtbl->GetBackBuffer(pDevice, 0, 0, D3DBACKBUFFER_TYPE_MONO, &g_pRealBackBuffer);
+    hrE1 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_bbWidth, g_bbHeight, D3DFMT_A8R8G8B8,
+                                                D3DMULTISAMPLE_NONE, 0, FALSE, &g_pEye1Surf, NULL);
+    hrE2 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_bbWidth, g_bbHeight, D3DFMT_A8R8G8B8,
+                                                D3DMULTISAMPLE_NONE, 0, FALSE, &g_pEye2Surf, NULL);
+
+    LogLine("SetupStereoSurfaces: GetBackBuffer hr=0x%08lX ptr=0x%p | Eye1 hr=0x%08lX ptr=0x%p | Eye2 hr=0x%08lX ptr=0x%p (%ux%u)",
+            (unsigned long)hrBB, (void *)g_pRealBackBuffer,
+            (unsigned long)hrE1, (void *)g_pEye1Surf,
+            (unsigned long)hrE2, (void *)g_pEye2Surf,
+            g_bbWidth, g_bbHeight);
+
+    g_stereoReady = SUCCEEDED(hrBB) && SUCCEEDED(hrE1) && SUCCEEDED(hrE2) &&
+                    g_pRealBackBuffer && g_pEye1Surf && g_pEye2Surf;
+
+    LogLine("Stereo ready = %d", g_stereoReady ? 1 : 0);
+}
+
 /* ---- Present hook (IDirect3DDevice9 vtable slot 17) -------------------- */
 /*
  * Fires once per frame. Logging every single call would spam the log file
@@ -159,6 +555,11 @@ static BOOL LoadRealD3D9(void)
  * use, so this throttles to roughly once per second (wall-clock, via
  * GetTickCount - robust to any framerate) while still incrementing a total
  * frame counter every call, so the log shows real elapsed-frame deltas.
+ *
+ * Also does the stereo composite: StretchRect both offscreen eye surfaces
+ * into the left/right halves of the real backbuffer before calling through
+ * to the real Present, and resets the per-frame camera cache flag so the
+ * next frame's first BuildViewMatrix hit re-caches a fresh clean base.
  */
 static HRESULT STDMETHODCALLTYPE Hook_Present(
     IDirect3DDevice9 *This,
@@ -169,9 +570,46 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
 {
     LONG frame = InterlockedIncrement(&g_frameCounter);
     DWORD now = GetTickCount();
+    BOOL doLog = (g_lastPresentLogTick == 0 || (DWORD)(now - g_lastPresentLogTick) >= 1000);
 
-    if (g_lastPresentLogTick == 0 || (DWORD)(now - g_lastPresentLogTick) >= 1000) {
-        LogLine("Present() hit - total frame #%ld (throttled ~1 log/sec)", frame);
+    /* CandB's own nested call tree calls Present internally (discovered
+     * this session - see the comment above CandB_BeforeEye1_asm). While
+     * eye 1's call is in flight, its internal Present fires too early (eye
+     * 2 hasn't been drawn yet) - fully suppress it, don't call through to
+     * the real Present at all, just report success and let CandB's own
+     * body continue running. */
+    if (g_stereoPhase == STEREO_PHASE_EYE1) {
+        return D3D_OK;
+    }
+
+    if (g_stereoPhase == STEREO_PHASE_EYE2 && g_stereoReady) {
+        /* Both eyes are now fully rendered (eye 1 completed normally
+         * including its own suppressed Present above; eye 2 just finished
+         * drawing right up to this Present call) - the real compositing
+         * moment: stitch both offscreen eye surfaces into the left/right
+         * halves of the real backbuffer before letting this one real
+         * hardware Present go through. */
+        RECT srcFull;
+        RECT dstLeft;
+        RECT dstRight;
+        HRESULT hrL, hrR;
+
+        srcFull.left = 0; srcFull.top = 0; srcFull.right = (LONG)g_bbWidth; srcFull.bottom = (LONG)g_bbHeight;
+        dstLeft.left = 0; dstLeft.top = 0; dstLeft.right = (LONG)(g_bbWidth / 2); dstLeft.bottom = (LONG)g_bbHeight;
+        dstRight.left = (LONG)(g_bbWidth / 2); dstRight.top = 0; dstRight.right = (LONG)g_bbWidth; dstRight.bottom = (LONG)g_bbHeight;
+
+        hrL = This->lpVtbl->StretchRect(This, g_pEye1Surf, &srcFull, g_pRealBackBuffer, &dstLeft, D3DTEXF_LINEAR);
+        hrR = This->lpVtbl->StretchRect(This, g_pEye2Surf, &srcFull, g_pRealBackBuffer, &dstRight, D3DTEXF_LINEAR);
+
+        if (doLog) {
+            LogLine("Present() composite (phase EYE2): StretchRect L=0x%08lX R=0x%08lX", (unsigned long)hrL, (unsigned long)hrR);
+        }
+    }
+
+    g_frameCamCached = FALSE;
+
+    if (doLog) {
+        LogLine("Present() hit - total frame #%ld phase=%ld (throttled ~1 log/sec)", frame, g_stereoPhase);
         g_lastPresentLogTick = now;
     }
 
@@ -252,6 +690,9 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
 
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
         InstallPresentHook(*ppReturnedDeviceInterface);
+        if (pPresentationParameters) {
+            SetupStereoSurfaces(*ppReturnedDeviceInterface, pPresentationParameters);
+        }
     }
 
     return hr;
@@ -316,6 +757,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         InitializeCriticalSection(&g_logLock);
         g_logLockInit = TRUE;
         LogLine("==== psychonautsvr proxy d3d9.dll: DLL_PROCESS_ATTACH (pid=%lu) ====", GetCurrentProcessId());
+        if (!InstallInlineHooks()) {
+            LogLine("ERROR: InstallInlineHooks failed - stereo prototype disabled, proxy still runs as pure observer");
+        }
         break;
     case DLL_PROCESS_DETACH:
         LogLine("==== psychonautsvr proxy d3d9.dll: DLL_PROCESS_DETACH (pid=%lu) ====", GetCurrentProcessId());
