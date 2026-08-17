@@ -433,6 +433,67 @@ typedef EVRCompositorError (__thiscall *VRBridge_WaitGetPoses_t)(void *pThis,
 typedef EVRCompositorError (__thiscall *VRBridge_Submit_t)(void *pThis,
     EVREye eEye, const Texture_t *pTexture, const VRTextureBounds_t *pBounds, EVRSubmitFlags nSubmitFlags);
 
+/* notes/31: per-span QueryPerformanceCounter timing, added to settle notes/30's open question
+ * (does WaitGetPoses or the GetRenderTargetData/memcpy/UpdateSurface readback chain dominate the
+ * measured ~8-9ms/frame VR-bridge cost?) with real microsecond-level data instead of guessing.
+ * Zero cost when g_vrSubmitEnabled is FALSE (this code only ever runs inside VRBridge_* functions,
+ * all of which early-out on that flag). Accumulates min/avg/max over a throttled ~1sec window,
+ * matching this file's existing log-throttle convention, then resets for the next window. */
+typedef struct {
+    LONGLONG sumTicks;
+    LONGLONG minTicks;
+    LONGLONG maxTicks;
+    int count;
+    DWORD lastLogTick;
+} VRBridgeTimingStat;
+
+static LARGE_INTEGER g_vrPerfFreq;
+static BOOL g_vrPerfFreqInit = FALSE;
+
+static double VRBridge_TicksToMs(LONGLONG ticks)
+{
+    if (!g_vrPerfFreqInit) { QueryPerformanceFrequency(&g_vrPerfFreq); g_vrPerfFreqInit = TRUE; }
+    if (g_vrPerfFreq.QuadPart == 0) return 0.0;
+    return (double)ticks * 1000.0 / (double)g_vrPerfFreq.QuadPart;
+}
+
+static void VRBridge_RecordSpan(VRBridgeTimingStat *stat, LONGLONG deltaTicks, const char *label)
+{
+    DWORD now;
+
+    if (stat->count == 0) {
+        stat->minTicks = deltaTicks;
+        stat->maxTicks = deltaTicks;
+    } else {
+        if (deltaTicks < stat->minTicks) stat->minTicks = deltaTicks;
+        if (deltaTicks > stat->maxTicks) stat->maxTicks = deltaTicks;
+    }
+    stat->sumTicks += deltaTicks;
+    stat->count++;
+
+    now = GetTickCount();
+    if (stat->lastLogTick == 0 || (DWORD)(now - stat->lastLogTick) >= 1000) {
+        double avgMs = VRBridge_TicksToMs(stat->sumTicks / stat->count);
+        double minMs = VRBridge_TicksToMs(stat->minTicks);
+        double maxMs = VRBridge_TicksToMs(stat->maxTicks);
+        LogLine("VRBridge_Timing: %-22s n=%-4d avg=%.4fms min=%.4fms max=%.4fms",
+                label, stat->count, avgMs, minMs, maxMs);
+        stat->sumTicks = 0;
+        stat->count = 0;
+        stat->lastLogTick = now;
+    }
+}
+
+static VRBridgeTimingStat g_statWaitGetPoses;
+
+/* notes/31 diagnostic-only bypass flags: runtime env vars (read once alongside
+ * PSYVR_ENABLE_SUBMIT) letting an A/B comparison of WaitGetPoses vs. the per-eye pump be done by
+ * relaunching with a different env var, not a rebuild - much faster iteration while isolating which
+ * candidate actually drives the measured Present() cost. Both default OFF (normal behavior
+ * unchanged) - purely diagnostic, not meant to ship enabled. */
+static BOOL g_vrSkipWaitPoses = FALSE;
+static BOOL g_vrSkipPumpEye = FALSE;
+
 /* Per-eye double-buffered two-hop pipeline state (notes/28, proven in
  * tools/vr-bridge/poc_dual_device_shared/dual_device_poc.c). "Device B" in that POC's terms is
  * always g_pDevice (the game's own plain device, already tracked); "Device A" is g_pVRDeviceA
@@ -457,6 +518,9 @@ typedef struct {
                         forever (see notes/29), sysmemB[1] was never written, pendingB[bPrev] was
                         never TRUE, no promotion could ever happen, and Submit was never reached. */
     EVREye vrEye;
+    /* notes/31: per-eye timing stats for the two candidate hot-path costs. */
+    VRBridgeTimingStat statGRTD;      /* GetRenderTargetData call alone (hop 1a) */
+    VRBridgeTimingStat statReadback;  /* LockRect+memcpy+UpdateSurface promotion chain (hop 1b), only when it actually runs */
 } VRBridgeEyeState;
 
 static BOOL g_vrSubmitEnabled = FALSE;   /* runtime flag: env var PSYVR_ENABLE_SUBMIT=1, read once at DllMain */
@@ -483,6 +547,16 @@ static void VRBridge_ReadEnableFlag(void)
     g_vrSubmitEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
     LogLine("VRBridge: PSYVR_ENABLE_SUBMIT=%s -> g_vrSubmitEnabled=%d",
             (len > 0 && len < sizeof(buf)) ? buf : "(unset)", g_vrSubmitEnabled ? 1 : 0);
+
+    /* notes/31 diagnostic-only A/B toggles - see the comment on g_vrSkipWaitPoses above. */
+    len = GetEnvironmentVariableA("PSYVR_SKIP_WAITPOSES", buf, sizeof(buf));
+    g_vrSkipWaitPoses = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    len = GetEnvironmentVariableA("PSYVR_SKIP_PUMPEYE", buf, sizeof(buf));
+    g_vrSkipPumpEye = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_vrSkipWaitPoses || g_vrSkipPumpEye) {
+        LogLine("VRBridge: diagnostic bypass flags - g_vrSkipWaitPoses=%d g_vrSkipPumpEye=%d",
+                g_vrSkipWaitPoses ? 1 : 0, g_vrSkipPumpEye ? 1 : 0);
+    }
 }
 
 static void VRBridge_ReleaseEyeBuffers(VRBridgeEyeState *eye)
@@ -713,8 +787,19 @@ static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeS
     HRESULT hr;
     eye->frameCount++;
 
-    /* --- Hop 1a: kick off this frame's readback into the CURRENT sysmemB slot. --- */
-    hr = g_pDevice->lpVtbl->GetRenderTargetData(g_pDevice, pGameEyeSurf, eye->sysmemB[bCur]);
+    /* --- Hop 1a: kick off this frame's readback into the CURRENT sysmemB slot. ---
+     * notes/31: timed alone (GetRenderTargetData call only) to separate its cost from the
+     * LockRect/memcpy/UpdateSurface chain below, which notes/28 already measured as sub-0.1ms in
+     * isolation against a synthetic Clear()-only workload but never against the real game scene. */
+    {
+        LARGE_INTEGER tG0, tG1;
+        char label[32];
+        QueryPerformanceCounter(&tG0);
+        hr = g_pDevice->lpVtbl->GetRenderTargetData(g_pDevice, pGameEyeSurf, eye->sysmemB[bCur]);
+        QueryPerformanceCounter(&tG1);
+        _snprintf(label, sizeof(label), "GetRenderTargetData[%d]", (int)eye->vrEye);
+        VRBridge_RecordSpan(&eye->statGRTD, tG1.QuadPart - tG0.QuadPart, label);
+    }
     if (FAILED(hr)) return; /* leave pendingB[bCur] as-is; try again next frame */
     eye->pendingB[bCur] = TRUE;
 
@@ -722,9 +807,14 @@ static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeS
      * it into Device A's next free slot. --- */
     if (eye->pendingB[bPrev]) {
         D3DLOCKED_RECT lockedB;
-        HRESULT lockHr = eye->sysmemB[bPrev]->lpVtbl->LockRect(eye->sysmemB[bPrev], &lockedB, NULL,
-                                                                 D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
+        LARGE_INTEGER tR0, tR1;
+        BOOL didWork = FALSE;
+        HRESULT lockHr;
+        QueryPerformanceCounter(&tR0);
+        lockHr = eye->sysmemB[bPrev]->lpVtbl->LockRect(eye->sysmemB[bPrev], &lockedB, NULL,
+                                                        D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
         if (lockHr == S_OK) {
+            didWork = TRUE;
             int aCur = eye->hop1Count % 2;
             BOOL aSlotFree = TRUE;
             if (eye->pendingA[aCur]) {
@@ -758,6 +848,15 @@ static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeS
         /* else lockHr != S_OK (e.g. D3DERR_WASSTILLDRAWING): the readback isn't done yet - do NOT
          * call UnlockRect (no successful Lock to match it), just leave this slot pending and check
          * again next frame. */
+        if (didWork) {
+            /* notes/31: only record the span when the chain actually ran end-to-end (LockRect
+             * succeeded AND the rest executed) - a D3DERR_WASSTILLDRAWING skip is a near-zero-cost
+             * non-blocking poll, not part of the real readback-chain cost being measured here. */
+            char label[32];
+            QueryPerformanceCounter(&tR1);
+            _snprintf(label, sizeof(label), "ReadbackChain[%d]", (int)eye->vrEye);
+            VRBridge_RecordSpan(&eye->statReadback, tR1.QuadPart - tR0.QuadPart, label);
+        }
     }
 
     /* --- Hop 2: non-blocking check of the oldest Device-A slot with a pending upload; if its
@@ -799,23 +898,49 @@ static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeS
     }
 }
 
-/* Called once per real Present-frame (from CandB_AfterBoth_asm, right where the existing monitor
- * composite already runs) once both eyes have finished rendering into g_pEye1Surf/g_pEye2Surf.
- * WaitGetPoses is called once per frame (standard OpenVR usage pattern) before either eye's Submit. */
+/* notes/31: split from the original single VRBridge_OnFrameComposited (which called WaitGetPoses
+ * AND the per-eye pump together, both from CandB_AfterBoth_asm - i.e. AFTER both eyes had already
+ * finished rendering). Direct instrumentation this session found WaitGetPoses costs a real,
+ * consistent ~25ms/call, confirmed REQUIRED for Submit to succeed (skipping it entirely restores
+ * full non-bridge framerate but breaks Submit with VRCompositorError_DoNotHaveFocus - see the
+ * PresentationInterval comment on Hook_CreateDevice for the parallel double-pacing finding).
+ * Standard OpenVR usage calls WaitGetPoses as early as possible each frame (right after the
+ * previous Present, at the TOP of the next frame's work) specifically so its compositor-side wait
+ * overlaps with the game's own CPU-side per-frame simulation, instead of sitting as pure added
+ * tail latency after rendering is already done. This file's hook points make that possible: call
+ * VRBridge_PumpPoses() from Hook_Present right after the real hardware Present succeeds (this
+ * frame is fully done; the NEXT frame's CPU-side game logic starts immediately after, giving the
+ * wait real work to overlap with) and keep VRBridge_PumpEyes() (which needs the actual rendered eye
+ * surfaces) at its original call site in CandB_AfterBoth_asm. */
+static void VRBridge_PumpPoses(void)
+{
+    if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
+    if (!g_pVRWaitGetPoses || g_vrSkipWaitPoses) return;
+
+    {
+        TrackedDevicePose_t renderPoses[64], gamePoses[64];
+        LARGE_INTEGER tW0, tW1;
+        ZeroMemory(renderPoses, sizeof(renderPoses));
+        ZeroMemory(gamePoses, sizeof(gamePoses));
+        QueryPerformanceCounter(&tW0);
+        g_pVRWaitGetPoses(g_pVRCompositor, renderPoses, 64, gamePoses, 64);
+        QueryPerformanceCounter(&tW1);
+        VRBridge_RecordSpan(&g_statWaitGetPoses, tW1.QuadPart - tW0.QuadPart, "WaitGetPoses");
+    }
+}
+
+/* Called once per real Present-frame from CandB_AfterBoth_asm, once both eyes have finished
+ * rendering into g_pEye1Surf/g_pEye2Surf - unchanged from before except WaitGetPoses itself moved
+ * out (see VRBridge_PumpPoses above). */
 static void VRBridge_OnFrameComposited(void)
 {
     if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
     if (!g_pEye1Surf || !g_pEye2Surf) return;
 
-    if (g_pVRWaitGetPoses) {
-        TrackedDevicePose_t renderPoses[64], gamePoses[64];
-        ZeroMemory(renderPoses, sizeof(renderPoses));
-        ZeroMemory(gamePoses, sizeof(gamePoses));
-        g_pVRWaitGetPoses(g_pVRCompositor, renderPoses, 64, gamePoses, 64);
+    if (!g_vrSkipPumpEye) {
+        VRBridge_PumpEye(&g_vrEye1, g_pEye1Surf);
+        VRBridge_PumpEye(&g_vrEye2, g_pEye2Surf);
     }
-
-    VRBridge_PumpEye(&g_vrEye1, g_pEye1Surf);
-    VRBridge_PumpEye(&g_vrEye2, g_pEye2Surf);
 }
 
 static void VRBridge_Shutdown(void)
@@ -1754,7 +1879,33 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
      * origDirtyRgn log fields above to confirm post-relaunch whether the
      * game was ever actually passing non-NULL values here. hDestWindowOverride
      * is passed through unmodified (unrelated to dirty-rect behavior). */
-    return g_pRealPresent(This, NULL, NULL, hDestWindowOverride, NULL);
+    /* notes/31: time the REAL hardware Present call itself - unconditional (not gated on
+     * g_vrSubmitEnabled) so the SAME instrumented build can also measure a true VR-bridge-OFF
+     * baseline with the identical direct methodology, not just when the bridge is active. This was
+     * added after the per-span WaitGetPoses/GetRenderTargetData/readback-chain timing (above/below)
+     * came back summing to only ~1.3ms/frame while the aggregate regression looked far larger - the
+     * missing cost has to be somewhere, and the real hardware Present call (which blocks on the
+     * GPU/compositor/vsync) is the next most likely place a GPU-side cost could surface, even
+     * though none of our own CPU-side D3D9 calls measure as slow. This also turned out to be the
+     * only DIRECT (non-double-counted) per-real-frame counter in this file - see the g_frameCounter
+     * comment revision below. */
+    {
+        static VRBridgeTimingStat s_statRealPresent;
+        LARGE_INTEGER tP0, tP1;
+        HRESULT presentHr;
+        QueryPerformanceCounter(&tP0);
+        presentHr = g_pRealPresent(This, NULL, NULL, hDestWindowOverride, NULL);
+        QueryPerformanceCounter(&tP1);
+        VRBridge_RecordSpan(&s_statRealPresent, tP1.QuadPart - tP0.QuadPart, "RealPresentCall");
+
+        /* notes/31: WaitGetPoses moved here (see VRBridge_PumpPoses's own comment) - called right
+         * after the real hardware Present returns, i.e. at the very start of the next frame's work,
+         * so its ~25ms compositor wait can overlap with the game's own CPU-side simulation for that
+         * next frame instead of sitting entirely after CandB has already finished rendering it. */
+        VRBridge_PumpPoses();
+
+        return presentHr;
+    }
 }
 
 /* notes/21: the game runs Windowed=1 (confirmed in the CreateDevice log) -
@@ -1800,6 +1951,14 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(
     if (g_pRealDepthStencil)  { g_pRealDepthStencil->lpVtbl->Release(g_pRealDepthStencil); g_pRealDepthStencil = NULL; }
     if (g_pEye1DepthStencil)  { g_pEye1DepthStencil->lpVtbl->Release(g_pEye1DepthStencil); g_pEye1DepthStencil = NULL; }
     if (g_pEye2DepthStencil)  { g_pEye2DepthStencil->lpVtbl->Release(g_pEye2DepthStencil); g_pEye2DepthStencil = NULL; }
+
+    /* notes/31: same PresentationInterval override as Hook_CreateDevice - a Reset (e.g. Alt+Tab)
+     * could otherwise revert the desktop swap chain to vsync-on, re-introducing the redundant
+     * double-pacing against WaitGetPoses. */
+    if (g_vrSubmitEnabled && pPresentationParameters &&
+        pPresentationParameters->PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE) {
+        pPresentationParameters->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
 
     hr = g_pRealReset(This, pPresentationParameters);
 
@@ -1880,6 +2039,26 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
                 (unsigned long)pPresentationParameters->Flags);
     } else {
         LogLine("  WARNING: pPresentationParameters is NULL");
+    }
+
+    /* notes/31: when the VR bridge is active, WaitGetPoses (called once/frame, required for
+     * IVRCompositor::Submit to succeed - see the VRBridge_OnFrameComposited comment) is ITSELF a
+     * real, measured ~25ms/frame blocking wait, paced by the OpenVR compositor - confirmed via
+     * direct A/B instrumentation (skipping it entirely restored the full non-bridge framerate, but
+     * broke Submit with VRCompositorError_DoNotHaveFocus, proving it's required, not optional). The
+     * game's own desktop-mirror swap chain requesting D3DPRESENT_INTERVAL_DEFAULT (vsync-on,
+     * confirmed via the log line above: PresentationInterval=0x0) stacks a SECOND, independent
+     * blocking wait (~14ms at this monitor's refresh rate) serially after WaitGetPoses's own wait -
+     * two separate frame-pacing mechanisms compounding, when only one (WaitGetPoses, the real VR
+     * timing source) should gate the frame. Forcing the desktop swap chain to
+     * D3DPRESENT_INTERVAL_IMMEDIATE removes the redundant second wait; the on-screen window may tear
+     * (irrelevant - it is only ever a monitor preview once a real HMD is presenting the actual view
+     * via Submit). Only applied when g_vrSubmitEnabled, so the non-VR path is completely unaffected. */
+    if (g_vrSubmitEnabled && pPresentationParameters &&
+        pPresentationParameters->PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE) {
+        LogLine("VRBridge: forcing PresentationInterval 0x%X -> D3DPRESENT_INTERVAL_IMMEDIATE (avoid double frame-pacing against WaitGetPoses)",
+                pPresentationParameters->PresentationInterval);
+        pPresentationParameters->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     }
 
     hr = g_pRealCreateDevice(This, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
