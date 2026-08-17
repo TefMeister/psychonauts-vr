@@ -239,6 +239,39 @@
  * this DLL - out of scope for this session per the task's own safety rule about the user's already-
  * running game session). See notes/28 for exactly what's proven standalone vs. what's still open.
  *
+ * Milestone 9 (this revision, notes/32): REAL OPENVR-QUERIED IPD/PROJECTION DATA, replacing the
+ * notes/24 hardcoded STEREO_HALF_IPD constant and estimated g_focusDistance shear term wherever
+ * real data is actually available. Confirmed via a standalone POC (tools/vr-bridge/poc_ipd_query,
+ * run against the live null-driver runtime BEFORE this code was written) that IVRSystem returns
+ * real, plausible values even with no physical HMD: IPD = 63.0mm exactly (the standard OpenVR
+ * default - only ~3% below the notes/15 hardcoded 3.25-unit guess), GetEyeToHeadTransform exactly
+ * +/-31.5mm (perfectly symmetric under this driver), GetRecommendedRenderTargetSize = 1656x1840/
+ * eye, and GetProjectionRaw = [-1,1,-1,1] for both eyes (i.e. this driver reports NO real off-axis
+ * asymmetry - confirmed by measurement, not assumed).
+ *
+ * VRBridge_QueryRealGeometry() (called once from VRBridge_Init, right after IVRSystem is ready)
+ * converts the meters-based IPD/eye-offset values into this game's world-unit scale via
+ * WORLD_UNITS_PER_METER=100 (the notes/15/18-established "1 world unit ~= 1cm" calibration) and
+ * caches them in g_realHalfIPD[]/g_realShearK[]/g_realShearValid[]. Hook_SetVertexShaderConstantF
+ * now uses these directly in place of STEREO_HALF_IPD/the focus-distance-derived k whenever
+ * g_vrGeomValid is TRUE - and transparently falls back to the pre-existing hardcoded behavior
+ * otherwise (OpenVR not initialized, i.e. PSYVR_ENABLE_SUBMIT unset or SteamVR absent - the
+ * default case for most users of this mod, who don't have or need SteamVR just for the monitor
+ * side-by-side stereo path). This can never make the stereo correction worse than before this
+ * session, and the real per-eye offset (g_realHalfIPD, from GetEyeToHeadTransform) need not be
+ * exactly symmetric the way STEREO_HALF_IPD*sign always was, once a real headset supplies it.
+ *
+ * GetEyeToHeadTransform returns a struct (HmdMatrix34_t) BY VALUE - a new ABI wrinkle none of the
+ * prior IVRCompositor calls hit (WaitGetPoses/Submit both take/return plain values or take output
+ * pointers). Handled the same defensive way notes/27 established for this whole file: don't trust
+ * a compiler's own struct-return code generation against MSVC-compiled code, declare the hidden
+ * return-pointer parameter explicitly instead. See the comment above VRBridge_GetEyeToHeadTransform_t.
+ *
+ * GetRecommendedRenderTargetSize's real 1656x1840/eye (vs. this file's current 640x480 VR-submit
+ * eye buffers, sized to match the game's own native backbuffer) was investigated for feasibility
+ * and found to be a genuinely separate, larger undertaking - not attempted this session, documented
+ * in notes/32 Sec4 instead of risked as a rushed mid-pipeline change.
+ *
  * Build target: 32-bit (i686), matching the 32-bit Psychonauts.exe.
  */
 
@@ -433,6 +466,38 @@ typedef EVRCompositorError (__thiscall *VRBridge_WaitGetPoses_t)(void *pThis,
 typedef EVRCompositorError (__thiscall *VRBridge_Submit_t)(void *pThis,
     EVREye eEye, const Texture_t *pTexture, const VRTextureBounds_t *pBounds, EVRSubmitFlags nSubmitFlags);
 
+/* notes/32 (Task 1): IVRSystem dispatch, same vtable-deref + __thiscall fix as IVRCompositor above.
+ * Vtable slot indices come directly from openvr_capi.h's struct VR_IVRSystem_FnTable field order
+ * (0-based, no QueryInterface/AddRef/Release prepended - IVRSystem is a plain abstract C++ class,
+ * not COM - confirmed by the already-proven slot 0 = GetRecommendedRenderTargetSize used in
+ * notes/27's own POC): 0=GetRecommendedRenderTargetSize, 2=GetProjectionRaw,
+ * 5=GetEyeToHeadTransform, 23=GetFloatTrackedDeviceProperty.
+ *
+ * GetEyeToHeadTransform returns HmdMatrix34_t (48 bytes) BY VALUE - the MSVC x86 ABI this
+ * installed SteamVR's vrclient.dll was built with passes a hidden pointer to caller-allocated
+ * return storage as the FIRST explicit parameter (right after `this`) for any large-struct-
+ * returning method. Declared explicitly here as a void-returning thiscall taking that pointer as
+ * an explicit argument, rather than trusting a compiler's own (unverified for this cross-compiler-
+ * calling-MSVC-code case) struct-return code generation - the same defensive, "don't assume the
+ * ABI, write it out" discipline notes/27 already established for this file's other OpenVR calls.
+ * GetProjectionRaw and GetFloatTrackedDeviceProperty both avoid this issue entirely (out-params /
+ * plain float return) - real evidence this pattern works: tools/vr-bridge/poc_ipd_query (notes/32)
+ * ran all four calls successfully against the live null-driver runtime before this code was
+ * written (see notes/32 Sec1 for the confirmed real numbers). */
+typedef void (__thiscall *VRBridge_GetRecommendedRenderTargetSize_t)(void *pThis, uint32_t *pW, uint32_t *pH);
+typedef void (__thiscall *VRBridge_GetProjectionRaw_t)(void *pThis, EVREye eEye, float *pL, float *pR, float *pT, float *pB);
+typedef void (__thiscall *VRBridge_GetEyeToHeadTransform_t)(void *pThis, HmdMatrix34_t *pOut, EVREye eEye);
+typedef float (__thiscall *VRBridge_GetFloatTrackedDeviceProperty_t)(void *pThis,
+    TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError);
+
+/* World-unit <-> real-world-meters conversion factor. Cross-validated across two prior sessions,
+ * not a new guess: notes/15's independent zNear/zFar-plausibility estimate ("1 world unit ~= 1cm")
+ * and notes/18's finding that the shipped STEREO_HALF_IPD=3.25 constant maps to ~6.5cm real-world
+ * separation - within 1mm of average adult human IPD (63mm) - both converge on the same ~1:1cm
+ * ratio. Used below (notes/32, Task 1) to convert OpenVR's meters-based IPD/eye-transform values
+ * into this game's world-unit scale. */
+#define WORLD_UNITS_PER_METER 100.0f
+
 /* notes/31: per-span QueryPerformanceCounter timing, added to settle notes/30's open question
  * (does WaitGetPoses or the GetRenderTargetData/memcpy/UpdateSurface readback chain dominate the
  * measured ~8-9ms/frame VR-bridge cost?) with real microsecond-level data instead of guessing.
@@ -537,6 +602,37 @@ static VRBridge_Submit_t g_pVRSubmit = NULL;
 static VRBridgeEyeState g_vrEye1, g_vrEye2; /* eye1=left, eye2=right, matching this file's existing eye numbering */
 static UINT g_vrBufWidth = 0, g_vrBufHeight = 0; /* dimensions the eye buffers above were sized for */
 
+/* notes/32 (Task 1): real per-eye geometry sourced from OpenVR, replacing the hardcoded
+ * STEREO_HALF_IPD/focus-distance estimate wherever it's actually available. g_pVRSystem/its
+ * function pointers are only non-NULL when g_vrSubmitEnabled=1 AND VRBridge_Init reached the
+ * IVRSystem step successfully - the stereo correction in Hook_SetVertexShaderConstantF (which
+ * runs unconditionally, VR-submit on or off) checks g_vrGeomValid and falls back to the original
+ * hardcoded constants whenever it's FALSE, so users without SteamVR installed at all keep getting
+ * exactly the pre-existing, already-live-tested/mod-repo-pushed monitor-stereo behavior. */
+static void *g_pVRSystem = NULL;
+static VRBridge_GetRecommendedRenderTargetSize_t g_pVRGetRecommendedRTSize = NULL;
+static VRBridge_GetProjectionRaw_t g_pVRGetProjectionRaw = NULL;
+static VRBridge_GetEyeToHeadTransform_t g_pVRGetEyeToHeadTransform = NULL;
+static VRBridge_GetFloatTrackedDeviceProperty_t g_pVRGetFloatProp = NULL;
+
+static BOOL g_vrGeomValid = FALSE;
+static float g_realHalfIPD[2] = { 0.0f, 0.0f };  /* world units, SIGNED per eye (index 0=left/eye1,
+                                                     1=right/eye2) - directly usable as `d`, no
+                                                     separate sign multiply needed (unlike the old
+                                                     STEREO_HALF_IPD*sign pattern), since a real
+                                                     headset's eye offsets need not be symmetric. */
+static float g_realShearK[2] = { 0.0f, 0.0f };   /* dimensionless GetProjectionRaw (l+r)/2 tangent-
+                                                     space frustum-center offset per eye - directly
+                                                     usable as the off-axis shear coefficient `k`
+                                                     (see the derivation above STEREO_WVP_REGISTER;
+                                                     k = (l+r)/2 is derived in notes/32 Sec2). */
+static BOOL g_realShearValid[2] = { FALSE, FALSE }; /* FALSE when GetProjectionRaw reports an
+                                                        exactly-symmetric frustum (as this null
+                                                        driver does - confirmed, not assumed, see
+                                                        notes/32 Sec1) - i.e. no real off-axis data
+                                                        to use, so Y30 keeps the existing
+                                                        focus-distance-estimated k instead. */
+
 /* Reads PSYVR_ENABLE_SUBMIT once. Default OFF - the whole VR path is inert unless explicitly
  * requested, per this session's explicit "don't risk destabilizing the working monitor path"
  * requirement. Set the env var to "1" (e.g. before launching the game) to enable. */
@@ -608,6 +704,80 @@ static BOOL VRBridge_CreateEyeBuffers(VRBridgeEyeState *eye, EVREye vrEye, UINT 
 
     LogLine("VRBridge: eye buffers created OK (eEye=%d, %ux%u)", (int)vrEye, w, h);
     return TRUE;
+}
+
+/* notes/32 (Task 1): query real per-eye geometry from IVRSystem and cache it (converted to this
+ * game's world-unit scale) for Hook_SetVertexShaderConstantF to consume instead of the hardcoded
+ * STEREO_HALF_IPD/focus-distance estimate. Called once from VRBridge_Init, right after IVRSystem
+ * is confirmed ready. Fully defensive: any missing function pointer leaves g_vrGeomValid FALSE and
+ * every caller transparently keeps using the pre-existing hardcoded fallback - this can never make
+ * the stereo correction worse than before this session, only better when real data is available.
+ * See notes/32 Sec1 for the exact real numbers this returned against the live null-driver runtime
+ * (confirmed once via tools/vr-bridge/poc_ipd_query BEFORE this code was written) and Sec2 for the
+ * k = (l+r)/2 derivation. */
+static void VRBridge_QueryRealGeometry(void)
+{
+    int e;
+
+    if (!g_pVRGetFloatProp || !g_pVRGetEyeToHeadTransform || !g_pVRGetProjectionRaw) {
+        LogLine("VRBridge_QueryRealGeometry: IVRSystem function pointers not ready - keeping hardcoded STEREO_HALF_IPD/focus-distance fallback");
+        return;
+    }
+
+    {
+        ETrackedPropertyError propErr = ETrackedPropertyError_TrackedProp_Success;
+        float ipdMeters = g_pVRGetFloatProp(g_pVRSystem, k_unTrackedDeviceIndex_Hmd,
+                                             ETrackedDeviceProperty_Prop_UserIpdMeters_Float, &propErr);
+        LogLine("VRBridge_QueryRealGeometry: real IPD = %.6f m (%.2f mm), err=%d",
+                ipdMeters, ipdMeters * 1000.0f, (int)propErr);
+    }
+
+    for (e = 0; e < 2; e++) {
+        EVREye vrEye = (e == 0) ? EVREye_Eye_Left : EVREye_Eye_Right;
+        HmdMatrix34_t m;
+        float l = 0.0f, r = 0.0f, t = 0.0f, b = 0.0f;
+
+        ZeroMemory(&m, sizeof(m));
+        g_pVRGetEyeToHeadTransform(g_pVRSystem, &m, vrEye);
+        /* notes/32 Sec2: m.m[0][3] is the eye's X offset from the head origin, in meters, SIGNED
+         * (negative=left of head-forward axis, positive=right) - this directly IS `d` (the eye
+         * offset the stereo correction inserts along the camera's right vector) once converted to
+         * world units. No separate sign multiply needed, unlike STEREO_HALF_IPD*sign - a real
+         * headset's two eye offsets need not be exactly symmetric. */
+        g_realHalfIPD[e] = m.m[0][3] * WORLD_UNITS_PER_METER;
+
+        g_pVRGetProjectionRaw(g_pVRSystem, vrEye, &l, &r, &t, &b);
+        /* notes/32 Sec2: k = (l+r)/2 - the raw tangent-space frustum-center offset directly maps
+         * onto this file's existing shear coefficient `k` (X' = X + k*Z inserted before the game's
+         * own symmetric-width Proj is applied) because a genuine asymmetric frustum with fixed
+         * angular width (r-l unchanged) is mathematically identical to a symmetric frustum sheared
+         * by its center offset - the standard "shift-lens" stereo-camera equivalence. Derivation:
+         * the frustum-center ray satisfies X/(-Z) = (l+r)/2 in eye space (RH, Z negative in front);
+         * the correction's own "clip_x==0" condition is X + k*Z == 0 -> X = -k*Z; equating the two
+         * gives k = (l+r)/2 directly, no unit conversion needed (both sides are dimensionless
+         * tangent ratios already in the same world-unit-per-world-unit space this file already
+         * works in). */
+        g_realShearK[e] = (l + r) * 0.5f;
+        g_realShearValid[e] = (fabsf(g_realShearK[e]) > 1e-4f);
+
+        LogLine("VRBridge_QueryRealGeometry: eye=%d eyeToHead.x=%.6fm (%.3f world units) "
+                "projRaw l=%.4f r=%.4f t=%.4f b=%.4f centerOffset=%.6f%s",
+                e, m.m[0][3], g_realHalfIPD[e], l, r, t, b, g_realShearK[e],
+                g_realShearValid[e] ? "" : " (symmetric - no real off-axis data, keeping focus-distance k fallback)");
+    }
+
+    if (g_pVRGetRecommendedRTSize) {
+        uint32_t rw = 0, rh = 0;
+        g_pVRGetRecommendedRTSize(g_pVRSystem, &rw, &rh);
+        LogLine("VRBridge_QueryRealGeometry: GetRecommendedRenderTargetSize = %u x %u per eye "
+                "(current VR-submit eye buffers are %ux%u, matching the game's own backbuffer - "
+                "see notes/32 Sec4 for why this session did not change that)",
+                rw, rh, g_bbWidth, g_bbHeight);
+    }
+
+    g_vrGeomValid = TRUE;
+    LogLine("VRBridge_QueryRealGeometry: g_vrGeomValid = TRUE - stereo correction now uses real "
+            "OpenVR-sourced IPD/eye-offset values instead of the hardcoded STEREO_HALF_IPD constant");
 }
 
 /* One-time init: private D3D9Ex device matched to the game's adapter, D3D11 device, OpenVR init +
@@ -727,6 +897,26 @@ static void VRBridge_Init(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
         g_pVRWaitGetPoses = (VRBridge_WaitGetPoses_t)vtbl[2];
         g_pVRSubmit = (VRBridge_Submit_t)vtbl[6];
         LogLine("VRBridge_Init: IVRCompositor ready (vtable=%p)", (void *)vtbl);
+    }
+    {
+        /* notes/32 (Task 1): IVRSystem, for real IPD/eye-transform/off-axis-frustum/render-target-
+         * size queries - a genuine improvement even without a physical headset (see the file-header
+         * Milestone 9 comment), but NOT load-bearing for Submit itself (IVRCompositor above is) -
+         * so a failure here logs and continues rather than aborting VRBridge_Init early; the
+         * existing hardcoded stereo-correction fallback (g_vrGeomValid stays FALSE) covers it. */
+        EVRInitError sysErr = EVRInitError_VRInitError_None;
+        g_pVRSystem = VR_GetGenericInterface(IVRSystem_Version, &sysErr);
+        if (!g_pVRSystem) {
+            LogLine("VRBridge_Init: VR_GetGenericInterface(IVRSystem) failed error=%d - real geometry queries unavailable, keeping hardcoded stereo-correction fallback", (int)sysErr);
+        } else {
+            void **sysVtbl = (void **)VRBridge_RealVtable(g_pVRSystem);
+            g_pVRGetRecommendedRTSize = (VRBridge_GetRecommendedRenderTargetSize_t)sysVtbl[0];
+            g_pVRGetProjectionRaw = (VRBridge_GetProjectionRaw_t)sysVtbl[2];
+            g_pVRGetEyeToHeadTransform = (VRBridge_GetEyeToHeadTransform_t)sysVtbl[5];
+            g_pVRGetFloatProp = (VRBridge_GetFloatTrackedDeviceProperty_t)sysVtbl[23];
+            LogLine("VRBridge_Init: IVRSystem ready (vtable=%p)", (void *)sysVtbl);
+            VRBridge_QueryRealGeometry();
+        }
     }
 
     if (!VRBridge_CreateEyeBuffers(&g_vrEye1, EVREye_Eye_Left, w, h) ||
@@ -958,6 +1148,17 @@ static void VRBridge_Shutdown(void)
     if (g_pVRDeviceA) { g_pVRDeviceA->lpVtbl->Release(g_pVRDeviceA); g_pVRDeviceA = NULL; }
     if (g_pVRD3D9Ex) { g_pVRD3D9Ex->lpVtbl->Release(g_pVRD3D9Ex); g_pVRD3D9Ex = NULL; }
 
+    /* notes/32: g_pVRSystem is owned by the same VR_InitInternal2/VR_ShutdownInternal lifecycle as
+     * g_pVRCompositor (both come from the same VR_GetGenericInterface pool) - no separate release
+     * call exists or is needed, just drop the cached pointers/function pointers and the derived
+     * geometry cache so a future re-Init starts clean. */
+    g_pVRSystem = NULL;
+    g_pVRGetRecommendedRTSize = NULL;
+    g_pVRGetProjectionRaw = NULL;
+    g_pVRGetEyeToHeadTransform = NULL;
+    g_pVRGetFloatProp = NULL;
+    g_vrGeomValid = FALSE;
+
     g_vrBridgeReady = FALSE;
     g_vrBridgeInitAttempted = FALSE;
 }
@@ -996,14 +1197,16 @@ typedef struct { float x, y, z; } Vec3;
  * close to the task's own suggested "~6-7 world units" ballpark. 3.25 (6.5
  * full) was chosen as a round number in that range.
  *
- * TODO(real headset): this is a placeholder for real per-eye IPD data. Once
- * an OpenVR/OpenXR runtime is available, replace this fixed constant with
- * the runtime's own reported IPD (e.g. OpenVR's
- * IVRSystem::GetFloatTrackedDeviceProperty(..., Prop_UserIpdMeters_Float),
- * converted into this game's world-unit scale via the same ~1 world unit =
- * ~1cm calibration notes/15 cross-validated) - ideally sampled live each
- * frame rather than cached once, since real headsets allow runtime IPD
- * adjustment. */
+ * FALLBACK ONLY as of notes/32 (Task 1): this fixed constant is now used
+ * only when real OpenVR data isn't available (g_vrGeomValid == FALSE - i.e.
+ * PSYVR_ENABLE_SUBMIT isn't set, or SteamVR/OpenVR init failed). When it IS
+ * available, Hook_SetVertexShaderConstantF uses g_realHalfIPD[] instead -
+ * the REAL per-eye IVRSystem::GetEyeToHeadTransform offset, converted to
+ * world units via WORLD_UNITS_PER_METER. Confirmed against the live
+ * null-driver runtime (notes/32 Sec1): real IPD = 63.0mm exactly (the
+ * standard OpenVR default), real half-IPD = 3.15cm = 3.15 world units - only
+ * ~3% below this hardcoded 3.25 guess, a genuine (if modest) cross-
+ * validation of the original notes/15 estimate. */
 #define STEREO_HALF_IPD 3.25f
 
 /* notes/24: convergence/focal distance for the off-axis projection below -
@@ -1017,15 +1220,22 @@ typedef struct { float x, y, z; } Vec3;
  * point naturally tracks wherever the game itself is already aiming each
  * frame instead of needing a scene-specific guessed constant.
  *
- * TODO(real headset): a real OpenVR/OpenXR runtime does not need this
- * estimation step at all - it supplies each eye's already-correct
- * asymmetric projection matrix directly (IVRSystem::GetProjectionMatrix /
- * xrLocateViews), computed from the actual physical display geometry, not
- * a convergence-distance guess. This whole g_focusDistance mechanism only
- * exists to approximate that in the no-headset case; once real per-eye
- * projection matrices are available this file should consume THOSE
- * directly instead of re-deriving an off-axis frustum from a fixed FOV +
- * an estimated focal distance. */
+ * FALLBACK ONLY as of notes/32 (Task 1): notes/24's original TODO here
+ * asked for IVRSystem::GetProjectionMatrix (a full asymmetric 4x4, which
+ * would need its own struct-return ABI handling and would still need
+ * decomposing back into this file's k/Y20/Y30 terms). This session used
+ * IVRSystem::GetProjectionRaw instead (real per-eye tangent bounds, no
+ * struct-return issue, no decomposition needed - see g_realShearK/
+ * VRBridge_QueryRealGeometry) precisely because the task called it out as
+ * the more direct API for this. When GetProjectionRaw reports a genuinely
+ * asymmetric frustum (g_realShearValid[eyeIdx]), its real k = (l+r)/2
+ * REPLACES this focus-distance estimate entirely for the shear term. This
+ * null-driver runtime reports an exactly symmetric frustum for both eyes
+ * (confirmed, not assumed - notes/32 Sec1), so g_focusDistance's estimate
+ * remains in active use in every configuration actually tested this
+ * session; it will be automatically superseded the moment a real headset
+ * (or any driver reporting real per-eye asymmetry) is connected, with no
+ * further code changes needed. */
 #define STEREO_FOCUS_DISTANCE_MIN 25.0f /* world units - clamp floor so a
                                             close `at` point never produces
                                             a near-zero/negative convergence
@@ -1702,17 +1912,40 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         float zn = g_projZNear;
         float zf = g_projZFar;
         float sign = (g_stereoPhase == STEREO_PHASE_EYE1) ? -1.0f : 1.0f;
-        float d = STEREO_HALF_IPD * sign;
+        int eyeIdx = (g_stereoPhase == STEREO_PHASE_EYE1) ? 0 : 1;
         float focus = g_focusDistance;
-        /* notes/24: k = -d/focus - the eye-space shear that puts zero
-         * disparity exactly at the convergence distance, see the
-         * derivation comment above STEREO_WVP_REGISTER. */
-        float k = (-d) / focus;
+        float d, k;
+        BOOL usingRealIPD = g_vrGeomValid;
+        BOOL usingRealShear;
         float A = zf / (zn - zf);
         float B = zn * zf / (zn - zf);
-        float Y20 = (-d) * xScale / B;
-        float Y30 = (-k - A * d / B) * xScale;
+        float Y20, Y30;
         int r;
+
+        /* notes/32 (Task 1): use real OpenVR-sourced per-eye geometry when available
+         * (g_vrGeomValid, set by VRBridge_QueryRealGeometry once IVRSystem is ready), falling back
+         * to the pre-existing hardcoded STEREO_HALF_IPD/focus-distance estimate otherwise - so this
+         * path behaves identically to before this session whenever OpenVR isn't initialized (the
+         * VR-submit flag is off, or SteamVR isn't installed at all). */
+        if (usingRealIPD) {
+            d = g_realHalfIPD[eyeIdx];
+        } else {
+            d = STEREO_HALF_IPD * sign;
+        }
+        /* notes/24: k = -d/focus - the eye-space shear that puts zero disparity exactly at the
+         * convergence distance, see the derivation comment above STEREO_WVP_REGISTER. notes/32:
+         * when OpenVR reports a genuinely asymmetric frustum (g_realShearValid[eyeIdx]), use its
+         * real k = (l+r)/2 directly instead - this driver reports an exactly symmetric frustum
+         * (confirmed, notes/32 Sec1), so this branch is exercised only once real headset data with
+         * real per-eye asymmetry is available; until then this reduces to the line below. */
+        usingRealShear = usingRealIPD && g_realShearValid[eyeIdx];
+        if (usingRealShear) {
+            k = g_realShearK[eyeIdx];
+        } else {
+            k = (-d) / focus;
+        }
+        Y20 = (-d) * xScale / B;
+        Y30 = (-k - A * d / B) * xScale;
 
         memcpy(patched, pConstantData, sizeof(patched));
         /* notes/24: full off-axis column-0 patch - reduces exactly to
@@ -1736,8 +1969,9 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
             static DWORD s_lastLog = 0;
             DWORD now = GetTickCount();
             if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
-                LogLine("SVSCF stereo-correct: reg=%u phase=%ld xScale=%.4f d=%.3f focus=%.2f k=%.6f Y20=%.6f Y30=%.4f",
-                        StartRegister, g_stereoPhase, xScale, d, focus, k, Y20, Y30);
+                LogLine("SVSCF stereo-correct: reg=%u phase=%ld xScale=%.4f d=%.3f focus=%.2f k=%.6f Y20=%.6f Y30=%.4f dSrc=%s kSrc=%s",
+                        StartRegister, g_stereoPhase, xScale, d, focus, k, Y20, Y30,
+                        usingRealIPD ? "openvr" : "hardcoded", usingRealShear ? "openvr" : "focus-est");
                 s_lastLog = now;
             }
         }
