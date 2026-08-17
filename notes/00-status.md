@@ -1,15 +1,64 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 12: notes/30's open question settled with real per-span timing —
-the dominant VR-bridge cost is `IVRCompositor::WaitGetPoses` (~25-27ms/call, required for Submit to
-work, confirmed via A/B testing), NOT `GetRenderTargetData`/the readback chain (measured negligible,
-<1ms/frame combined). Two architecture fixes implemented and verified safe but measured to have ~zero
-fps impact given WaitGetPoses's cost is externally imposed by SteamVR's compositor. Also found and
-corrected two methodology bugs: this project's "offscreen" test convention triggers Windows DWM
-occlusion-throttling (invalidates fps timing), and notes/28-30's own frame counter double-counts
-(true baseline is ~60fps, not the previously-reported ~119fps) — full detail in notes/31)
+Last updated: 2026-08-17 (session 13: the hardcoded STEREO_HALF_IPD=3.25 constant and the
+estimated focus-distance shear term are now driven by REAL OpenVR-queried data whenever it's
+available (IVRSystem::GetFloatTrackedDeviceProperty/GetEyeToHeadTransform/GetProjectionRaw),
+falling back transparently to the pre-existing hardcoded behavior when it isn't (e.g. no
+PSYVR_ENABLE_SUBMIT / no SteamVR). Real numbers confirmed via the live null-driver runtime: IPD =
+63.00mm exactly (only ~3% below the old 3.25-unit guess), eye offsets exactly symmetric (±31.5mm),
+GetProjectionRaw exactly symmetric ([-1,1,-1,1] both eyes - no real off-axis data from this
+driver), GetRecommendedRenderTargetSize = 1656x1840/eye. Submit re-verified working after the
+change. Higher-resolution VR-only rendering investigated and found to be a genuinely separate,
+larger undertaking - documented, not attempted. Menu black-left-eye bug: bounded-effort hypothesis
+update only, no new lead — full detail in notes/32)
 
-## Real per-span timing settles WaitGetPoses vs. GetRenderTargetData; two methodology bugs found (2026-08-17, session 12)
+## Real OpenVR-queried IPD/projection data replaces hardcoded stereo constants (2026-08-17, session 13)
+
+**Task 1: `IVRSystem::GetFloatTrackedDeviceProperty(Prop_UserIpdMeters_Float)`,
+`GetEyeToHeadTransform`, and `GetProjectionRaw` now drive the stereo correction's `d`/`k` terms
+whenever OpenVR is initialized, replacing notes/24's hardcoded `STEREO_HALF_IPD=3.25`/estimated
+focus-distance shear with real runtime data — confirmed working end-to-end, not just wired up.**
+Full detail in `notes/32-real-openvr-ipd-projection-data-and-menu-bug-revisit.md`. Headline
+findings:
+
+- **Real numbers confirmed twice** (standalone POC `tools/vr-bridge/poc_ipd_query`, then live
+  in-game): IPD = 0.063000m exactly (63mm, the standard OpenVR default — only ~3% below the old
+  hardcoded 3.25-world-unit half-IPD guess, a genuine cross-validation of that earlier estimate);
+  `GetEyeToHeadTransform` = exactly ±0.0315m, perfectly symmetric; `GetProjectionRaw` = exactly
+  `[-1,1,-1,1]` for both eyes (this null driver reports NO real off-axis asymmetry — confirmed,
+  not assumed); `GetRecommendedRenderTargetSize` = 1656x1840/eye.
+- **A real derivation, not a guess**: `GetProjectionRaw`'s `(l+r)/2` maps directly onto the
+  existing shear coefficient `k` via the standard "shift-lens" stereo-camera equivalence (a
+  same-width asymmetric frustum is mathematically identical to a symmetric frustum sheared by its
+  center offset) — used automatically whenever a driver reports genuine asymmetry, with the
+  existing focus-distance estimate as fallback (the only path this null driver actually exercises).
+- **A new ABI wrinkle handled correctly**: `GetEyeToHeadTransform` returns a 48-byte struct BY
+  VALUE — the MSVC x86 hidden-return-pointer convention was implemented explicitly (not left to
+  the cross-compiler's own struct-return codegen), confirmed working via the standalone POC before
+  touching the live-tested integration code.
+- **Fully backward-compatible by design**: the real-data path only activates when
+  `g_vrGeomValid` is TRUE (OpenVR successfully initialized) — anyone without `PSYVR_ENABLE_SUBMIT=1`
+  set and SteamVR installed (the default for most users of this mod) gets byte-for-byte identical
+  behavior to before this session.
+- **Submit re-verified working**: live proxy log shows `Submit(eye=N) OK` climbing continuously
+  for both eyes (frame 3 through 700+), and `SVSCF stereo-correct` log lines confirm the real
+  values are actually consumed (`d=-3.150`/`d=3.150`, `dSrc=openvr`), not just logged and unused.
+- **Task 1 item 4 (higher internal VR render resolution)**: investigated, found to require
+  decoupling the VR-submit path's render target from the monitor-composite path's shared
+  `g_pEye1Surf`/`g_pEye2Surf` — a real, separate, riskier undertaking. Documented with a concrete
+  recommended approach (prototype standalone first, mirroring how the whole VR bridge itself was
+  built) rather than attempted this session, per the task's own explicit permission to do so.
+- **Task 2 (menu black-left-eye bug)**: bounded-effort check only, per the task's own scoping.
+  The real `GetProjectionRaw` data doesn't change the notes/23 hypothesis (this driver reports no
+  real asymmetry to test against); the real IPD being slightly smaller than the old hardcoded
+  value (3.15 vs 3.25) very slightly reduces rather than increases the hypothesized frustum-
+  boundary risk. No new lead — reproducing the bug still needs either working synthetic input past
+  the title screen (unsolved since notes/15-18) or the user hitting it live.
+- **Deployed**: the new build was deployed into the game directory (additive, off by default
+  without `PSYVR_ENABLE_SUBMIT=1` — the notes/31 build was backed up first). Not pushed to the mod
+  repo (this session's own instruction: modding-notes/dev-archive only).
+
+## Prior milestone (real per-span timing settles WaitGetPoses vs. GetRenderTargetData; two methodology bugs found, session 12, still valid as background)
 
 **notes/30 flagged an open question (does WaitGetPoses or the GetRenderTargetData/readback chain
 dominate the VR-bridge's measured performance cost?) and specified exactly the fix: per-span
