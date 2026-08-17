@@ -1,8 +1,48 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 2: second-cause diagnosis for frozen-left/dark-right, post-notes/20)
+Last updated: 2026-08-17 (session 3: eye-parity refutes culling hypothesis, shared-depth-stencil fix shipped)
 
 ## Latest status (read this first)
+
+**The eye1:eye2 draw-call asymmetry that drove notes/20 and notes/21 was proven NOT REAL — a hard
+per-frame count from the user's own live gameplay session showed 206/206 exact matches (16960:16960)
+— and a genuinely new, well-evidenced structural bug was found and fixed instead: both eyes shared the
+device's single depth-stencil surface the entire time.** Still NOT YET LIVE-TESTED (the user's game was
+already running mid-level for the whole session; per this project's standing safety rule it was never
+touched). Full detail in `notes/22-eye-parity-refutes-culling-shared-depth-stencil-fix.md`. Headline
+findings:
+
+- **The frustum-culling-cache hypothesis is refuted, with hard numbers.** notes/21's exact per-frame
+  `g_svscfCountEye1`/`g_svscfCountEye2` counters (shipped but never actually read from a live session
+  until now) were read from the user's own already-running gameplay session (real level traversal,
+  camera moved from `(-371,457,17)` to `(52198,-32867,-3980)`) — every single one of 206 composite log
+  lines showed eye1 exactly equal to eye2 (sum 16960:16960, ratio 1.000). There is no draw-call
+  asymmetry to explain via culling or any other mechanism.
+- **Root-caused why the OLD metric (167:13, then 109:15) looked skewed**: the "SVSCF stereo-correct:
+  phase=X" log line's print-throttle uses one `static DWORD s_lastLog` shared across both eyes' calls;
+  since eye 1's whole per-frame burst always fires before eye 2's, the 2-second throttle reopening
+  almost always gets claimed by phase=1, systematically starving phase=2's log line regardless of real
+  relative work. A logging artifact, not an engine-state signal — explains why two rounds of unrelated
+  fixes never moved that ratio.
+- **Found and fixed a real bug instead**: both offscreen eye render targets have always rendered against
+  the device's single shared auto depth-stencil surface (`SetDepthStencilSurface` was never called
+  anywhere in `proxy_d3d9.c`), and only eye 2 ever explicitly cleared it. This exactly matches a clue
+  notes/14 recorded but never fully connected ("clearing BOTH eyes flipped which eye's background was
+  missing") — the signature of two passes contending for one physical depth buffer, where whichever eye
+  clears last each frame gets a clean depth buffer and the other inherits stale depth data (causing
+  depth-test rejections that read as missing/stale = "frozen"; the eye that clears to black last shows
+  through as "dark" wherever its own draws get rejected in turn). **Fixed by giving each eye its own
+  private depth-stencil surface** (created/released alongside the existing per-eye color render
+  targets, same `Reset`-hook lifecycle) and clearing both eyes unconditionally every frame — safe now
+  that there's no shared resource left to contaminate.
+- **Build clean, DLL rebuilt. Not live-tested** — the user's game (PID 2340) was already running,
+  mid-level, for this entire session; per the task's own explicit safety rule ("ask via task end rather
+  than killing it" if already running) it was never touched (no kill, no debugger attach, no write to
+  the game directory's `d3d9.dll`, which that live process has loaded). **The user needs to close the
+  current game session; the orchestrating session can then copy the new DLL in and relaunch** to test
+  whether the shared-depth-stencil fix resolves the dark/frozen symptoms.
+
+## Prior milestone (second-cause diagnosis session, still valid as background — asymmetry finding above supersedes its unresolved §3)
 
 **Follow-up live-log session confirms notes/20's fix works exactly as designed, but proves both
 reported symptoms (frozen left, dark right) have a SECOND, still-only-partially-understood cause —
