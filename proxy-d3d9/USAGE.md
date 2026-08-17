@@ -2,10 +2,12 @@
 
 This is the mod's core component so far: a `d3d9.dll` that loads in place of the system one
 (standard Windows DLL search order, the same mechanism dxwrapper and most D3D9 mods use), and now
-implements a **first working side-by-side stereo render** — two independent renders of the title
-screen, composited into the left/right halves of the window, with a per-eye camera offset that
-demonstrably reaches the GPU. This is early, experimental, title-screen-only work, not a finished
-VR mod — see "Known limitations" below before expecting more than that.
+implements a **working side-by-side stereo render of real gameplay** — two independent renders of the
+scene, once per eye, composited into the left/right halves of the window, with a per-eye camera offset
+that demonstrably reaches the GPU. **This has been confirmed working in real, player-controlled
+gameplay by direct play-testing** (not just the title screen's scripted attract-mode camera — see
+"Confirmed evidence" below). It is still early, experimental, monitor-only work, not a finished VR mod
+with head tracking or a VR runtime — see "Known limitations" below before expecting more than that.
 
 ## What it does now
 
@@ -38,25 +40,46 @@ VR mod — see "Known limitations" below before expecting more than that.
 
 ## Confirmed evidence (be precise about what this is)
 
-At `STEREO_HALF_IPD=0` (a zero-offset control), both eyes render the same content at the same
-screen position (differing only in brightness) — proof the pipeline introduces no spurious effect.
-At the shipped `STEREO_HALF_IPD=3.25` (a realistic half-IPD scaled to the title screen's camera
-distance) and a diagnostic `60` (18×), the two eyes' background content visibly and reproducibly
-diverges in a way that scales with the offset magnitude, while unrelated screen-space UI stays
-fixed in both halves as expected. This is real, causal, reproducible evidence the per-eye
-correction reaches the GPU. **It is not yet a single obviously-legible "the same object is at a
-different X position in each eye" screenshot** — the specific geometry the identified register
-drives on the title screen is a detailed background texture, not a discrete object, so the visible
-effect reads as "the pattern's character changes with the correction" rather than "the shape moved
-sideways." Read [modding-notes/14](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/14-shader-constant-stereo-hook.md)
-before assuming more than this.
+**Real gameplay, user-confirmed (2026-08-17):** after fixing a structural bug where both eyes shared
+the device's one physical depth-stencil surface (causing depth-test rejections that read as a frozen
+left eye / dark right eye — see
+[modding-notes/22](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/22-eye-parity-refutes-culling-shared-depth-stencil-fix.md)),
+the person playing the game directly confirmed real, player-controlled gameplay renders correctly in
+stereo on both eyes ("the game is running absolutely fine on both sides"). This is the strongest
+evidence bar the project has cleared so far — a direct play-test verdict, not just an agent reading
+logs or comparing screenshots. Full write-up:
+[modding-notes/23](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/23-gameplay-stereo-working-milestone.md).
 
-## Known limitations
+Getting here took two earlier rounds of real, well-evidenced fixes (notes/20, notes/21) that turned
+out not to be sufficient on their own — the actual root cause (the shared depth-stencil surface) was
+only found in notes/22 after proving, with hard per-frame draw-call counts from a live gameplay
+session (206/206 frames, exact match), that a previously-suspected draw-call asymmetry between the
+eyes was never real. If you're auditing this project's rigor, that arc (notes/20 → 21 → 22) is a good
+one to read end to end.
 
-- **Title screen only.** Real gameplay has not been reached yet (simulated input doesn't dismiss
-  the title screen in this dev environment — see
-  [modding-notes/08](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/08-live-camera-data-gameplay.md)).
-  Nothing about gameplay rendering/camera behavior has been validated.
+**Earlier, title-screen-only evidence, still valid**: at `STEREO_HALF_IPD=0` (a zero-offset control),
+both eyes render the same content at the same screen position (differing only in brightness) — proof
+the pipeline introduces no spurious effect. At the shipped `STEREO_HALF_IPD=3.25` (a realistic
+half-IPD, cross-validated in
+[modding-notes/15](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/15-input-blocker-retry-and-stereo-robustness.md)
+against real human IPD, ≈6.5cm) and a diagnostic `60` (18×), the two eyes' content visibly and
+reproducibly diverges in a way that scales with the offset magnitude. Read
+[modding-notes/14](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/14-shader-constant-stereo-hook.md)
+for the full original derivation.
+
+## Known issues / limitations
+
+- **Main pause/menu UI screen: left eye reported completely black.** Distinct from both the title
+  screen and real gameplay, which both work correctly. Diagnosed as far as passive log evidence
+  allows this session (ruled out draw-call omission and `StretchRect` failure — see
+  [modding-notes/23](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/23-gameplay-stereo-working-milestone.md)
+  §5) but not yet fixed; leading unconfirmed hypothesis is a near-clip/frustum interaction specific to
+  that screen's likely close-up camera framing colliding with the fixed-world-unit parallax offset.
+- **No real VR headset / runtime validation yet.** Everything above (including the gameplay milestone)
+  has been tested as a side-by-side window render on a monitor, without SteamVR/OpenXR or a physical
+  headset in the loop. No head tracking exists — the per-eye offset is a fixed, rigid parallel-axis
+  translation (correct for comfort per the IPD cross-check above), not a converged/toe-in stereo pair
+  driven by live head pose.
 - **Only one shader-constant register is corrected.** Skinned/animated geometry (uploaded via a
   different register carrying up to 24 bone matrices) does not yet get a per-eye correction, so it
   will currently render identically in both eyes.
@@ -70,8 +93,6 @@ before assuming more than this.
   modding-notes/17). The correction now patches the buffer index that accounts for that transpose;
   see modding-notes/18 for the re-derivation and the real bug it found/fixed in an earlier version
   of this same file (patching `floats[12]` instead of `floats[3]`).
-- No head tracking, no VR runtime (SteamVR/OpenXR) integration, no asymmetric per-eye frustums yet
-  (this uses a rigid parallel-axis offset, not proper toe-in/converged stereo).
 
 ## How to use it (for testing/development only)
 
@@ -93,9 +114,9 @@ back to whatever `i686-w64-mingw32-clang.exe` is on `PATH`.
 
 ## Next milestone
 
-Trace the untraced transform-composition path (`exe+0x433E50`/`0x42E2A0` in the current build) to
-understand why the corrected register's matrix doesn't decompose against the tracked camera state,
-extend the correction to the other per-draw matrix registers (skinning/bone matrices) so animated
-geometry also gets correct per-eye parallax, and work toward reaching real gameplay (past the
-title screen) to validate all of this against content with clear discrete objects rather than a
-detailed background texture.
+With real gameplay now confirmed working (the big one), the next priorities are: track down the
+main-menu black-left-eye issue above with a real reproduction; extend the correction to the other
+per-draw matrix registers (skinning/bone matrices) so animated geometry also gets correct per-eye
+parallax; and — the real next frontier — actual VR headset/runtime validation (SteamVR/OpenXR
+integration and head tracking), since everything confirmed so far has been a monitor-only
+side-by-side render.

@@ -61,9 +61,72 @@
  * decomposition test that ruled out several other candidate registers), and
  * empirical results.
  *
+ * Milestone 5 (this revision, notes/21): first real-gameplay live-log read
+ * after the notes/20 fix was deployed and played. Confirmed the notes/20
+ * fix itself works exactly as designed (no more premature/duplicate internal
+ * Present hits during eye 2's pass), but the user's live report of the two
+ * original symptoms persisting (right eye tracks but is dark; left eye still
+ * freezes, beyond what focus-loss auto-pause explains) meant a SECOND cause
+ * for each was still needed. Three independent, low-risk fixes added:
+ *   1. Hook_Present now forces the real hardware Present to a full-
+ *      backbuffer blit (NULL src/dest/dirty rect) instead of passing the
+ *      game's own Present args through - our composite always redraws the
+ *      whole backbuffer, so any partial-rect optimization the game applies
+ *      based on its own (non-stereo) dirty-region tracking could otherwise
+ *      leave stale pixels on screen, which looks exactly like "one half
+ *      frozen." Also logs the game's original rect args for confirmation.
+ *   2. A new IDirect3DDevice9::Reset hook (vtable slot 16, right before
+ *      Present's slot 17) releases and recreates all three D3DPOOL_DEFAULT
+ *      surfaces (backbuffer ref, both eye render targets) around Reset -
+ *      previously unhandled entirely, a real correctness gap for any device
+ *      parameter change/recovery, newly relevant because this is the first
+ *      session where the user has been alt-tabbing during live testing.
+ *   3. Exact (not throttle-race-sampled) per-real-frame eye1/eye2 register-6
+ *      draw-call counters (g_svscfCountEye1/2), logged each real composite -
+ *      notes/20's 167:13 phase skew persisted essentially unchanged (109:15)
+ *      AFTER that session's fix, proving the skew was never caused by the
+ *      bug notes/20 fixed; this instrumentation turns "probably a real
+ *      asymmetry" into an exact number for the next live-log read, in place
+ *      of further speculation about the root cause of the dark-eye asymmetry
+ *      itself (not yet found - see notes/21 for the full disposition).
+ * See notes/21-<name>.md for the full live-log evidence and derivation.
+ *
+ * Milestone 6 (this revision, notes/22): read the LIVE log of the user's own already-
+ * running real-gameplay session (real level, not the title screen - camera traveled from
+ * (-371,457,17) to (52198,-32867,-3980) over the session) with notes/21's exact per-frame
+ * g_svscfCountEye1/g_svscfCountEye2 counters actually active for the first time. Found
+ * PERFECT parity: 206/206 real-frame samples showed eye1 == eye2 exactly (sum 16960:16960,
+ * ratio 1.000) - the long-chased "eye1:eye2 draw-call asymmetry" (167:13, then 109:15) was
+ * NEVER REAL. It was an artifact of the OLD "SVSCF stereo-correct: phase=X" throttled log
+ * line sharing one `static DWORD s_lastLog` across BOTH phases inside
+ * Hook_SetVertexShaderConstantF - since eye1's burst of corrections always fires first each
+ * frame (CandB_BeforeEye1 runs before CandB_BeforeEye2), the 2-second throttle reopening
+ * almost always lands during eye1's burst and gets claimed by phase=1, systematically
+ * starving phase=2's log line regardless of real relative work. This retroactively explains
+ * why two full sessions of fixes (notes/20, notes/21) never moved that ratio: it was never
+ * measuring real draw-call volume in the first place. This RULES OUT the frustum-culling-
+ * cache-reuse hypothesis (nothing to explain - draw counts are equal) and redirects the
+ * whole investigation.
+ *
+ * With no real draw-call asymmetry to explain, re-examined the code for a structural
+ * asymmetry instead and found one that was there the whole time: both g_pEye1Surf and
+ * g_pEye2Surf have ALWAYS rendered against the device's single shared auto depth-stencil
+ * surface (SetDepthStencilSurface was never called anywhere in this file), and only eye2
+ * ever explicitly Cleared it (eye1 never cleared at all). This exactly matches a clue
+ * notes/14 already recorded but didn't fully connect: "clearing BOTH eyes flipped which
+ * eye's background was missing" - the textbook signature of two passes sharing one
+ * physical depth buffer, where whichever eye's Clear() runs last each frame "wins" a
+ * properly-reset depth buffer and the other inherits stale depth data (causing depth-test
+ * rejections that read as missing/stale content). Fixed by giving each eye its own private
+ * depth-stencil surface (created/released alongside the existing color render targets, same
+ * Reset-hook lifecycle) and Clearing both eyes unconditionally every frame - now safe with
+ * no shared resource left to contaminate. See notes/22-<name>.md for the full derivation
+ * and live-log evidence.
+ *
  * Vtable indices used (0-based, standard COM: slot 0/1/2 are always
  * QueryInterface/AddRef/Release):
  *   IDirect3D9::CreateDevice                    = slot 16
+ *   IDirect3DDevice9::Reset                     = slot 16 (different vtable)
  *   IDirect3DDevice9::Present                   = slot 17
  *   IDirect3DDevice9::SetVertexShaderConstantF  = slot 94
  * These are NOT guessed - they come from two independent, cross-checked
@@ -103,6 +166,9 @@ typedef HRESULT (STDMETHODCALLTYPE *Present_t)(
     CONST RECT *pDestRect,
     HWND hDestWindowOverride,
     CONST RGNDATA *pDirtyRegion);
+typedef HRESULT (STDMETHODCALLTYPE *Reset_t)(
+    IDirect3DDevice9 *This,
+    D3DPRESENT_PARAMETERS *pPresentationParameters);
 typedef HRESULT (STDMETHODCALLTYPE *SetVertexShaderConstantF_t)(
     IDirect3DDevice9 *This,
     UINT StartRegister,
@@ -113,6 +179,7 @@ static HMODULE g_hRealD3D9 = NULL;
 static Direct3DCreate9_t g_pRealDirect3DCreate9 = NULL;
 static CreateDevice_t g_pRealCreateDevice = NULL;
 static Present_t g_pRealPresent = NULL;
+static Reset_t g_pRealReset = NULL;
 static SetVertexShaderConstantF_t g_pRealSetVSConstF = NULL;
 static BOOL g_d3d9Hooked = FALSE;      /* IDirect3D9::CreateDevice patched? */
 static BOOL g_deviceHooked = FALSE;    /* IDirect3DDevice9::Present patched? */
@@ -247,9 +314,18 @@ static IDirect3DDevice9 *g_pDevice = NULL;
 static IDirect3DSurface9 *g_pRealBackBuffer = NULL;
 static IDirect3DSurface9 *g_pEye1Surf = NULL;
 static IDirect3DSurface9 *g_pEye2Surf = NULL;
+/* notes/22: the device's single auto depth-stencil surface (EnableAutoDepthStencil=1,
+ * live-confirmed AutoDepthStencilFormat=75/D3DFMT_D24S8) was NEVER reassigned per eye -
+ * both g_pEye1Surf/g_pEye2Surf rendered against the SAME physical depth buffer the whole
+ * time, and SetDepthStencilSurface was never called anywhere in this file. Each eye now
+ * gets its own private depth-stencil surface, captured/restored exactly like the color
+ * render targets. See the comment on SetEyeAndTarget() for the full mechanism this fixes. */
+static IDirect3DSurface9 *g_pRealDepthStencil = NULL;
+static IDirect3DSurface9 *g_pEye1DepthStencil = NULL;
+static IDirect3DSurface9 *g_pEye2DepthStencil = NULL;
 static UINT g_bbWidth = 0;
 static UINT g_bbHeight = 0;
-static BOOL g_stereoReady = FALSE; /* device + both offscreen surfaces created OK */
+static BOOL g_stereoReady = FALSE; /* device + both offscreen color+depth surfaces created OK */
 
 static BOOL g_frameCamCached = FALSE;
 static Vec3 g_baseEye, g_baseAt, g_baseUp, g_rightVec;
@@ -399,44 +475,72 @@ void __cdecl BPM_OnEntry_asm(float rawFov, float aspect)
  * directly re-invoking BuildViewMatrix's real, unmodified body (through its
  * trampoline) with a fresh eye position computed from the cached clean base
  * - never from a read-back already-offset value. */
-static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf, BOOL explicitClear)
+/* notes/22: THE ACTUAL ROOT CAUSE of the dark-eye/frozen-eye symptoms (notes/20/21).
+ * notes/14's own background-layer-bug investigation already recorded the decisive clue
+ * and didn't fully connect it: "clearing BOTH eyes flipped which eye's background was
+ * missing (eye1 went blank, eye2's fixed itself) rather than fixing both." That is the
+ * exact signature of two render passes sharing ONE physical depth-stencil surface -
+ * whichever eye's Clear() runs LAST in a given frame gets a properly-reset depth buffer
+ * for its own draws, and the OTHER eye's draws run against the previous frame's leftover
+ * depth values (mostly-near-plane content from the eye that rendered/cleared last),
+ * causing widespread depth-test rejections. Since notes/20/21, only eye2 ever cleared
+ * (explicitClear=TRUE) and eye1 never did at all - so every frame, eye1 rendered against
+ * stale depth left over from EYE2's PREVIOUS frame (rejecting geometry that should have
+ * drawn = missing/stale-looking content, reads as "frozen"), while eye2 cleared to solid
+ * black immediately before drawing (so any depth-rejected or simply undrawn pixels show
+ * through as black = "dark"). This was never a CandB internal-logic bug and had nothing
+ * to do with draw-call counts (notes/22 confirmed those are exactly equal between eyes
+ * via a live gameplay session's exact per-frame counters - see notes/22 for the full
+ * derivation) - it was a resource-sharing bug in this file the whole time.
+ *
+ * Fix: give each eye its OWN private depth-stencil surface (created in
+ * SetupStereoSurfaces, same lifecycle as the color render targets) and bind it via
+ * SetDepthStencilSurface alongside SetRenderTarget. With no shared physical resource
+ * left, both eyes can now be safely Cleared (color+depth+stencil) every frame with zero
+ * cross-eye contamination - notes/14's "flip" symptom simply cannot happen anymore. */
+static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf, IDirect3DSurface9 *depthSurf)
 {
-    if (!g_stereoReady || !g_pDevice || !targetSurf) return;
+    if (!g_stereoReady || !g_pDevice || !targetSurf || !depthSurf) return;
 
     g_pDevice->lpVtbl->SetRenderTarget(g_pDevice, 0, targetSurf);
+    g_pDevice->lpVtbl->SetDepthStencilSurface(g_pDevice, depthSurf);
 
-    /* notes/14 background-layer-bug investigation: both eyes' offscreen
-     * targets share the device's single auto depth-stencil surface (never
-     * reassigned via SetDepthStencilSurface) - if CandB's own internal
-     * Clear() calls somehow don't unconditionally reset depth/stencil on
-     * every invocation, eye 2's background draws could silently fail a
-     * depth test against eye 1's leftover depth values. Explicitly clearing
-     * color+depth+stencil here, before CandB's real body runs for THIS eye,
-     * tests that cheaply regardless of whatever CandB does internally.
-     * Empirically (this session): clearing BOTH eyes flipped which eye's
-     * background was missing (eye1 went blank, eye2's fixed itself) rather
-     * than fixing both - clearing is gated per-eye by the caller so this can
-     * be isolated/compared; see notes/14 for the full experiment log. */
-    if (explicitClear) {
-        g_pDevice->lpVtbl->Clear(g_pDevice, 0, NULL,
-                                  D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
-                                  D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
-    }
+    g_pDevice->lpVtbl->Clear(g_pDevice, 0, NULL,
+                              D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
+                              D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
 
-    if (g_frameCamCached && g_camPOutMatrix && g_realBuildViewMatrix) {
-        Vec3 eye;
-        eye.x = g_baseEye.x + g_rightVec.x * STEREO_HALF_IPD * sign;
-        eye.y = g_baseEye.y + g_rightVec.y * STEREO_HALF_IPD * sign;
-        eye.z = g_baseEye.z + g_rightVec.z * STEREO_HALF_IPD * sign;
-        /* This CPU-side matrix rewrite (confirmed by notes/13 to land
-         * correctly in *pOutMatrix) is kept as a structurally-correct,
-         * belt-and-suspenders injection alongside notes/14's real fix (the
-         * SetVertexShaderConstantF correction below) - it has no confirmed
-         * effect on its own (notes/13), since the actual per-draw matrix the
-         * GPU uses is uploaded via shader constants, not re-read from this
-         * buffer at draw time. */
-        g_realBuildViewMatrix(g_camPOutMatrix, &eye, &g_baseAt, &g_baseUp);
-    }
+    /* notes/20 (real-gameplay session): this CPU-side re-invocation of
+     * BuildViewMatrix through g_camPOutMatrix was previously kept as a
+     * "belt and suspenders" injection alongside notes/14's real fix (the
+     * SetVertexShaderConstantF correction below), on the strength of
+     * notes/09's finding that BuildViewMatrix's pOutMatrix is a genuinely
+     * persistent, stable object field (confirmed via a single, always-
+     * identical address, 0x0019EAF0, across the whole title-screen
+     * session). That assumption does NOT hold in real gameplay: this
+     * session's live proxy log (188 "BVM cache SET" samples from an
+     * actively-running gameplay session) shows pOutMatrix alternating
+     * between at least two distinct addresses (0x0019EAF0, the vast
+     * majority, and 0x0019E380, 6/188 samples) - i.e. BuildViewMatrix has
+     * more than one live call site/context in gameplay, unlike the title
+     * screen's single attract-mode camera. That is exactly the same class
+     * of bug notes/14 Sec3 already found and fixed for
+     * BuildProjectionMatrix's output pointer (a caller stack temp, unsafe
+     * to cache-and-write-later) - g_camPOutMatrix is captured once per
+     * frame (first BuildViewMatrix hit) and then this function calls the
+     * REAL BuildViewMatrix body a second and third time (once per eye)
+     * through that cached pointer, from deep inside CandB's own nested
+     * call tree - by then the original caller that owned that stack slot
+     * may have already returned, so this write can land on stack memory
+     * that unrelated, currently-executing gameplay code has since reused,
+     * i.e. a real, live-evidenced memory-corruption risk that was never
+     * exercised at the title screen. Since notes/14 already established
+     * this rewrite has "no confirmed effect on its own" on the actual
+     * GPU-driven image (the real, load-bearing fix is the
+     * SetVertexShaderConstantF register-6 correction below, which does not
+     * depend on this pointer at all) - it is disabled outright rather than
+     * gated, trading away a redundant, unsafe-in-gameplay CPU-side write
+     * for zero loss of the actual stereo effect. */
+    (void)sign;
 }
 
 /* IMPORTANT DISCOVERY (this session, see notes/13): CandB's own nested call
@@ -462,18 +566,64 @@ static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf, BOOL expl
 #define STEREO_PHASE_EYE2  2
 static volatile LONG g_stereoPhase = STEREO_PHASE_IDLE;
 
+/* notes/20 (real-gameplay session): the original design assumed CandB's
+ * nested call tree calls Present internally EXACTLY ONCE per eye (true at
+ * the title screen, per notes/13). Nothing enforced that assumption -
+ * before this fix, EVERY internal Present hit while phase==EYE2 re-ran the
+ * full StretchRect composite AND called the real hardware Present again,
+ * using whatever partial content g_pEye2Surf held at that exact moment. If
+ * gameplay's richer multi-pass rendering (notes/10 already found 8x
+ * SetRenderTarget/3x Clear per frame even at the simple title screen scene)
+ * causes CandB's nested tree to call Present more than once while rendering
+ * eye 2, the FIRST such call would prematurely flip a still-INCOMPLETE eye2
+ * render (missing whatever draws were still to come - lighting/detail
+ * passes, etc.) to the actual screen, which reads exactly like the reported
+ * "right half is very dark / doesn't look right" symptom; a following
+ * legitimate composite from the SAME logical frame could then also
+ * overwrite eye 1's already-correct half with a second flip before the
+ * display actually samples it, contributing to the reported "left half
+ * frozen" symptom (the visible frame becomes whichever premature/duplicate
+ * flip last happened to win the race, not a clean single composite per
+ * logical frame). Fixed by making the real composite+Present strictly
+ * once-per-CandB-double-invoke: g_eye2Presented is reset at the start of
+ * every cycle (BeforeEye1) and checked/set in Hook_Present's EYE2 branch;
+ * any extra internal Present hits during EYE2 (beyond the first) are now
+ * suppressed exactly like EYE1's, instead of re-compositing/re-presenting. */
+static volatile LONG g_eye2Presented = 0;
+
+/* notes/21: notes/20's own log evidence (SVSCF register-6 correction counts,
+ * throttled-sample-based) showed a heavily skewed phase=1:phase=2 ratio
+ * (167:13) and speculated this was consistent with eye 2's pass being cut
+ * short by a premature internal Present - but a fresh live-log read this
+ * session (after the notes/20 fix was deployed and live-tested) found the
+ * SAME skew, now 109:15, essentially UNCHANGED by that fix. Since the fix
+ * already closed the premature-extra-Present path, the skew's persistence
+ * means it was never actually caused by that bug - it reflects a real,
+ * still-unexplained difference in how much rendering work happens during
+ * eye 1's CandB invocation vs eye 2's, independent of the Present-guard
+ * logic. These two counters replace the old race-based "which phase wins
+ * the 2-second throttle" sampling with an exact, unthrottled per-real-frame
+ * count of how many times the register-6 correction actually applied in
+ * each phase, logged once per real composite (see Hook_Present) - the goal
+ * is to turn this from a suspected pattern into a hard, precise number the
+ * next live-log read can use directly instead of re-deriving it from a
+ * throttling artifact. */
+static volatile LONG g_svscfCountEye1 = 0;
+static volatile LONG g_svscfCountEye2 = 0;
+
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
 {
     g_stereoPhase = STEREO_PHASE_EYE1;
-    SetEyeAndTarget(-1.0f, g_pEye1Surf, FALSE);
+    g_eye2Presented = 0;
+    SetEyeAndTarget(-1.0f, g_pEye1Surf, g_pEye1DepthStencil);
 }
 
 void __cdecl CandB_BeforeEye2_asm(void) asm("CandB_BeforeEye2_asm");
 void __cdecl CandB_BeforeEye2_asm(void)
 {
     g_stereoPhase = STEREO_PHASE_EYE2;
-    SetEyeAndTarget(+1.0f, g_pEye2Surf, TRUE);
+    SetEyeAndTarget(+1.0f, g_pEye2Surf, g_pEye2DepthStencil);
 }
 
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
@@ -482,6 +632,9 @@ void __cdecl CandB_AfterBoth_asm(void)
     g_stereoPhase = STEREO_PHASE_IDLE;
     if (!g_stereoReady || !g_pDevice || !g_pRealBackBuffer) return;
     g_pDevice->lpVtbl->SetRenderTarget(g_pDevice, 0, g_pRealBackBuffer);
+    if (g_pRealDepthStencil) {
+        g_pDevice->lpVtbl->SetDepthStencilSurface(g_pDevice, g_pRealDepthStencil);
+    }
 }
 
 /* ---- naked inline-hook entry points -----------------------------------
@@ -646,7 +799,7 @@ static BOOL InstallInlineHooks(void)
  * CandB_AfterBoth_asm to restore the render target after both eye passes). */
 static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS *pp)
 {
-    HRESULT hrBB, hrE1, hrE2;
+    HRESULT hrBB, hrE1, hrE2, hrDS, hrDS1, hrDS2;
 
     g_pDevice = pDevice;
     g_bbWidth = pp->BackBufferWidth;
@@ -658,14 +811,38 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
     hrE2 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_bbWidth, g_bbHeight, D3DFMT_A8R8G8B8,
                                                 D3DMULTISAMPLE_NONE, 0, FALSE, &g_pEye2Surf, NULL);
 
-    LogLine("SetupStereoSurfaces: GetBackBuffer hr=0x%08lX ptr=0x%p | Eye1 hr=0x%08lX ptr=0x%p | Eye2 hr=0x%08lX ptr=0x%p (%ux%u)",
+    /* notes/22: capture the device's original auto depth-stencil surface (so it can be
+     * restored after both eye passes) and give each eye its OWN private depth-stencil
+     * surface matching the real one's format - see the comment on SetEyeAndTarget() for
+     * why sharing a single depth buffer between both eyes was the real root cause of the
+     * dark-eye/frozen-eye symptoms. Format comes from pp->AutoDepthStencilFormat (live-
+     * confirmed 75/D3DFMT_D24S8), not guessed. Discard=TRUE matches typical depth-buffer
+     * usage and is safe here since every eye pass unconditionally Clears its own depth
+     * surface before drawing. */
+    hrDS = pDevice->lpVtbl->GetDepthStencilSurface(pDevice, &g_pRealDepthStencil);
+    hrDS1 = pDevice->lpVtbl->CreateDepthStencilSurface(pDevice, g_bbWidth, g_bbHeight,
+                                                        pp->AutoDepthStencilFormat,
+                                                        D3DMULTISAMPLE_NONE, 0, TRUE,
+                                                        &g_pEye1DepthStencil, NULL);
+    hrDS2 = pDevice->lpVtbl->CreateDepthStencilSurface(pDevice, g_bbWidth, g_bbHeight,
+                                                        pp->AutoDepthStencilFormat,
+                                                        D3DMULTISAMPLE_NONE, 0, TRUE,
+                                                        &g_pEye2DepthStencil, NULL);
+
+    LogLine("SetupStereoSurfaces: GetBackBuffer hr=0x%08lX ptr=0x%p | Eye1 hr=0x%08lX ptr=0x%p | Eye2 hr=0x%08lX ptr=0x%p (%ux%u) | "
+            "GetDS hr=0x%08lX ptr=0x%p | Eye1DS hr=0x%08lX ptr=0x%p | Eye2DS hr=0x%08lX ptr=0x%p",
             (unsigned long)hrBB, (void *)g_pRealBackBuffer,
             (unsigned long)hrE1, (void *)g_pEye1Surf,
             (unsigned long)hrE2, (void *)g_pEye2Surf,
-            g_bbWidth, g_bbHeight);
+            g_bbWidth, g_bbHeight,
+            (unsigned long)hrDS, (void *)g_pRealDepthStencil,
+            (unsigned long)hrDS1, (void *)g_pEye1DepthStencil,
+            (unsigned long)hrDS2, (void *)g_pEye2DepthStencil);
 
     g_stereoReady = SUCCEEDED(hrBB) && SUCCEEDED(hrE1) && SUCCEEDED(hrE2) &&
-                    g_pRealBackBuffer && g_pEye1Surf && g_pEye2Surf;
+                    SUCCEEDED(hrDS1) && SUCCEEDED(hrDS2) &&
+                    g_pRealBackBuffer && g_pEye1Surf && g_pEye2Surf &&
+                    g_pEye1DepthStencil && g_pEye2DepthStencil;
 
     LogLine("Stereo ready = %d", g_stereoReady ? 1 : 0);
 }
@@ -731,6 +908,14 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
          * the closed-form correction targets) lives at flat index 3 in
          * this already-transposed buffer, not index 12. */
         patched[3] += (-d) * xScale;
+
+        /* notes/21: exact per-eye draw-call counters, see comment on
+         * g_svscfCountEye1/2 above. */
+        if (g_stereoPhase == STEREO_PHASE_EYE1) {
+            InterlockedIncrement(&g_svscfCountEye1);
+        } else {
+            InterlockedIncrement(&g_svscfCountEye2);
+        }
 
         {
             static DWORD s_lastLog = 0;
@@ -808,6 +993,15 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         return D3D_OK;
     }
 
+    /* notes/20: suppress any EXTRA internal Present hits during eye 2's
+     * pass beyond the first - see the comment on g_eye2Presented above
+     * CandB_BeforeEye1_asm for why this matters in real gameplay (it never
+     * triggered at the title screen, where each eye's pass only ever
+     * called Present once). */
+    if (g_stereoPhase == STEREO_PHASE_EYE2 && g_eye2Presented) {
+        return D3D_OK;
+    }
+
     if (g_stereoPhase == STEREO_PHASE_EYE2 && g_stereoReady) {
         /* Both eyes are now fully rendered (eye 1 completed normally
          * including its own suppressed Present above; eye 2 just finished
@@ -815,6 +1009,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
          * moment: stitch both offscreen eye surfaces into the left/right
          * halves of the real backbuffer before letting this one real
          * hardware Present go through. */
+        g_eye2Presented = 1;
         RECT srcFull;
         RECT dstLeft;
         RECT dstRight;
@@ -828,8 +1023,20 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         hrR = This->lpVtbl->StretchRect(This, g_pEye2Surf, &srcFull, g_pRealBackBuffer, &dstRight, D3DTEXF_LINEAR);
 
         if (doLog) {
-            LogLine("Present() composite (phase EYE2): StretchRect L=0x%08lX R=0x%08lX", (unsigned long)hrL, (unsigned long)hrR);
+            /* notes/21: exact eye1/eye2 register-6 draw-call counts for THIS
+             * real frame (not a throttled race sample like notes/20's
+             * phase=1/phase=2 log line) - see comment on g_svscfCountEye1/2.
+             * Also logs whether the game itself asked for a partial-rect
+             * Present (pSourceRect/pDirtyRegion non-NULL) - real evidence for
+             * whether the "forced full-backbuffer Present" fix below is
+             * actually correcting anything, rather than being a no-op. */
+            LogLine("Present() composite (phase EYE2): StretchRect L=0x%08lX R=0x%08lX | svscfEye1=%ld svscfEye2=%ld | origSrcRect=%p origDestRect=%p origDirtyRgn=%p",
+                     (unsigned long)hrL, (unsigned long)hrR,
+                     g_svscfCountEye1, g_svscfCountEye2,
+                     (void *)pSourceRect, (void *)pDestRect, (void *)pDirtyRegion);
         }
+        g_svscfCountEye1 = 0;
+        g_svscfCountEye2 = 0;
     }
 
     g_frameCamCached = FALSE;
@@ -839,15 +1046,90 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         g_lastPresentLogTick = now;
     }
 
-    return g_pRealPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+    /* notes/21: the real hardware Present is always forced to a full-
+     * backbuffer blit (NULL source/dirty rect), regardless of what the game
+     * itself passed in. Rationale: our composite step just unconditionally
+     * overwrote the ENTIRE real backbuffer with fresh content via two full
+     * StretchRects above - if the game's own Present call assumed a partial/
+     * dirty-rect optimization based on what ITS OWN (single-eye, non-stereo)
+     * rendering changed this frame, passing that same partial rect through
+     * here could cause the hardware Present to only actually flip PART of
+     * our new side-by-side image to the screen, leaving the rest showing
+     * stale pixels from a prior frame - a plausible, concrete explanation
+     * for a symptom that looks exactly like "one half of the screen frozen"
+     * while the other updates normally. Forcing NULL/NULL/NULL here is
+     * always safe for our use case (we always redraw 100% of the backbuffer
+     * every real frame) regardless of whether this specific mechanism turns
+     * out to be the actual cause - see the origSrcRect/origDestRect/
+     * origDirtyRgn log fields above to confirm post-relaunch whether the
+     * game was ever actually passing non-NULL values here. hDestWindowOverride
+     * is passed through unmodified (unrelated to dirty-rect behavior). */
+    return g_pRealPresent(This, NULL, NULL, hDestWindowOverride, NULL);
 }
 
-/* Patch IDirect3DDevice9::Present (vtbl slot 17) to point at our hook.
- * The vtable pointed to by This->lpVtbl is a single shared, normally
- * read-only structure (typically in the real d3d9.dll's .rdata), so it must
- * be made writable with VirtualProtect before patching and restored after.
- * Guarded by g_deviceHooked so a second CreateDevice call (should one ever
- * happen) doesn't re-patch an already-patched vtable. */
+/* notes/21: the game runs Windowed=1 (confirmed in the CreateDevice log) -
+ * in windowed mode a real device-lost/Reset cycle is much less commonly
+ * triggered by plain Alt+Tab focus loss than in fullscreen-exclusive mode,
+ * but nothing in this codebase handled Reset() AT ALL before this fix, which
+ * is a real, well-known D3D9 correctness gap regardless of exactly when it
+ * fires: Reset() invalidates every D3DPOOL_DEFAULT resource on the device,
+ * including g_pRealBackBuffer/g_pEye1Surf/g_pEye2Surf (all created via
+ * CreateRenderTarget/GetBackBuffer, both implicitly D3DPOOL_DEFAULT) - any
+ * of our own code that runs after a real Reset without us first releasing
+ * and then recreating those three surfaces would be operating on stale/
+ * dangling COM pointers. Depending on driver behavior this can silently
+ * produce exactly the kind of asymmetric, hard-to-explain per-surface
+ * symptoms reported live this session (one eye's surface still showing
+ * stale/frozen content because the GPU memory it referenced happened not to
+ * be reclaimed yet, the other looking corrupted/dark because its memory WAS
+ * reused) - a strong, concrete, mechanism-level candidate for "freeze
+ * persists beyond just the game's own focus-loss auto-pause" specifically
+ * because the user has been alt-tabbing to communicate during this exact
+ * session, a variable no prior session (title-screen only) ever exercised.
+ * Fix: release all three surfaces (and mark stereo not-ready, which every
+ * other hook already guards on) before forwarding to the real Reset, then
+ * recreate them via the same SetupStereoSurfaces() used at device creation. */
+static HRESULT STDMETHODCALLTYPE Hook_Reset(
+    IDirect3DDevice9 *This,
+    D3DPRESENT_PARAMETERS *pPresentationParameters)
+{
+    HRESULT hr;
+
+    LogLine("Reset() called - releasing stereo surfaces before real Reset (Windowed=%d %ux%u)",
+            pPresentationParameters ? pPresentationParameters->Windowed : -1,
+            pPresentationParameters ? pPresentationParameters->BackBufferWidth : 0,
+            pPresentationParameters ? pPresentationParameters->BackBufferHeight : 0);
+
+    g_stereoReady = FALSE;
+    if (g_pRealBackBuffer)    { g_pRealBackBuffer->lpVtbl->Release(g_pRealBackBuffer); g_pRealBackBuffer = NULL; }
+    if (g_pEye1Surf)          { g_pEye1Surf->lpVtbl->Release(g_pEye1Surf); g_pEye1Surf = NULL; }
+    if (g_pEye2Surf)          { g_pEye2Surf->lpVtbl->Release(g_pEye2Surf); g_pEye2Surf = NULL; }
+    /* notes/22: the two new private per-eye depth-stencil surfaces (and the captured
+     * original auto depth-stencil) are D3DPOOL_DEFAULT too - same Reset-invalidation
+     * hazard as the three surfaces above, same fix. */
+    if (g_pRealDepthStencil)  { g_pRealDepthStencil->lpVtbl->Release(g_pRealDepthStencil); g_pRealDepthStencil = NULL; }
+    if (g_pEye1DepthStencil)  { g_pEye1DepthStencil->lpVtbl->Release(g_pEye1DepthStencil); g_pEye1DepthStencil = NULL; }
+    if (g_pEye2DepthStencil)  { g_pEye2DepthStencil->lpVtbl->Release(g_pEye2DepthStencil); g_pEye2DepthStencil = NULL; }
+
+    hr = g_pRealReset(This, pPresentationParameters);
+
+    LogLine("Real Reset returned hr=0x%08lX", (unsigned long)hr);
+
+    if (SUCCEEDED(hr) && pPresentationParameters) {
+        SetupStereoSurfaces(This, pPresentationParameters);
+    }
+
+    return hr;
+}
+
+/* Patch IDirect3DDevice9::Present (vtbl slot 17) and ::Reset (vtbl slot 16)
+ * to point at our hooks. The vtable pointed to by This->lpVtbl is a single
+ * shared, normally read-only structure (typically in the real d3d9.dll's
+ * .rdata), so it must be made writable with VirtualProtect before patching
+ * and restored after. Guarded by g_deviceHooked so a second CreateDevice
+ * call (should one ever happen) doesn't re-patch an already-patched vtable.
+ * Both hooks are patched together under one VirtualProtect call since
+ * they're adjacent slots on the same vtable struct. */
 static void InstallPresentHook(IDirect3DDevice9 *pDevice)
 {
     IDirect3DDevice9Vtbl *vtbl;
@@ -864,11 +1146,14 @@ static void InstallPresentHook(IDirect3DDevice9 *pDevice)
 
     g_pRealPresent = vtbl->Present;
     vtbl->Present = Hook_Present;
+    g_pRealReset = vtbl->Reset;
+    vtbl->Reset = Hook_Reset;
 
     VirtualProtect(vtbl, sizeof(*vtbl), oldProtect, &oldProtect);
 
     g_deviceHooked = TRUE;
-    LogLine("Hooked IDirect3DDevice9::Present (vtable slot 17), original=0x%p", (void *)g_pRealPresent);
+    LogLine("Hooked IDirect3DDevice9::Present (vtable slot 17), original=0x%p; ::Reset (vtable slot 16), original=0x%p",
+            (void *)g_pRealPresent, (void *)g_pRealReset);
 }
 
 /* ---- CreateDevice hook (IDirect3D9 vtable slot 16) ---------------------- */
