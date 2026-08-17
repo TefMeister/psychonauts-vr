@@ -1,10 +1,71 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 7: off-axis fix LIVE-VERIFIED correct via real-gameplay log
-evidence + independent math re-derivation; user's "no difference" report explained as expected, not
-a bug — full detail in notes/26)
+Last updated: 2026-08-17 (session 8: SteamVR installed by user, null driver enabled, OpenVR init
+SUCCEEDS against it, and `IVRCompositor::Submit` returns `VRCompositorError_None` for both eyes on a
+real D3D9Ex->shared-D3D11 bridged texture — the full VR-bridge mechanism proven end-to-end with zero
+physical hardware — full detail in notes/27)
 
-## Off-axis (asymmetric frustum) projection upgrade — LIVE-VERIFIED CORRECT (2026-08-17)
+## VR runtime bridge — OpenVR init + IVRCompositor::Submit PROVEN end-to-end via null driver (2026-08-17)
+
+**The user installed SteamVR, unblocking everything notes/25 left gated on it — and this session
+completed the full "does the VR bridge concept actually work" milestone: null driver enabled,
+OpenVR init succeeds, and a real D3D9Ex-rendered surface bridged through a shared D3D11 texture was
+successfully submitted to the OpenVR compositor (`VRCompositorError_None`, both eyes, 4/4 clean
+runs) — all without any physical VR headset.** Full detail in
+`notes/27-null-driver-openvr-init-and-compositor-submit.md`. Headline findings:
+
+- **Null driver enabled** per notes/25 §5's researched plan, executed now that SteamVR exists: both
+  `default.vrsettings` files (`driver_null.enable=true`; `steamvr.requireHmd=false`,
+  `forcedDriver="null"`, `activateMultipleDrivers=true`) plus a newly-created durable per-user
+  override (`<Steam>\config\steamvr.vrsettings`, since SteamVR had never run before). SteamVR's full
+  process stack (`vrserver`/`vrcompositor`/`vrdashboard`/`vrmonitor`/`vrwebhelper`) now runs
+  headlessly, confirmed via `Get-Process` and live log lines (`Using existing HMD null.Null Serial
+  Number`).
+- **A second real config bug found and fixed**: distinct from notes/25's already-known stale
+  *runtime* path, the SteamVR installer left `openvrpaths.vrpath`'s `config`/`log` paths pointing at
+  a nonexistent `C:\Program Files (x86)\Steam` — fixed with the official `vrpathreg.exe setconfig`/
+  `setlog`/`setruntime` commands, not hand-editing the JSON.
+- **`poc_openvr_init.exe` rerun: `VR_InitInternal2` now returns `error=0`** (previously 100,
+  `InstallationNotFound`, with SteamVR absent) — but then crashed on the very next standard-pattern
+  call. **Real, fully-diagnosed root cause** (vectored exception handler + `VirtualQuery`, not
+  guessed): this installed SteamVR build's `VR_GetGenericInterface()` returns a genuine C++ object
+  pointer (`vrclient.dll` `this`-ptr), not the "flat FnTable" struct `openvr_capi.h` documents and
+  many C bindings assume — calling through it as a flat table reads the vtable pointer as if it were
+  function-pointer slot 0 and jumps into a non-executable `.rdata` page (confirmed
+  `PAGE_READONLY` via `VirtualQuery`). **Fix, confirmed working**: dereference the real vtable
+  (`*(void**)ptr`) and dispatch via `__thiscall` (matching `openvr.h`'s unattributed-virtual C++ ABI)
+  — `GetRecommendedRenderTargetSize` then returns real values (1656×1840/eye) and shutdown is clean.
+  This is a genuine, environment-specific ABI finding that will matter again for the real
+  `proxy_d3d9.c` integration, not a one-off POC quirk.
+- **New POC (`tools/vr-bridge/poc_submit_test/`) combines the proven D3D9Ex shared-surface mechanism
+  (notes/25) with the vtable-dispatch fix above to reach the actual task success criterion**: creates
+  a D3D9Ex device, clears a shared render target to a distinct test color, opens it from a separate
+  `ID3D11Device` (same proven mechanism as notes/25's `poc_shared_surface`), inits OpenVR against the
+  null driver, calls `WaitGetPoses` then `IVRCompositor::Submit` for both eyes with the bridged D3D11
+  texture. **Result: `VRCompositorError_None` for both eyes, 4/4 consecutive clean runs, zero
+  crashes, no leftover processes.** This is the full intended bridge mechanism (D3D9Ex render →
+  shared D3D11 surface → OpenVR compositor) proven end-to-end on real hardware (GTX 1660 SUPER) with
+  zero physical VR headset involved — the single riskiest open question from notes/24's original VR
+  scoping is now closed.
+- **User's game (PID 7052) ran the entire session, untouched** (no attach/kill/write) — this task
+  never needed the game; all work stayed in `tools/vr-bridge/` standalone POCs, per this session's
+  explicit scope.
+- **Concrete next steps**: (1) extend the shared-surface bridge from one solid-color clear to a real
+  per-frame pipeline with non-stalling GPU synchronization (the current `flush_d3d9` helper is a
+  synchronous stall, fine for a POC, wrong for a 60-90fps hot path); (2) carry the vtable/`__thiscall`
+  dispatch fix into whatever OpenVR-calling code eventually goes into `proxy_d3d9.c` — the flat
+  FnTable pattern the header documents does NOT work against this installed runtime; (3) actual
+  `proxy_d3d9.c` integration (create the second D3D9Ex+D3D11 device pair alongside the game's own
+  device, wire the existing per-eye render targets to shared surfaces, call `Submit` from the real
+  per-frame hook) remains explicitly out of scope until this groundwork is fully solid — not
+  attempted this session per the task's own instruction.
+
+## Prior milestone (off-axis fix live-verified correct, still valid as background)
+
+**The user played real gameplay against the notes/24 off-axis build and reported "no difference at
+all" versus the old correction — this was investigated with real evidence (live log + independent
+math re-derivation), not assumption, and found NOT to be a bug.** Full detail in
+`notes/26-off-axis-fix-live-verified-no-visible-difference-explained.md`. Headline findings:
 
 **The user played real gameplay against the notes/24 off-axis build and reported "no difference at
 all" versus the old correction — this was investigated with real evidence (live log + independent
