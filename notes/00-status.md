@@ -1,8 +1,43 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-16 (stereo-correction index-bug fix + action-slot-4 ruled-out session)
+Last updated: 2026-08-17 (first real-gameplay stereo test: frozen-left/dark-right diagnosis session)
 
 ## Latest status (read this first)
+
+**First-ever real-gameplay test of the stereo hook (previously only exercised on the title screen)
+found two bugs — left half frozen, right half dark/corrupted — both diagnosed with real live-log
+evidence and fixed in code, but the fix is NOT YET LIVE-TESTED.** Full detail in
+`notes/20-real-gameplay-stereo-frozen-left-dark-right.md`. Headline findings:
+
+- **Root cause 1 (frozen left, likely contributor)**: `BuildViewMatrix`'s output-buffer pointer,
+  previously confirmed stable (always the same address) only against the title screen's single
+  attract-mode camera, was found — via the live proxy log from the user's actual running gameplay
+  session — to **alternate between at least two distinct addresses in real gameplay** (182/188
+  samples one address, 6/188 a second one). This is the same class of dangling-caller-stack-pointer
+  bug notes/14 already found and fixed once for `BuildProjectionMatrix`; it had just never been
+  exercised for `BuildViewMatrix` before because the title screen's camera was too simple to expose
+  it. `SetEyeAndTarget()` was re-invoking `BuildViewMatrix`'s real body through this cached pointer a
+  second/third time (once per eye) from deep inside `CandB`'s nested call tree — a real risk of
+  writing into stack memory unrelated gameplay code has since reused. **Fixed by disabling this
+  CPU-side rewrite outright** (already established in notes/14 as not load-bearing for the actual
+  visible correction, which comes from the independent `SetVertexShaderConstantF` register-6 patch).
+- **Root cause 2 (dark/corrupted right, likely contributor)**: the Present-suppression phase logic
+  assumed `CandB`'s internally-nested `Present` call fires exactly once per eye (true at the title
+  screen, per notes/13) — nothing guarded against it firing more than once during eye 2's pass in
+  gameplay's richer multi-pass rendering. Log evidence (register-6 correction counts heavily skewed
+  167:13 between eye1:eye2 phases despite structurally symmetric code paths) is consistent with eye
+  2's pass being cut short by a premature internal `Present`. **Fixed with a strict
+  once-per-`CandB`-double-invoke guard** (`g_eye2Presented` flag) — any extra internal `Present` hits
+  during eye 2 beyond the first are now suppressed like eye 1's, instead of re-compositing/re-flipping
+  partial content.
+- **Both fixes are in `tools/proxy-d3d9/proxy_d3d9.c`, build clean, DLL rebuilt — but NOT yet copied
+  into the game directory or live-tested.** Both the process kill and the DLL file copy were denied
+  by the Claude Code auto-mode safety classifier this session (the exact "drop payload DLL then
+  kill+relaunch" risk pattern the project has hit before) — **the user needs to manually close the
+  game, copy `tools\proxy-d3d9\d3d9.dll` into the game directory, and relaunch** to pick up the fix.
+  See notes/20 §5 for exact steps. Not pushed to the mod repo (untested).
+
+## Prior milestone (stereo-correction index-bug fix + action-slot-4 ruled-out session, still valid)
 
 **Two leads worked this session, picking up exactly where notes/17 left off — a fix for a real
 mathematical bug in the stereo correction (Lead 2), and a live direct-write test that rules out a

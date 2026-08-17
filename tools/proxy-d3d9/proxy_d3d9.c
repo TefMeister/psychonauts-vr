@@ -423,20 +423,38 @@ static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf, BOOL expl
                                   D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
     }
 
-    if (g_frameCamCached && g_camPOutMatrix && g_realBuildViewMatrix) {
-        Vec3 eye;
-        eye.x = g_baseEye.x + g_rightVec.x * STEREO_HALF_IPD * sign;
-        eye.y = g_baseEye.y + g_rightVec.y * STEREO_HALF_IPD * sign;
-        eye.z = g_baseEye.z + g_rightVec.z * STEREO_HALF_IPD * sign;
-        /* This CPU-side matrix rewrite (confirmed by notes/13 to land
-         * correctly in *pOutMatrix) is kept as a structurally-correct,
-         * belt-and-suspenders injection alongside notes/14's real fix (the
-         * SetVertexShaderConstantF correction below) - it has no confirmed
-         * effect on its own (notes/13), since the actual per-draw matrix the
-         * GPU uses is uploaded via shader constants, not re-read from this
-         * buffer at draw time. */
-        g_realBuildViewMatrix(g_camPOutMatrix, &eye, &g_baseAt, &g_baseUp);
-    }
+    /* notes/20 (real-gameplay session): this CPU-side re-invocation of
+     * BuildViewMatrix through g_camPOutMatrix was previously kept as a
+     * "belt and suspenders" injection alongside notes/14's real fix (the
+     * SetVertexShaderConstantF correction below), on the strength of
+     * notes/09's finding that BuildViewMatrix's pOutMatrix is a genuinely
+     * persistent, stable object field (confirmed via a single, always-
+     * identical address, 0x0019EAF0, across the whole title-screen
+     * session). That assumption does NOT hold in real gameplay: this
+     * session's live proxy log (188 "BVM cache SET" samples from an
+     * actively-running gameplay session) shows pOutMatrix alternating
+     * between at least two distinct addresses (0x0019EAF0, the vast
+     * majority, and 0x0019E380, 6/188 samples) - i.e. BuildViewMatrix has
+     * more than one live call site/context in gameplay, unlike the title
+     * screen's single attract-mode camera. That is exactly the same class
+     * of bug notes/14 Sec3 already found and fixed for
+     * BuildProjectionMatrix's output pointer (a caller stack temp, unsafe
+     * to cache-and-write-later) - g_camPOutMatrix is captured once per
+     * frame (first BuildViewMatrix hit) and then this function calls the
+     * REAL BuildViewMatrix body a second and third time (once per eye)
+     * through that cached pointer, from deep inside CandB's own nested
+     * call tree - by then the original caller that owned that stack slot
+     * may have already returned, so this write can land on stack memory
+     * that unrelated, currently-executing gameplay code has since reused,
+     * i.e. a real, live-evidenced memory-corruption risk that was never
+     * exercised at the title screen. Since notes/14 already established
+     * this rewrite has "no confirmed effect on its own" on the actual
+     * GPU-driven image (the real, load-bearing fix is the
+     * SetVertexShaderConstantF register-6 correction below, which does not
+     * depend on this pointer at all) - it is disabled outright rather than
+     * gated, trading away a redundant, unsafe-in-gameplay CPU-side write
+     * for zero loss of the actual stereo effect. */
+    (void)sign;
 }
 
 /* IMPORTANT DISCOVERY (this session, see notes/13): CandB's own nested call
@@ -462,10 +480,36 @@ static void SetEyeAndTarget(float sign, IDirect3DSurface9 *targetSurf, BOOL expl
 #define STEREO_PHASE_EYE2  2
 static volatile LONG g_stereoPhase = STEREO_PHASE_IDLE;
 
+/* notes/20 (real-gameplay session): the original design assumed CandB's
+ * nested call tree calls Present internally EXACTLY ONCE per eye (true at
+ * the title screen, per notes/13). Nothing enforced that assumption -
+ * before this fix, EVERY internal Present hit while phase==EYE2 re-ran the
+ * full StretchRect composite AND called the real hardware Present again,
+ * using whatever partial content g_pEye2Surf held at that exact moment. If
+ * gameplay's richer multi-pass rendering (notes/10 already found 8x
+ * SetRenderTarget/3x Clear per frame even at the simple title screen scene)
+ * causes CandB's nested tree to call Present more than once while rendering
+ * eye 2, the FIRST such call would prematurely flip a still-INCOMPLETE eye2
+ * render (missing whatever draws were still to come - lighting/detail
+ * passes, etc.) to the actual screen, which reads exactly like the reported
+ * "right half is very dark / doesn't look right" symptom; a following
+ * legitimate composite from the SAME logical frame could then also
+ * overwrite eye 1's already-correct half with a second flip before the
+ * display actually samples it, contributing to the reported "left half
+ * frozen" symptom (the visible frame becomes whichever premature/duplicate
+ * flip last happened to win the race, not a clean single composite per
+ * logical frame). Fixed by making the real composite+Present strictly
+ * once-per-CandB-double-invoke: g_eye2Presented is reset at the start of
+ * every cycle (BeforeEye1) and checked/set in Hook_Present's EYE2 branch;
+ * any extra internal Present hits during EYE2 (beyond the first) are now
+ * suppressed exactly like EYE1's, instead of re-compositing/re-presenting. */
+static volatile LONG g_eye2Presented = 0;
+
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
 {
     g_stereoPhase = STEREO_PHASE_EYE1;
+    g_eye2Presented = 0;
     SetEyeAndTarget(-1.0f, g_pEye1Surf, FALSE);
 }
 
@@ -808,6 +852,15 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         return D3D_OK;
     }
 
+    /* notes/20: suppress any EXTRA internal Present hits during eye 2's
+     * pass beyond the first - see the comment on g_eye2Presented above
+     * CandB_BeforeEye1_asm for why this matters in real gameplay (it never
+     * triggered at the title screen, where each eye's pass only ever
+     * called Present once). */
+    if (g_stereoPhase == STEREO_PHASE_EYE2 && g_eye2Presented) {
+        return D3D_OK;
+    }
+
     if (g_stereoPhase == STEREO_PHASE_EYE2 && g_stereoReady) {
         /* Both eyes are now fully rendered (eye 1 completed normally
          * including its own suppressed Present above; eye 2 just finished
@@ -815,6 +868,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
          * moment: stitch both offscreen eye surfaces into the left/right
          * halves of the real backbuffer before letting this one real
          * hardware Present go through. */
+        g_eye2Presented = 1;
         RECT srcFull;
         RECT dstLeft;
         RECT dstRight;
