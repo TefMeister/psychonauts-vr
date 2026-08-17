@@ -1,11 +1,72 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 8: SteamVR installed by user, null driver enabled, OpenVR init
-SUCCEEDS against it, and `IVRCompositor::Submit` returns `VRCompositorError_None` for both eyes on a
-real D3D9Ex->shared-D3D11 bridged texture — the full VR-bridge mechanism proven end-to-end with zero
-physical hardware — full detail in notes/27)
+Last updated: 2026-08-17 (session 9: non-blocking double-buffered sync mechanism fixed and verified
+(1000-6000x faster than the old blocking helper, zero correctness regressions); a real architectural
+constraint found empirically (the game's plain D3D9 device cannot open a D3D9Ex-originated shared
+handle) and worked around with a fully-validated, fully non-blocking two-hop CPU-round-trip pipeline;
+that design wired into the real `proxy_d3d9.c` additively, gated off by default — compiles/links
+clean, NOT yet live-tested against the real game — full detail in notes/28)
 
-## VR runtime bridge — OpenVR init + IVRCompositor::Submit PROVEN end-to-end via null driver (2026-08-17)
+## Non-blocking sync mechanism + real proxy_d3d9.c VR submission integration (2026-08-17, session 9)
+
+**Picked up exactly where notes/27 left off — its own explicitly-flagged "this sync mechanism is a
+blocking stall, wrong for a per-frame hot path" caveat is now fixed and measured (1000-6000x faster),
+and the real `proxy_d3d9.c` integration (previously fully out of scope) now has real, additive,
+off-by-default code wired into every needed hook, though not yet live-tested.** Full detail in
+`notes/28-nonblocking-sync-and-vr-submit-integration.md`. Headline findings:
+
+- **Sync mechanism fix, measured**: replaced the synchronous GPU-flush-and-wait helper
+  (`while(GetData()!=S_OK) Sleep(1)`) with a proven non-blocking, double-buffered technique in
+  `tools/vr-bridge/poc_submit_test/`. Real repeated measurements: OLD blocking helper stalls
+  ~15-16ms/call (dominated by `Sleep(1)`'s ~15.6ms Windows timer-granularity rounding); NEW
+  non-blocking poll costs 1.2-16.7 **microseconds** — 4/4 clean runs, zero pixel mismatches, zero
+  dropped frames.
+- **A real, load-bearing architectural finding, discovered empirically, not assumed**: Psychonauts'
+  own D3D9 device is a PLAIN (non-Ex) device (confirmed: this file only ever hooks
+  `IDirect3D9::CreateDevice`, never `CreateDeviceEx`) — and a plain device CANNOT open a shared
+  handle a separate D3D9Ex device originated (`hr=0x8876086C`/`D3DERR_INVALIDCALL`, tried two ways,
+  both failed identically). This rules out any zero-copy shared-surface design and forces a
+  CPU-visible round trip (`GetRenderTargetData` + `UpdateSurface`) — a real, concrete constraint
+  found via a new standalone POC (`tools/vr-bridge/poc_dual_device_shared/`), not discovered by
+  reading docs alone.
+- **That round trip needed a SECOND non-blocking fence, also found empirically**: an initial
+  one-fence version produced a real, reproducible pixel mismatch; root-caused with a diagnostic
+  blocking-flush test (confirmed the hypothesis before writing the real fix) to the destination
+  device's `UpdateSurface` being itself an async GPU upload needing its own completion fence,
+  independent of the first hop's fence. The fully-fixed two-hop, double-buffered, fully
+  non-blocking pipeline: 3/3 clean runs, zero mismatches, zero waits anywhere, and
+  `GetRenderTargetData` itself confirmed NOT to be a stall on this hardware (a real answer to a
+  well-known historical D3D9 performance question, measured not assumed).
+- **This validated design is now real code in `tools/proxy-d3d9/proxy_d3d9.c`** ("Milestone 8"),
+  fully additive (every new symbol prefixed `VRBridge_`/`g_vr`, touches none of the existing
+  eye-surface/depth-stencil/composite code) and gated behind a runtime flag
+  (`PSYVR_ENABLE_SUBMIT=1`, default OFF — with it unset, behavior is byte-for-byte identical to
+  before this session). Wires a private D3D9Ex "Device A" + D3D11 device + OpenVR/`IVRCompositor`
+  init (lazily, from the existing `SetupStereoSurfaces`), a per-eye two-hop non-blocking pump
+  (`VRBridge_PumpEye`, a direct port of the proven POC loop) called once per real frame from
+  `CandB_AfterBoth_asm` right after both eyes finish rendering into the UNCHANGED
+  `g_pEye1Surf`/`g_pEye2Surf`, and clean shutdown. Build updated to link d3d11/dxgi/the vendored
+  OpenVR import lib and deploy `openvr_api.dll` alongside the built `d3d9.dll`. **Build is clean.**
+- **Not yet live-tested, and a clear reason why, not just "ran out of time"**: this DLL's
+  pre-existing inline-hook mechanism (from notes/13 onward, untouched this session) hardcodes
+  absolute addresses that only exist inside `Psychonauts.exe`'s own address space (confirmed via
+  `VirtualQuery` returning failure/unmapped when checked from any other process) — it has always
+  required the real game process to test past `DllMain`, which is exactly why `validate.ps1`
+  launches the actual game. A standalone loader-only sanity check (deliberately never touching the
+  real game) confirmed the DLL's new imports (d3d9/d3d11/dxgi/openvr_api) all resolve correctly
+  (a `DLL_INIT_FAILED` error from the pre-existing hook code executing in the wrong process, not a
+  missing-import error) before hitting that pre-existing, unrelated limitation.
+  `validate.ps1` itself was deliberately NOT run (its cleanup kills any process named `Psychonauts`
+  by force, which would have killed the user's live session).
+- **The user's game (PID 7052) ran the entire session, untouched** (no attach/kill/write) — all work
+  stayed in `tools/vr-bridge/` standalone POCs plus editing (not deploying) `proxy_d3d9.c`.
+- **Concrete next step, and it needs the user**: close the current Psychonauts session so the
+  orchestrating session can copy `tools/proxy-d3d9/d3d9.dll` + `openvr_api.dll` into the game
+  directory, set `PSYVR_ENABLE_SUBMIT=1`, relaunch, and read the live proxy log for
+  `VRBridge_Init`/`Submit` results — SteamVR's null driver is already confirmed enabled and running
+  from notes/27, no further SteamVR setup needed.
+
+## Prior milestone (VR runtime bridge — OpenVR init + IVRCompositor::Submit PROVEN end-to-end via null driver, still valid as background, 2026-08-17)
 
 **The user installed SteamVR, unblocking everything notes/25 left gated on it — and this session
 completed the full "does the VR bridge concept actually work" milestone: null driver enabled,

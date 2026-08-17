@@ -190,15 +190,72 @@
  * = ..., ->lpVtbl->Present = ...) so the compiler - not manual offset math -
  * guarantees the correct slot is patched.
  *
+ * Milestone 8 (this revision, notes/28): VR SUBMISSION PATH (additive, off by default).
+ * notes/27 proved the full D3D9Ex-shared-surface -> D3D11 -> IVRCompositor::Submit bridge works
+ * end-to-end via standalone POCs, but explicitly flagged its sync mechanism (a synchronous
+ * GPU-flush stall) as unfit for a real per-frame hot path. This session (notes/28) first replaced
+ * that with a proven non-blocking double-buffered technique (tools/vr-bridge/poc_submit_test),
+ * then discovered - empirically, via a second standalone POC
+ * (tools/vr-bridge/poc_dual_device_shared) - a real architectural constraint that changes the
+ * whole integration design: Psychonauts' own D3D9 device (the one this file hooks) is a PLAIN
+ * (non-Ex) device, created via Direct3DCreate9 -> IDirect3D9::CreateDevice (never CreateDeviceEx -
+ * confirmed by this file's own hooks, which only ever patch IDirect3D9::CreateDevice). Only a
+ * D3D9Ex device's CreateTexture can produce a shared handle that ID3D11Device::OpenSharedResource
+ * can open. A plain device CANNOT open a handle an Ex device originated (confirmed empirically:
+ * hr=0x8876086C/D3DERR_INVALIDCALL, tried both as a direct render-target and as a StretchRect
+ * destination) - so this file's own device can never render directly into anything D3D11/OpenVR
+ * can see.
+ *
+ * The working design (proven in poc_dual_device_shared, 3/3 clean runs): a SEPARATE, private
+ * D3D9Ex device ("Device A" below) is created by this DLL, matched to the same physical adapter
+ * as the game's device via LUID. Each real frame, for each eye: the game's already-rendered
+ * private eye surface (g_pEye1Surf/g_pEye2Surf - UNCHANGED, still used for the existing monitor
+ * composite) is copied to the CPU via GetRenderTargetData (on the game's own device), then
+ * memcpy'd and UpdateSurface'd into Device A's own D3DPOOL_DEFAULT shared texture (both hops
+ * individually required to stay on one device each - a real MSDN constraint, not a design choice).
+ * D3D11 opens Device A's shared texture and hands it to IVRCompositor::Submit.
+ *
+ * This CPU round trip turned out to need TWO independent non-blocking completion fences, not one:
+ * GetRenderTargetData's own readback (checked via IDirect3DSurface9::LockRect with
+ * D3DLOCK_DONOTWAIT) AND Device A's subsequent UpdateSurface, which is itself an async GPU upload
+ * needing its own fence (an IDirect3DQuery9 D3DQUERYTYPE_EVENT on Device A, checked non-blockingly)
+ * before a downstream reader touches it - discovered by a real, reproducible mismatch (a stale/
+ * torn frame reaching D3D11) when only the first fence was implemented, root-caused and fixed with
+ * a diagnostic blocking-flush test that confirmed the hypothesis before the real fix was written.
+ * Both hops are double-buffered exactly like notes/28 Part 1's proven single-hop design, so the
+ * steady-state per-frame cost is a small, fixed number of non-blocking Lock/GetData calls - never
+ * a wait - see the full derivation and real timing numbers in notes/28.
+ *
+ * ADDITIVE BY DESIGN, OFF BY DEFAULT: every new symbol below is prefixed VRBridge_/g_vr, touches
+ * NONE of the existing eye-surface/depth-stencil/composite code, and the entire path is gated
+ * behind a runtime environment-variable flag (PSYVR_ENABLE_SUBMIT=1) read once at DllMain and
+ * checked before any VR-specific work happens anywhere - with the flag unset (the default), this
+ * file's behavior is byte-for-byte identical to before this milestone. Even with the flag set, any
+ * failure at any VR bridge init/per-frame step (SteamVR absent, OpenVR call failure, etc.) simply
+ * leaves g_vrBridgeReady FALSE and the existing monitor-composite path continues completely
+ * unaffected - the VR path can never take down or degrade the proven working fallback.
+ *
+ * NOT YET LIVE-TESTED against the real game (needs SteamVR's null driver + a relaunch to pick up
+ * this DLL - out of scope for this session per the task's own safety rule about the user's already-
+ * running game session). See notes/28 for exactly what's proven standalone vs. what's still open.
+ *
  * Build target: 32-bit (i686), matching the 32-bit Psychonauts.exe.
  */
 
+#define INITGUID
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include "../vr-bridge/openvr-sdk/headers/openvr_capi.h"
+/* Do NOT include <stdbool.h> - openvr_capi.h typedefs its own bool as char on Windows, which
+ * collides with <stdbool.h>'s #define bool _Bool if both are included in the same translation
+ * unit (documented in tools/vr-bridge/poc_openvr_init/openvr_init_poc.c, notes/25 Sec2). */
 
 typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
 typedef HRESULT (STDMETHODCALLTYPE *CreateDevice_t)(
@@ -324,6 +381,437 @@ static BOOL LoadRealD3D9(void)
     return TRUE;
 }
 
+/* Moved up from the "Stereo prototype" section below (notes/28) so the VR bridge code that
+ * immediately follows - which reads/writes these same globals (g_pDevice, g_pEye1Surf/2Surf,
+ * g_bbWidth/Height) - can reference them without a forward-declaration dance. No functional
+ * change: same globals, same lifecycle, just declared earlier in the file. */
+static IDirect3DDevice9 *g_pDevice = NULL;
+static IDirect3DSurface9 *g_pRealBackBuffer = NULL;
+static IDirect3DSurface9 *g_pEye1Surf = NULL;
+static IDirect3DSurface9 *g_pEye2Surf = NULL;
+/* notes/22: the device's single auto depth-stencil surface (EnableAutoDepthStencil=1,
+ * live-confirmed AutoDepthStencilFormat=75/D3DFMT_D24S8) was NEVER reassigned per eye -
+ * both g_pEye1Surf/g_pEye2Surf rendered against the SAME physical depth buffer the whole
+ * time, and SetDepthStencilSurface was never called anywhere in this file. Each eye now
+ * gets its own private depth-stencil surface, captured/restored exactly like the color
+ * render targets. See the comment on SetEyeAndTarget() for the full mechanism this fixes. */
+static IDirect3DSurface9 *g_pRealDepthStencil = NULL;
+static IDirect3DSurface9 *g_pEye1DepthStencil = NULL;
+static IDirect3DSurface9 *g_pEye2DepthStencil = NULL;
+static UINT g_bbWidth = 0;
+static UINT g_bbHeight = 0;
+static BOOL g_stereoReady = FALSE; /* device + both offscreen color+depth surfaces created OK */
+
+/* ======================================================================
+ * VR submission bridge (notes/28) - additive, gated behind PSYVR_ENABLE_SUBMIT=1.
+ * See the Milestone 8 header comment at the top of this file for the full design and the two
+ * real architectural findings (plain-device-cannot-open-Ex-handle; UpdateSurface needs its own
+ * fence) that shaped it.
+ * ====================================================================== */
+
+/* ---- OpenVR global entry points (declared directly, not via openvr_capi.h's dead #if 0 block -
+ * see tools/vr-bridge/poc_openvr_init/openvr_init_poc.c and notes/25 Sec2 for why). ---- */
+extern bool VR_IsRuntimeInstalled(void);
+extern bool VR_IsHmdPresent(void);
+extern uint32_t VR_InitInternal2(EVRInitError *peError, EVRApplicationType eApplicationType, const char *pStartupInfo);
+extern void VR_ShutdownInternal(void);
+extern void *VR_GetGenericInterface(const char *pchInterfaceVersion, EVRInitError *peError);
+extern const char *VR_GetVRInitErrorAsEnglishDescription(EVRInitError error);
+
+typedef IDirect3D9 *(WINAPI *Direct3DCreate9Ex9_t)(void); /* not used - Ex creation goes through Direct3DCreate9Ex below */
+typedef HRESULT (WINAPI *Direct3DCreate9Ex_t)(UINT SDKVersion, IDirect3D9Ex **ppD3D);
+static Direct3DCreate9Ex_t g_pRealDirect3DCreate9Ex = NULL;
+
+/* Real-C++-vtable dispatch fix (notes/27): this installed SteamVR build's VR_GetGenericInterface()
+ * returns a genuine C++ this-ptr, not the flat FnTable struct openvr_capi.h documents - calling
+ * through it as a flat table crashes. Dereference the real vtable and dispatch via __thiscall. */
+static void *VRBridge_RealVtable(void *thisPtr) { return *(void **)thisPtr; }
+
+typedef EVRCompositorError (__thiscall *VRBridge_WaitGetPoses_t)(void *pThis,
+    TrackedDevicePose_t *pRenderPoseArray, uint32_t unRenderPoseArrayCount,
+    TrackedDevicePose_t *pGamePoseArray, uint32_t unGamePoseArrayCount);
+typedef EVRCompositorError (__thiscall *VRBridge_Submit_t)(void *pThis,
+    EVREye eEye, const Texture_t *pTexture, const VRTextureBounds_t *pBounds, EVRSubmitFlags nSubmitFlags);
+
+/* Per-eye double-buffered two-hop pipeline state (notes/28, proven in
+ * tools/vr-bridge/poc_dual_device_shared/dual_device_poc.c). "Device B" in that POC's terms is
+ * always g_pDevice (the game's own plain device, already tracked); "Device A" is g_pVRDeviceA
+ * below (shared across both eyes - one private D3D9Ex device backs both eyes' buffers). */
+typedef struct {
+    /* Hop 1: g_pDevice's rendered eye surface -> GetRenderTargetData -> sysmemB (game device, sysmem) */
+    IDirect3DSurface9 *sysmemB[2];
+    BOOL pendingB[2];
+    /* Hop 2: memcpy -> UpdateSurface -> Device A's own shared D3DPOOL_DEFAULT texture, fenced per-slot */
+    IDirect3DTexture9 *texA[2];
+    IDirect3DSurface9 *surfA[2];
+    HANDLE handleA[2];
+    IDirect3DQuery9 *queryA[2];
+    BOOL pendingA[2];
+    ID3D11Texture2D *tex11[2];
+    int hop1Count; /* selects which Device-A slot to write next / which to consume (hop1Count-2) */
+    EVREye vrEye;
+} VRBridgeEyeState;
+
+static BOOL g_vrSubmitEnabled = FALSE;   /* runtime flag: env var PSYVR_ENABLE_SUBMIT=1, read once at DllMain */
+static BOOL g_vrBridgeInitAttempted = FALSE;
+static BOOL g_vrBridgeReady = FALSE;     /* Device A + D3D11 + OpenVR all initialized OK */
+static IDirect3D9Ex *g_pVRD3D9Ex = NULL;
+static IDirect3DDevice9Ex *g_pVRDeviceA = NULL;
+static IDirect3DSurface9 *g_pVRSysmemAScratch = NULL; /* shared transient scratch, both eyes (used sequentially, never concurrently) */
+static ID3D11Device *g_pVRDevice11 = NULL;
+static ID3D11DeviceContext *g_pVRContext11 = NULL;
+static void *g_pVRCompositor = NULL;
+static VRBridge_WaitGetPoses_t g_pVRWaitGetPoses = NULL;
+static VRBridge_Submit_t g_pVRSubmit = NULL;
+static VRBridgeEyeState g_vrEye1, g_vrEye2; /* eye1=left, eye2=right, matching this file's existing eye numbering */
+static UINT g_vrBufWidth = 0, g_vrBufHeight = 0; /* dimensions the eye buffers above were sized for */
+
+/* Reads PSYVR_ENABLE_SUBMIT once. Default OFF - the whole VR path is inert unless explicitly
+ * requested, per this session's explicit "don't risk destabilizing the working monitor path"
+ * requirement. Set the env var to "1" (e.g. before launching the game) to enable. */
+static void VRBridge_ReadEnableFlag(void)
+{
+    char buf[8];
+    DWORD len = GetEnvironmentVariableA("PSYVR_ENABLE_SUBMIT", buf, sizeof(buf));
+    g_vrSubmitEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    LogLine("VRBridge: PSYVR_ENABLE_SUBMIT=%s -> g_vrSubmitEnabled=%d",
+            (len > 0 && len < sizeof(buf)) ? buf : "(unset)", g_vrSubmitEnabled ? 1 : 0);
+}
+
+static void VRBridge_ReleaseEyeBuffers(VRBridgeEyeState *eye)
+{
+    int s;
+    for (s = 0; s < 2; s++) {
+        if (eye->tex11[s])  { eye->tex11[s]->lpVtbl->Release(eye->tex11[s]); eye->tex11[s] = NULL; }
+        if (eye->queryA[s]) { eye->queryA[s]->lpVtbl->Release(eye->queryA[s]); eye->queryA[s] = NULL; }
+        if (eye->surfA[s])  { eye->surfA[s]->lpVtbl->Release(eye->surfA[s]); eye->surfA[s] = NULL; }
+        if (eye->texA[s])   { eye->texA[s]->lpVtbl->Release(eye->texA[s]); eye->texA[s] = NULL; }
+        if (eye->sysmemB[s]) { eye->sysmemB[s]->lpVtbl->Release(eye->sysmemB[s]); eye->sysmemB[s] = NULL; }
+        eye->pendingB[s] = FALSE;
+        eye->pendingA[s] = FALSE;
+        eye->handleA[s] = NULL;
+    }
+    eye->hop1Count = 0;
+}
+
+/* Creates one eye's double-buffered pipeline surfaces at the given dimensions (matching the
+ * game's current eye render targets - g_bbWidth/g_bbHeight). Defensive throughout: any failure
+ * releases what was partially created and returns FALSE, leaving the VR path inert for this eye
+ * without touching anything else. */
+static BOOL VRBridge_CreateEyeBuffers(VRBridgeEyeState *eye, EVREye vrEye, UINT w, UINT h)
+{
+    int s;
+    HRESULT hr;
+
+    eye->vrEye = vrEye;
+
+    for (s = 0; s < 2; s++) {
+        hr = g_pDevice->lpVtbl->CreateOffscreenPlainSurface(g_pDevice, w, h, D3DFMT_A8R8G8B8,
+                                                              D3DPOOL_SYSTEMMEM, &eye->sysmemB[s], NULL);
+        if (FAILED(hr)) { LogLine("VRBridge: CreateOffscreenPlainSurface (sysmemB[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = g_pVRDeviceA->lpVtbl->CreateTexture(g_pVRDeviceA, w, h, 1, D3DUSAGE_RENDERTARGET,
+                                                  D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &eye->texA[s], &eye->handleA[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: CreateTexture (texA[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = eye->texA[s]->lpVtbl->GetSurfaceLevel(eye->texA[s], 0, &eye->surfA[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: GetSurfaceLevel (surfA[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = g_pVRDeviceA->lpVtbl->CreateQuery(g_pVRDeviceA, D3DQUERYTYPE_EVENT, &eye->queryA[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: CreateQuery (queryA[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = g_pVRDevice11->lpVtbl->OpenSharedResource(g_pVRDevice11, eye->handleA[s], &IID_ID3D11Texture2D, (void **)&eye->tex11[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: OpenSharedResource (tex11[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+    }
+
+    LogLine("VRBridge: eye buffers created OK (eEye=%d, %ux%u)", (int)vrEye, w, h);
+    return TRUE;
+}
+
+/* One-time init: private D3D9Ex device matched to the game's adapter, D3D11 device, OpenVR init +
+ * IVRCompositor. Called lazily from SetupStereoSurfaces the first time g_vrSubmitEnabled is TRUE
+ * and the game's own device/backbuffer dims are known. Never called more than once per process
+ * (guarded by g_vrBridgeInitAttempted) - a failed attempt is NOT retried every frame/Reset. */
+static void VRBridge_Init(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
+{
+    HRESULT hr;
+    LUID gameLuid;
+    IDirect3D9 *pGameD3D9 = NULL;
+    IDXGIFactory1 *pFactory = NULL;
+    IDXGIAdapter1 *pChosenAdapter = NULL;
+    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
+    D3D_FEATURE_LEVEL gotLevel;
+    UINT i;
+
+    g_vrBridgeInitAttempted = TRUE;
+
+    if (!g_hRealD3D9) { LogLine("VRBridge_Init: ERROR real d3d9.dll not loaded"); return; }
+    g_pRealDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hRealD3D9, "Direct3DCreate9Ex");
+    if (!g_pRealDirect3DCreate9Ex) { LogLine("VRBridge_Init: ERROR Direct3DCreate9Ex not exported by real d3d9.dll"); return; }
+
+    hr = g_pRealDirect3DCreate9Ex(D3D_SDK_VERSION, &g_pVRD3D9Ex);
+    if (FAILED(hr) || !g_pVRD3D9Ex) { LogLine("VRBridge_Init: Direct3DCreate9Ex failed hr=0x%08lX", (unsigned long)hr); return; }
+
+    /* Match Device A to the SAME physical adapter the game's own device is using (required for a
+     * valid shared handle even on a single-GPU machine - notes/25 Sec3a). Get the game device's
+     * adapter LUID via its own IDirect3D9 (GetDirect3D), not assumed to be adapter 0. */
+    hr = pGameDevice->lpVtbl->GetDirect3D(pGameDevice, &pGameD3D9);
+    if (FAILED(hr) || !pGameD3D9) { LogLine("VRBridge_Init: GetDirect3D (game device) failed hr=0x%08lX", (unsigned long)hr); return; }
+    {
+        D3DADAPTER_IDENTIFIER9 ident;
+        UINT gameAdapter = D3DADAPTER_DEFAULT; /* CreateDevice's Adapter arg isn't retrievable from the device itself;
+                                                    D3DADAPTER_DEFAULT (0) matches this project's confirmed single-GPU setup
+                                                    (notes/25/27: NVIDIA GTX 1660 SUPER, the only adapter). */
+        hr = pGameD3D9->lpVtbl->GetAdapterIdentifier(pGameD3D9, gameAdapter, 0, &ident);
+        if (FAILED(hr)) { LogLine("VRBridge_Init: GetAdapterIdentifier failed hr=0x%08lX", (unsigned long)hr); pGameD3D9->lpVtbl->Release(pGameD3D9); return; }
+        LogLine("VRBridge_Init: game device adapter = \"%s\"", ident.Description);
+    }
+    pGameD3D9->lpVtbl->Release(pGameD3D9);
+
+    hr = g_pVRD3D9Ex->lpVtbl->GetAdapterLUID(g_pVRD3D9Ex, D3DADAPTER_DEFAULT, &gameLuid);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: GetAdapterLUID failed hr=0x%08lX", (unsigned long)hr); return; }
+
+    {
+        WNDCLASSEXA wc;
+        HWND hwnd;
+        D3DPRESENT_PARAMETERS pp;
+
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DefWindowProcA;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = "PsyVR_BridgeDeviceA";
+        RegisterClassExA(&wc);
+        hwnd = CreateWindowExA(0, wc.lpszClassName, "PsyVR bridge device A", WS_OVERLAPPEDWINDOW,
+                                0, 0, 64, 64, NULL, NULL, wc.hInstance, NULL);
+        if (!hwnd) { LogLine("VRBridge_Init: CreateWindowExA failed"); return; }
+
+        ZeroMemory(&pp, sizeof(pp));
+        pp.Windowed = TRUE;
+        pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        pp.hDeviceWindow = hwnd;
+        pp.BackBufferFormat = D3DFMT_UNKNOWN;
+        pp.BackBufferWidth = 64;
+        pp.BackBufferHeight = 64;
+        pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+
+        hr = g_pVRD3D9Ex->lpVtbl->CreateDeviceEx(g_pVRD3D9Ex, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
+            D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED | D3DCREATE_FPU_PRESERVE,
+            &pp, NULL, &g_pVRDeviceA);
+        if (FAILED(hr) || !g_pVRDeviceA) { LogLine("VRBridge_Init: CreateDeviceEx (Device A) failed hr=0x%08lX", (unsigned long)hr); return; }
+    }
+    LogLine("VRBridge_Init: private D3D9Ex Device A created OK");
+
+    hr = g_pVRDeviceA->lpVtbl->CreateOffscreenPlainSurface(g_pVRDeviceA, w, h, D3DFMT_A8R8G8B8,
+                                                             D3DPOOL_SYSTEMMEM, &g_pVRSysmemAScratch, NULL);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: CreateOffscreenPlainSurface (scratch) failed hr=0x%08lX", (unsigned long)hr); return; }
+
+    hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&pFactory);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: CreateDXGIFactory1 failed hr=0x%08lX", (unsigned long)hr); return; }
+    for (i = 0;; i++) {
+        IDXGIAdapter1 *pAdapter = NULL;
+        DXGI_ADAPTER_DESC1 desc;
+        hr = pFactory->lpVtbl->EnumAdapters1(pFactory, i, &pAdapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        pAdapter->lpVtbl->GetDesc1(pAdapter, &desc);
+        if (desc.AdapterLuid.LowPart == gameLuid.LowPart && desc.AdapterLuid.HighPart == gameLuid.HighPart) {
+            pChosenAdapter = pAdapter;
+            break;
+        }
+        pAdapter->lpVtbl->Release(pAdapter);
+    }
+    if (!pChosenAdapter) { LogLine("VRBridge_Init: no matching DXGI adapter found"); pFactory->lpVtbl->Release(pFactory); return; }
+
+    hr = D3D11CreateDevice((IDXGIAdapter *)pChosenAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                            D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+                            D3D11_SDK_VERSION, &g_pVRDevice11, &gotLevel, &g_pVRContext11);
+    pChosenAdapter->lpVtbl->Release(pChosenAdapter);
+    pFactory->lpVtbl->Release(pFactory);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: D3D11CreateDevice failed hr=0x%08lX", (unsigned long)hr); return; }
+    LogLine("VRBridge_Init: D3D11 device created OK, feature level=0x%X", gotLevel);
+
+    {
+        EVRInitError err = EVRInitError_VRInitError_None;
+        uint32_t token = VR_InitInternal2(&err, EVRApplicationType_VRApplication_Scene, NULL);
+        LogLine("VRBridge_Init: VR_InitInternal2 -> token=%u error=%d (%s)", token, (int)err, VR_GetVRInitErrorAsEnglishDescription(err));
+        if (!(err == EVRInitError_VRInitError_None && token != 0)) return;
+    }
+    {
+        EVRInitError compErr = EVRInitError_VRInitError_None;
+        void **vtbl;
+        g_pVRCompositor = VR_GetGenericInterface(IVRCompositor_Version, &compErr);
+        if (!g_pVRCompositor) { LogLine("VRBridge_Init: VR_GetGenericInterface(IVRCompositor) failed error=%d", (int)compErr); return; }
+        vtbl = (void **)VRBridge_RealVtable(g_pVRCompositor);
+        g_pVRWaitGetPoses = (VRBridge_WaitGetPoses_t)vtbl[2];
+        g_pVRSubmit = (VRBridge_Submit_t)vtbl[6];
+        LogLine("VRBridge_Init: IVRCompositor ready (vtable=%p)", (void *)vtbl);
+    }
+
+    if (!VRBridge_CreateEyeBuffers(&g_vrEye1, EVREye_Eye_Left, w, h) ||
+        !VRBridge_CreateEyeBuffers(&g_vrEye2, EVREye_Eye_Right, w, h)) {
+        LogLine("VRBridge_Init: eye buffer creation failed - VR bridge NOT ready");
+        return;
+    }
+
+    g_vrBufWidth = w;
+    g_vrBufHeight = h;
+    g_vrBridgeReady = TRUE;
+    LogLine("VRBridge_Init: SUCCESS - g_vrBridgeReady = TRUE (%ux%u per eye)", w, h);
+}
+
+/* Called from SetupStereoSurfaces (device creation AND every Reset) once the existing monitor-
+ * composite path's own surfaces are confirmed ready. Lazily inits Device A/D3D11/OpenVR on first
+ * call; on every call (including after a Reset with new dimensions) ensures the eye buffers match
+ * the CURRENT g_bbWidth/g_bbHeight, recreating them if the size changed. Fully defensive - any
+ * failure leaves g_vrBridgeReady FALSE and the monitor composite path is completely unaffected. */
+static void VRBridge_OnStereoSurfacesReady(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
+{
+    if (!g_vrSubmitEnabled) return;
+
+    if (!g_vrBridgeInitAttempted) {
+        VRBridge_Init(pGameDevice, w, h);
+        return;
+    }
+    if (!g_pVRDeviceA || !g_pVRDevice11) return; /* init failed earlier - stay inert, don't retry every frame */
+
+    if (g_vrBridgeReady && (w != g_vrBufWidth || h != g_vrBufHeight)) {
+        LogLine("VRBridge: dimensions changed (%ux%u -> %ux%u), recreating eye buffers", g_vrBufWidth, g_vrBufHeight, w, h);
+        g_vrBridgeReady = FALSE;
+        VRBridge_ReleaseEyeBuffers(&g_vrEye1);
+        VRBridge_ReleaseEyeBuffers(&g_vrEye2);
+        if (VRBridge_CreateEyeBuffers(&g_vrEye1, EVREye_Eye_Left, w, h) &&
+            VRBridge_CreateEyeBuffers(&g_vrEye2, EVREye_Eye_Right, w, h)) {
+            g_vrBufWidth = w; g_vrBufHeight = h;
+            g_vrBridgeReady = TRUE;
+        }
+    }
+}
+
+/* The per-eye, per-real-frame pump: hop 1 (game device readback -> promote to Device A when
+ * ready, non-blocking) then hop 2 (check Device A's oldest pending upload; if its fence is
+ * signaled, Submit that texture to the compositor). Mirrors
+ * tools/vr-bridge/poc_dual_device_shared/dual_device_poc.c's proven Part 2 loop exactly, just
+ * driven once per real Present-frame instead of a fixed iteration count. Never blocks: every
+ * readiness check is a single non-blocking Lock/GetData call, and an unready buffer is simply
+ * skipped this frame (dropped/retried next frame) rather than waited on. */
+static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeSurf)
+{
+    int bCur = eye->hop1Count % 2;
+    int bPrev = (bCur + 1) % 2;
+    HRESULT hr;
+
+    /* --- Hop 1a: kick off this frame's readback into the CURRENT sysmemB slot. --- */
+    hr = g_pDevice->lpVtbl->GetRenderTargetData(g_pDevice, pGameEyeSurf, eye->sysmemB[bCur]);
+    if (FAILED(hr)) return; /* leave pendingB[bCur] as-is; try again next frame */
+    eye->pendingB[bCur] = TRUE;
+
+    /* --- Hop 1b: non-blocking check of the OTHER (previous-frame) sysmemB slot; if ready, promote
+     * it into Device A's next free slot. --- */
+    if (eye->pendingB[bPrev]) {
+        D3DLOCKED_RECT lockedB;
+        HRESULT lockHr = eye->sysmemB[bPrev]->lpVtbl->LockRect(eye->sysmemB[bPrev], &lockedB, NULL,
+                                                                 D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
+        if (lockHr == S_OK) {
+            int aCur = eye->hop1Count % 2;
+            BOOL aSlotFree = TRUE;
+            if (eye->pendingA[aCur]) {
+                HRESULT qHr = eye->queryA[aCur]->lpVtbl->GetData(eye->queryA[aCur], NULL, 0, 0);
+                aSlotFree = (qHr == S_OK);
+            }
+            if (aSlotFree) {
+                D3DLOCKED_RECT lockedA;
+                hr = g_pVRSysmemAScratch->lpVtbl->LockRect(g_pVRSysmemAScratch, &lockedA, NULL, 0);
+                if (SUCCEEDED(hr)) {
+                    UINT y;
+                    for (y = 0; y < g_vrBufHeight; y++) {
+                        memcpy((BYTE *)lockedA.pBits + (size_t)y * lockedA.Pitch,
+                               (BYTE *)lockedB.pBits + (size_t)y * lockedB.Pitch,
+                               (size_t)g_vrBufWidth * 4);
+                    }
+                    g_pVRSysmemAScratch->lpVtbl->UnlockRect(g_pVRSysmemAScratch);
+
+                    hr = g_pVRDeviceA->lpVtbl->UpdateSurface(g_pVRDeviceA, g_pVRSysmemAScratch, NULL, eye->surfA[aCur], NULL);
+                    if (SUCCEEDED(hr)) {
+                        eye->queryA[aCur]->lpVtbl->Issue(eye->queryA[aCur], D3DISSUE_END);
+                        eye->queryA[aCur]->lpVtbl->GetData(eye->queryA[aCur], NULL, 0, D3DGETDATA_FLUSH); /* kick, non-blocking */
+                        eye->pendingA[aCur] = TRUE;
+                        eye->hop1Count++;
+                    }
+                }
+            }
+            /* else: Device A backpressure - drop this frame's promotion, no wait, try again next frame */
+            eye->sysmemB[bPrev]->lpVtbl->UnlockRect(eye->sysmemB[bPrev]);
+        }
+        /* else lockHr != S_OK (e.g. D3DERR_WASSTILLDRAWING): the readback isn't done yet - do NOT
+         * call UnlockRect (no successful Lock to match it), just leave this slot pending and check
+         * again next frame. */
+    }
+
+    /* --- Hop 2: non-blocking check of the oldest Device-A slot with a pending upload; if its
+     * fence is signaled, Submit that texture to the compositor. --- */
+    if (eye->hop1Count >= 2 && g_pVRSubmit) {
+        int aConsume = (eye->hop1Count - 2) % 2;
+        if (eye->pendingA[aConsume]) {
+            HRESULT qHr = eye->queryA[aConsume]->lpVtbl->GetData(eye->queryA[aConsume], NULL, 0, 0);
+            if (qHr == S_OK) {
+                Texture_t tex;
+                EVRCompositorError subErr;
+                tex.handle = (void *)eye->tex11[aConsume];
+                tex.eType = ETextureType_TextureType_DirectX;
+                tex.eColorSpace = EColorSpace_ColorSpace_Auto;
+                subErr = g_pVRSubmit(g_pVRCompositor, eye->vrEye, &tex, NULL, EVRSubmitFlags_Submit_Default);
+                if (subErr != EVRCompositorError_VRCompositorError_None) {
+                    static DWORD s_lastLog = 0;
+                    DWORD now = GetTickCount();
+                    if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
+                        LogLine("VRBridge: Submit(eye=%d) error=%d", (int)eye->vrEye, (int)subErr);
+                        s_lastLog = now;
+                    }
+                }
+            }
+            /* else: not ready yet - skip this frame's submit for this eye, no wait, try again next frame */
+        }
+    }
+}
+
+/* Called once per real Present-frame (from CandB_AfterBoth_asm, right where the existing monitor
+ * composite already runs) once both eyes have finished rendering into g_pEye1Surf/g_pEye2Surf.
+ * WaitGetPoses is called once per frame (standard OpenVR usage pattern) before either eye's Submit. */
+static void VRBridge_OnFrameComposited(void)
+{
+    if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
+    if (!g_pEye1Surf || !g_pEye2Surf) return;
+
+    if (g_pVRWaitGetPoses) {
+        TrackedDevicePose_t renderPoses[64], gamePoses[64];
+        ZeroMemory(renderPoses, sizeof(renderPoses));
+        ZeroMemory(gamePoses, sizeof(gamePoses));
+        g_pVRWaitGetPoses(g_pVRCompositor, renderPoses, 64, gamePoses, 64);
+    }
+
+    VRBridge_PumpEye(&g_vrEye1, g_pEye1Surf);
+    VRBridge_PumpEye(&g_vrEye2, g_pEye2Surf);
+}
+
+static void VRBridge_Shutdown(void)
+{
+    if (!g_vrBridgeInitAttempted) return;
+    LogLine("VRBridge_Shutdown: releasing VR bridge resources");
+
+    VRBridge_ReleaseEyeBuffers(&g_vrEye1);
+    VRBridge_ReleaseEyeBuffers(&g_vrEye2);
+
+    if (g_pVRCompositor) { VR_ShutdownInternal(); g_pVRCompositor = NULL; }
+    if (g_pVRSysmemAScratch) { g_pVRSysmemAScratch->lpVtbl->Release(g_pVRSysmemAScratch); g_pVRSysmemAScratch = NULL; }
+    if (g_pVRContext11) { g_pVRContext11->lpVtbl->Release(g_pVRContext11); g_pVRContext11 = NULL; }
+    if (g_pVRDevice11) { g_pVRDevice11->lpVtbl->Release(g_pVRDevice11); g_pVRDevice11 = NULL; }
+    if (g_pVRDeviceA) { g_pVRDeviceA->lpVtbl->Release(g_pVRDeviceA); g_pVRDeviceA = NULL; }
+    if (g_pVRD3D9Ex) { g_pVRD3D9Ex->lpVtbl->Release(g_pVRD3D9Ex); g_pVRD3D9Ex = NULL; }
+
+    g_vrBridgeReady = FALSE;
+    g_vrBridgeInitAttempted = FALSE;
+}
+
 /* ======================================================================
  * Stereo prototype: inline hooks into Psychonauts.exe's own code
  * ====================================================================== */
@@ -398,23 +886,6 @@ typedef struct { float x, y, z; } Vec3;
                                                  screen's own observed
                                                  ~190-200 unit eye->at
                                                  framing (notes/08/09) */
-
-static IDirect3DDevice9 *g_pDevice = NULL;
-static IDirect3DSurface9 *g_pRealBackBuffer = NULL;
-static IDirect3DSurface9 *g_pEye1Surf = NULL;
-static IDirect3DSurface9 *g_pEye2Surf = NULL;
-/* notes/22: the device's single auto depth-stencil surface (EnableAutoDepthStencil=1,
- * live-confirmed AutoDepthStencilFormat=75/D3DFMT_D24S8) was NEVER reassigned per eye -
- * both g_pEye1Surf/g_pEye2Surf rendered against the SAME physical depth buffer the whole
- * time, and SetDepthStencilSurface was never called anywhere in this file. Each eye now
- * gets its own private depth-stencil surface, captured/restored exactly like the color
- * render targets. See the comment on SetEyeAndTarget() for the full mechanism this fixes. */
-static IDirect3DSurface9 *g_pRealDepthStencil = NULL;
-static IDirect3DSurface9 *g_pEye1DepthStencil = NULL;
-static IDirect3DSurface9 *g_pEye2DepthStencil = NULL;
-static UINT g_bbWidth = 0;
-static UINT g_bbHeight = 0;
-static BOOL g_stereoReady = FALSE; /* device + both offscreen color+depth surfaces created OK */
 
 static BOOL g_frameCamCached = FALSE;
 static Vec3 g_baseEye, g_baseAt, g_baseUp, g_rightVec;
@@ -753,6 +1224,15 @@ void __cdecl CandB_AfterBoth_asm(void)
 {
     g_stereoPhase = STEREO_PHASE_IDLE;
     if (!g_stereoReady || !g_pDevice || !g_pRealBackBuffer) return;
+
+    /* notes/28: both eyes' private render targets (g_pEye1Surf/g_pEye2Surf) are now fully
+     * rendered for this frame - the natural point to pump the additive VR submission path, BEFORE
+     * the render target is switched back to the real backbuffer below. Inert unless
+     * PSYVR_ENABLE_SUBMIT=1 (see VRBridge_OnFrameComposited's own guard); never touches
+     * g_pRealBackBuffer or anything else the existing monitor composite (Hook_Present, below)
+     * depends on. */
+    VRBridge_OnFrameComposited();
+
     g_pDevice->lpVtbl->SetRenderTarget(g_pDevice, 0, g_pRealBackBuffer);
     if (g_pRealDepthStencil) {
         g_pDevice->lpVtbl->SetDepthStencilSurface(g_pDevice, g_pRealDepthStencil);
@@ -972,6 +1452,14 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
                     g_pEye1DepthStencil && g_pEye2DepthStencil;
 
     LogLine("Stereo ready = %d", g_stereoReady ? 1 : 0);
+
+    /* notes/28: additive VR submission path - only does anything if PSYVR_ENABLE_SUBMIT=1 was set
+     * (default off). Called after the existing monitor-composite surfaces are confirmed ready so
+     * the VR bridge's own eye buffers can be sized to match g_bbWidth/g_bbHeight exactly - runs on
+     * both initial CreateDevice AND every Reset (this same function handles both, unchanged). */
+    if (g_stereoReady) {
+        VRBridge_OnStereoSurfacesReady(pDevice, g_bbWidth, g_bbHeight);
+    }
 }
 
 /* Register that carries the per-draw clip-space composite matrix identified
@@ -1449,9 +1937,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         if (!InstallInlineHooks()) {
             LogLine("ERROR: InstallInlineHooks failed - stereo prototype disabled, proxy still runs as pure observer");
         }
+        VRBridge_ReadEnableFlag(); /* notes/28: PSYVR_ENABLE_SUBMIT=1 opts in, default off */
         break;
     case DLL_PROCESS_DETACH:
         LogLine("==== psychonautsvr proxy d3d9.dll: DLL_PROCESS_DETACH (pid=%lu) ====", GetCurrentProcessId());
+        VRBridge_Shutdown();
         if (g_hRealD3D9) {
             FreeLibrary(g_hRealD3D9);
             g_hRealD3D9 = NULL;
