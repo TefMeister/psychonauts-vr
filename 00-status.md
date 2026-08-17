@@ -1,10 +1,48 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 6: VR runtime bridge scaffolding — SteamVR confirmed NOT installed
-(blocker, needs user go-ahead), OpenVR SDK vendored, and the crux D3D9Ex→D3D11 shared-surface
-interop question PROVEN working with a standalone, game-free proof-of-concept)
+Last updated: 2026-08-17 (session 7: off-axis fix LIVE-VERIFIED correct via real-gameplay log
+evidence + independent math re-derivation; user's "no difference" report explained as expected, not
+a bug — full detail in notes/26)
 
-## VR runtime bridge scaffolding — crux shared-surface interop PROVEN, SteamVR install still needed (2026-08-17)
+## Off-axis (asymmetric frustum) projection upgrade — LIVE-VERIFIED CORRECT (2026-08-17)
+
+**The user played real gameplay against the notes/24 off-axis build and reported "no difference at
+all" versus the old correction — this was investigated with real evidence (live log + independent
+math re-derivation), not assumption, and found NOT to be a bug.** Full detail in
+`notes/26-off-axis-fix-live-verified-no-visible-difference-explained.md`. Headline findings:
+
+- **Deployed DLL confirmed correct and current**: byte-identical to the tools-folder notes/24 build,
+  and the game process (PID 21588) started 19 minutes after that DLL was written — not a stale/wrong
+  DLL.
+- **The off-axis code path is confirmed executing every frame, on ~70-78 draw calls per eye per
+  frame (matched exactly between eyes)** via the live `SVSCF stereo-correct` log line: non-zero
+  `Y20`/`Y30` (the new shear term notes/18's old code never had), `xScale`/`d` matching established
+  ground truth, and `focus` cross-validated against the independently-logged live `BVM cache SET
+  eye/at` data (computed |at-eye| ≈196.6 vs. logged `focus`≈193-199 in the same window) — the exact
+  check notes/24 §1g called for.
+- **A second, from-scratch hand re-derivation of the `Y = Proj⁻¹·X·Proj` matrix math** (independent
+  of notes/24's own three verification scripts) confirms the C code's `Y20`/`Y30` formulas are
+  exactly correct, and derives the physical meaning of the new term: `Δx_clip = k·xScale·eye_z` per
+  vertex — a real, correct, but genuinely small perturbation (single-digit-percent at the session's
+  live `k` values) on top of an unchanged overall stereo-separation magnitude (`STEREO_HALF_IPD`
+  untouched). This is why "looks about the same on a monitor" is the expected, correct outcome, not
+  evidence of a bug — the old and new code differ mainly in *where along the depth axis* disparity
+  crosses zero, a subtle cue on a flat 2D screen without a controlled comparison or headset.
+- **One correction to the general toe-in-vs-off-axis framing**: this codebase has never implemented
+  toe-in (the CPU-side re-aim in `SetEyeAndTarget` has been dead code since notes/20) — both the old
+  and new correction are purely horizontal. The classic "vertical parallax/keystoning" distinction
+  doesn't apply to this specific before/after comparison.
+- **No code changes this session** — the fix is confirmed correct as-is. Per this project's own
+  standing practice (push once live-verified, see notes/22/23), this satisfies notes/24's own
+  condition for a mod-repo push ("once live-tested... push if it holds up"), but per this session's
+  own scope (no bug was fixed) no push was made — left as a clear next step.
+- **Concrete next step for an obviously-legible demo** (not done this session): temporarily
+  exaggerate `k` (mirroring the existing 60-unit/18x `STEREO_HALF_IPD` diagnostic) or force a short
+  fixed `g_focusDistance` so near/far objects show a clear, oppositely-signed disparity crossover
+  within one frame — directly distinguishing the new off-axis signature from the old code's
+  never-crosses-zero behavior in a single screenshot comparison.
+
+## Prior milestone (VR runtime bridge scaffolding — crux shared-surface interop PROVEN, SteamVR install still needed, still valid as background)
 
 **The single riskiest open technical question from the prior session's VR-runtime scoping — can a
 D3D9Ex shared surface actually be opened and read correctly from a separate D3D11 device — is now
