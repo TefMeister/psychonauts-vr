@@ -449,6 +449,13 @@ typedef struct {
     BOOL pendingA[2];
     ID3D11Texture2D *tex11[2];
     int hop1Count; /* selects which Device-A slot to write next / which to consume (hop1Count-2) */
+    int frameCount; /* per-real-frame counter, ALWAYS increments once per VRBridge_PumpEye call
+                        regardless of whether a promotion happened this frame - selects which
+                        sysmemB[] slot to write next (bCur = frameCount % 2). Must be independent
+                        of hop1Count: hop1Count only advances when a promotion actually succeeds,
+                        so using it to pick bCur/bPrev (an earlier bug) meant bCur was stuck at 0
+                        forever (see notes/29), sysmemB[1] was never written, pendingB[bPrev] was
+                        never TRUE, no promotion could ever happen, and Submit was never reached. */
     EVREye vrEye;
 } VRBridgeEyeState;
 
@@ -492,6 +499,7 @@ static void VRBridge_ReleaseEyeBuffers(VRBridgeEyeState *eye)
         eye->handleA[s] = NULL;
     }
     eye->hop1Count = 0;
+    eye->frameCount = 0;
 }
 
 /* Creates one eye's double-buffered pipeline surfaces at the given dimensions (matching the
@@ -696,9 +704,14 @@ static void VRBridge_OnStereoSurfacesReady(IDirect3DDevice9 *pGameDevice, UINT w
  * skipped this frame (dropped/retried next frame) rather than waited on. */
 static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeSurf)
 {
-    int bCur = eye->hop1Count % 2;
+    /* bCur/bPrev MUST be driven by a counter that advances every call (frameCount), NOT by
+     * hop1Count - hop1Count only advances once a promotion actually succeeds (see below), so
+     * deriving bCur from it created a deadlock (notes/29): bCur stuck at 0 forever, sysmemB[1]
+     * never written, pendingB[bPrev] never TRUE, promotion (and therefore Submit) never reached. */
+    int bCur = eye->frameCount % 2;
     int bPrev = (bCur + 1) % 2;
     HRESULT hr;
+    eye->frameCount++;
 
     /* --- Hop 1a: kick off this frame's readback into the CURRENT sysmemB slot. --- */
     hr = g_pDevice->lpVtbl->GetRenderTargetData(g_pDevice, pGameEyeSurf, eye->sysmemB[bCur]);
@@ -761,11 +774,23 @@ static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeS
                 tex.eColorSpace = EColorSpace_ColorSpace_Auto;
                 subErr = g_pVRSubmit(g_pVRCompositor, eye->vrEye, &tex, NULL, EVRSubmitFlags_Submit_Default);
                 if (subErr != EVRCompositorError_VRCompositorError_None) {
-                    static DWORD s_lastLog = 0;
+                    static DWORD s_lastErrLog = 0;
                     DWORD now = GetTickCount();
-                    if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
+                    if (s_lastErrLog == 0 || (DWORD)(now - s_lastErrLog) >= 2000) {
                         LogLine("VRBridge: Submit(eye=%d) error=%d", (int)eye->vrEye, (int)subErr);
-                        s_lastLog = now;
+                        s_lastErrLog = now;
+                    }
+                } else {
+                    /* notes/29: the success path previously had NO log statement at all, which is
+                     * why 1700+ real frames of (it turned out, never-firing) per-frame submission
+                     * produced zero log evidence either way - throttled ~1/sec per eye so this is
+                     * verifiable going forward without flooding the log every frame. */
+                    static DWORD s_lastOkLog[2] = { 0, 0 };
+                    DWORD now = GetTickCount();
+                    int idx = (eye->vrEye == EVREye_Eye_Left) ? 0 : 1;
+                    if (s_lastOkLog[idx] == 0 || (DWORD)(now - s_lastOkLog[idx]) >= 1000) {
+                        LogLine("VRBridge: Submit(eye=%d) OK (frame=%d)", (int)eye->vrEye, eye->frameCount);
+                        s_lastOkLog[idx] = now;
                     }
                 }
             }
