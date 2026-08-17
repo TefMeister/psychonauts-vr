@@ -49,8 +49,30 @@ extern void VR_ShutdownInternal(void);
 extern void *VR_GetGenericInterface(const char *pchInterfaceVersion, EVRInitError *peError);
 extern const char *VR_GetVRInitErrorAsEnglishDescription(EVRInitError error);
 
+static LONG WINAPI CrashDiag(EXCEPTION_POINTERS *ep)
+{
+    printf("\n!!! VECTORED EXCEPTION: code=0x%08lX at address=%p !!!\n",
+           ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2) {
+        printf("    access type=%lu (0=read,1=write) target address=0x%p\n",
+               (unsigned long)ep->ExceptionRecord->ExceptionInformation[0],
+               (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+#if defined(__i386__)
+    printf("    EIP=%p ESP=%p EBP=%p EAX=%p ECX=%p\n",
+           (void*)ep->ContextRecord->Eip, (void*)ep->ContextRecord->Esp,
+           (void*)ep->ContextRecord->Ebp, (void*)ep->ContextRecord->Eax,
+           (void*)ep->ContextRecord->Ecx);
+#endif
+    fflush(stdout);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered - so output survives if VR_InitInternal2 crashes */
+    AddVectoredExceptionHandler(1, CrashDiag);
     printf("=== OpenVR SDK header/link smoke test (VR_InitInternal2) ===\n\n");
 
     printf("VR_IsRuntimeInstalled() = %s\n", VR_IsRuntimeInstalled() ? "true" : "false");
@@ -72,8 +94,57 @@ int main(void)
         if (sysPtr) {
             struct VR_IVRSystem_FnTable *pSystem = (struct VR_IVRSystem_FnTable *)sysPtr;
             uint32_t w = 0, h = 0;
-            pSystem->GetRecommendedRenderTargetSize(&w, &h);
-            printf("GetRecommendedRenderTargetSize -> %u x %u per eye\n", w, h);
+
+            /* Diagnostic: dump the raw first few pointer-sized slots of the FnTable and query
+             * their containing module, to check whether sysPtr really points at an array of
+             * valid code pointers before calling through slot 0. */
+            void **slots = (void **)sysPtr;
+            for (int i = 0; i < 6; i++) {
+                HMODULE hMod = NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    (LPCSTR)slots[i], &hMod);
+                char modName[MAX_PATH] = "?";
+                if (hMod) GetModuleFileNameA(hMod, modName, MAX_PATH);
+                printf("  slot[%d] = %p  (module: %s)\n", i, slots[i], hMod ? modName : "(none - not in any loaded module)");
+            }
+
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(slots[0], &mbi, sizeof(mbi))) {
+                printf("  VirtualQuery(slot[0]): BaseAddress=%p RegionSize=0x%zx State=0x%lx Protect=0x%lx AllocProtect=0x%lx\n",
+                       mbi.BaseAddress, mbi.RegionSize, mbi.State, mbi.Protect, mbi.AllocationProtect);
+            } else {
+                printf("  VirtualQuery(slot[0]) FAILED, err=%lu\n", GetLastError());
+            }
+            /* Dump the first 16 raw bytes at slot[0] - if it's real x86 code it should look like a
+             * plausible prologue (push ebp / mov / sub esp, etc). If it's all zero or garbage, the
+             * pointer itself is wrong despite being "in range" of vrclient.dll. */
+            unsigned char *codeBytes = (unsigned char *)slots[0];
+            printf("  bytes @ slot[0]:");
+            for (int i = 0; i < 16; i++) printf(" %02X", codeBytes[i]);
+            printf("\n");
+
+            /* HYPOTHESIS: sysPtr is a real C++ object (this-ptr to a vtable), not a flat FnTable -
+             * slot[0]'s bytes decoded as more in-range pointers (a vtable stored in .rdata), and
+             * VirtualQuery confirms slot[0] itself sits on a PAGE_READONLY (non-executable) page,
+             * i.e. it cannot be code. Test: treat sysPtr as this-ptr, *(void***)sysPtr as the real
+             * vtable, and dispatch slot 0 of THAT via __thiscall (openvr.h's IVRSystem methods are
+             * plain unattributed C++ virtuals => default MSVC-ABI __thiscall on x86: this in ECX). */
+            void **vtbl = *(void ***)sysPtr;
+            printf("  (vtable hypothesis) *(void***)sysPtr = %p\n", (void*)vtbl);
+            if (vtbl) {
+                MEMORY_BASIC_INFORMATION mbi2;
+                if (VirtualQuery(vtbl[0], &mbi2, sizeof(mbi2))) {
+                    printf("  VirtualQuery(vtbl[0]=%p): Protect=0x%lx AllocProtect=0x%lx\n",
+                           vtbl[0], mbi2.Protect, mbi2.AllocationProtect);
+                }
+                typedef void (__thiscall *GetRecommendedRenderTargetSize_thiscall_t)(void *pThis, uint32_t *pW, uint32_t *pH);
+                GetRecommendedRenderTargetSize_thiscall_t fn = (GetRecommendedRenderTargetSize_thiscall_t)vtbl[0];
+                printf("Calling vtbl[0] via __thiscall with this=sysPtr now...\n");
+                fflush(stdout);
+                fn(sysPtr, &w, &h);
+                printf("GetRecommendedRenderTargetSize (thiscall vtable) -> %u x %u per eye\n", w, h);
+            }
         }
 
         VR_ShutdownInternal();
