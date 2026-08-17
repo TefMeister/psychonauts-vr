@@ -61,9 +61,40 @@
  * decomposition test that ruled out several other candidate registers), and
  * empirical results.
  *
+ * Milestone 5 (this revision, notes/21): first real-gameplay live-log read
+ * after the notes/20 fix was deployed and played. Confirmed the notes/20
+ * fix itself works exactly as designed (no more premature/duplicate internal
+ * Present hits during eye 2's pass), but the user's live report of the two
+ * original symptoms persisting (right eye tracks but is dark; left eye still
+ * freezes, beyond what focus-loss auto-pause explains) meant a SECOND cause
+ * for each was still needed. Three independent, low-risk fixes added:
+ *   1. Hook_Present now forces the real hardware Present to a full-
+ *      backbuffer blit (NULL src/dest/dirty rect) instead of passing the
+ *      game's own Present args through - our composite always redraws the
+ *      whole backbuffer, so any partial-rect optimization the game applies
+ *      based on its own (non-stereo) dirty-region tracking could otherwise
+ *      leave stale pixels on screen, which looks exactly like "one half
+ *      frozen." Also logs the game's original rect args for confirmation.
+ *   2. A new IDirect3DDevice9::Reset hook (vtable slot 16, right before
+ *      Present's slot 17) releases and recreates all three D3DPOOL_DEFAULT
+ *      surfaces (backbuffer ref, both eye render targets) around Reset -
+ *      previously unhandled entirely, a real correctness gap for any device
+ *      parameter change/recovery, newly relevant because this is the first
+ *      session where the user has been alt-tabbing during live testing.
+ *   3. Exact (not throttle-race-sampled) per-real-frame eye1/eye2 register-6
+ *      draw-call counters (g_svscfCountEye1/2), logged each real composite -
+ *      notes/20's 167:13 phase skew persisted essentially unchanged (109:15)
+ *      AFTER that session's fix, proving the skew was never caused by the
+ *      bug notes/20 fixed; this instrumentation turns "probably a real
+ *      asymmetry" into an exact number for the next live-log read, in place
+ *      of further speculation about the root cause of the dark-eye asymmetry
+ *      itself (not yet found - see notes/21 for the full disposition).
+ * See notes/21-<name>.md for the full live-log evidence and derivation.
+ *
  * Vtable indices used (0-based, standard COM: slot 0/1/2 are always
  * QueryInterface/AddRef/Release):
  *   IDirect3D9::CreateDevice                    = slot 16
+ *   IDirect3DDevice9::Reset                     = slot 16 (different vtable)
  *   IDirect3DDevice9::Present                   = slot 17
  *   IDirect3DDevice9::SetVertexShaderConstantF  = slot 94
  * These are NOT guessed - they come from two independent, cross-checked
@@ -103,6 +134,9 @@ typedef HRESULT (STDMETHODCALLTYPE *Present_t)(
     CONST RECT *pDestRect,
     HWND hDestWindowOverride,
     CONST RGNDATA *pDirtyRegion);
+typedef HRESULT (STDMETHODCALLTYPE *Reset_t)(
+    IDirect3DDevice9 *This,
+    D3DPRESENT_PARAMETERS *pPresentationParameters);
 typedef HRESULT (STDMETHODCALLTYPE *SetVertexShaderConstantF_t)(
     IDirect3DDevice9 *This,
     UINT StartRegister,
@@ -113,6 +147,7 @@ static HMODULE g_hRealD3D9 = NULL;
 static Direct3DCreate9_t g_pRealDirect3DCreate9 = NULL;
 static CreateDevice_t g_pRealCreateDevice = NULL;
 static Present_t g_pRealPresent = NULL;
+static Reset_t g_pRealReset = NULL;
 static SetVertexShaderConstantF_t g_pRealSetVSConstF = NULL;
 static BOOL g_d3d9Hooked = FALSE;      /* IDirect3D9::CreateDevice patched? */
 static BOOL g_deviceHooked = FALSE;    /* IDirect3DDevice9::Present patched? */
@@ -505,6 +540,26 @@ static volatile LONG g_stereoPhase = STEREO_PHASE_IDLE;
  * suppressed exactly like EYE1's, instead of re-compositing/re-presenting. */
 static volatile LONG g_eye2Presented = 0;
 
+/* notes/21: notes/20's own log evidence (SVSCF register-6 correction counts,
+ * throttled-sample-based) showed a heavily skewed phase=1:phase=2 ratio
+ * (167:13) and speculated this was consistent with eye 2's pass being cut
+ * short by a premature internal Present - but a fresh live-log read this
+ * session (after the notes/20 fix was deployed and live-tested) found the
+ * SAME skew, now 109:15, essentially UNCHANGED by that fix. Since the fix
+ * already closed the premature-extra-Present path, the skew's persistence
+ * means it was never actually caused by that bug - it reflects a real,
+ * still-unexplained difference in how much rendering work happens during
+ * eye 1's CandB invocation vs eye 2's, independent of the Present-guard
+ * logic. These two counters replace the old race-based "which phase wins
+ * the 2-second throttle" sampling with an exact, unthrottled per-real-frame
+ * count of how many times the register-6 correction actually applied in
+ * each phase, logged once per real composite (see Hook_Present) - the goal
+ * is to turn this from a suspected pattern into a hard, precise number the
+ * next live-log read can use directly instead of re-deriving it from a
+ * throttling artifact. */
+static volatile LONG g_svscfCountEye1 = 0;
+static volatile LONG g_svscfCountEye2 = 0;
+
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
 {
@@ -776,6 +831,14 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
          * this already-transposed buffer, not index 12. */
         patched[3] += (-d) * xScale;
 
+        /* notes/21: exact per-eye draw-call counters, see comment on
+         * g_svscfCountEye1/2 above. */
+        if (g_stereoPhase == STEREO_PHASE_EYE1) {
+            InterlockedIncrement(&g_svscfCountEye1);
+        } else {
+            InterlockedIncrement(&g_svscfCountEye2);
+        }
+
         {
             static DWORD s_lastLog = 0;
             DWORD now = GetTickCount();
@@ -882,8 +945,20 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         hrR = This->lpVtbl->StretchRect(This, g_pEye2Surf, &srcFull, g_pRealBackBuffer, &dstRight, D3DTEXF_LINEAR);
 
         if (doLog) {
-            LogLine("Present() composite (phase EYE2): StretchRect L=0x%08lX R=0x%08lX", (unsigned long)hrL, (unsigned long)hrR);
+            /* notes/21: exact eye1/eye2 register-6 draw-call counts for THIS
+             * real frame (not a throttled race sample like notes/20's
+             * phase=1/phase=2 log line) - see comment on g_svscfCountEye1/2.
+             * Also logs whether the game itself asked for a partial-rect
+             * Present (pSourceRect/pDirtyRegion non-NULL) - real evidence for
+             * whether the "forced full-backbuffer Present" fix below is
+             * actually correcting anything, rather than being a no-op. */
+            LogLine("Present() composite (phase EYE2): StretchRect L=0x%08lX R=0x%08lX | svscfEye1=%ld svscfEye2=%ld | origSrcRect=%p origDestRect=%p origDirtyRgn=%p",
+                     (unsigned long)hrL, (unsigned long)hrR,
+                     g_svscfCountEye1, g_svscfCountEye2,
+                     (void *)pSourceRect, (void *)pDestRect, (void *)pDirtyRegion);
         }
+        g_svscfCountEye1 = 0;
+        g_svscfCountEye2 = 0;
     }
 
     g_frameCamCached = FALSE;
@@ -893,15 +968,84 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         g_lastPresentLogTick = now;
     }
 
-    return g_pRealPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+    /* notes/21: the real hardware Present is always forced to a full-
+     * backbuffer blit (NULL source/dirty rect), regardless of what the game
+     * itself passed in. Rationale: our composite step just unconditionally
+     * overwrote the ENTIRE real backbuffer with fresh content via two full
+     * StretchRects above - if the game's own Present call assumed a partial/
+     * dirty-rect optimization based on what ITS OWN (single-eye, non-stereo)
+     * rendering changed this frame, passing that same partial rect through
+     * here could cause the hardware Present to only actually flip PART of
+     * our new side-by-side image to the screen, leaving the rest showing
+     * stale pixels from a prior frame - a plausible, concrete explanation
+     * for a symptom that looks exactly like "one half of the screen frozen"
+     * while the other updates normally. Forcing NULL/NULL/NULL here is
+     * always safe for our use case (we always redraw 100% of the backbuffer
+     * every real frame) regardless of whether this specific mechanism turns
+     * out to be the actual cause - see the origSrcRect/origDestRect/
+     * origDirtyRgn log fields above to confirm post-relaunch whether the
+     * game was ever actually passing non-NULL values here. hDestWindowOverride
+     * is passed through unmodified (unrelated to dirty-rect behavior). */
+    return g_pRealPresent(This, NULL, NULL, hDestWindowOverride, NULL);
 }
 
-/* Patch IDirect3DDevice9::Present (vtbl slot 17) to point at our hook.
- * The vtable pointed to by This->lpVtbl is a single shared, normally
- * read-only structure (typically in the real d3d9.dll's .rdata), so it must
- * be made writable with VirtualProtect before patching and restored after.
- * Guarded by g_deviceHooked so a second CreateDevice call (should one ever
- * happen) doesn't re-patch an already-patched vtable. */
+/* notes/21: the game runs Windowed=1 (confirmed in the CreateDevice log) -
+ * in windowed mode a real device-lost/Reset cycle is much less commonly
+ * triggered by plain Alt+Tab focus loss than in fullscreen-exclusive mode,
+ * but nothing in this codebase handled Reset() AT ALL before this fix, which
+ * is a real, well-known D3D9 correctness gap regardless of exactly when it
+ * fires: Reset() invalidates every D3DPOOL_DEFAULT resource on the device,
+ * including g_pRealBackBuffer/g_pEye1Surf/g_pEye2Surf (all created via
+ * CreateRenderTarget/GetBackBuffer, both implicitly D3DPOOL_DEFAULT) - any
+ * of our own code that runs after a real Reset without us first releasing
+ * and then recreating those three surfaces would be operating on stale/
+ * dangling COM pointers. Depending on driver behavior this can silently
+ * produce exactly the kind of asymmetric, hard-to-explain per-surface
+ * symptoms reported live this session (one eye's surface still showing
+ * stale/frozen content because the GPU memory it referenced happened not to
+ * be reclaimed yet, the other looking corrupted/dark because its memory WAS
+ * reused) - a strong, concrete, mechanism-level candidate for "freeze
+ * persists beyond just the game's own focus-loss auto-pause" specifically
+ * because the user has been alt-tabbing to communicate during this exact
+ * session, a variable no prior session (title-screen only) ever exercised.
+ * Fix: release all three surfaces (and mark stereo not-ready, which every
+ * other hook already guards on) before forwarding to the real Reset, then
+ * recreate them via the same SetupStereoSurfaces() used at device creation. */
+static HRESULT STDMETHODCALLTYPE Hook_Reset(
+    IDirect3DDevice9 *This,
+    D3DPRESENT_PARAMETERS *pPresentationParameters)
+{
+    HRESULT hr;
+
+    LogLine("Reset() called - releasing stereo surfaces before real Reset (Windowed=%d %ux%u)",
+            pPresentationParameters ? pPresentationParameters->Windowed : -1,
+            pPresentationParameters ? pPresentationParameters->BackBufferWidth : 0,
+            pPresentationParameters ? pPresentationParameters->BackBufferHeight : 0);
+
+    g_stereoReady = FALSE;
+    if (g_pRealBackBuffer) { g_pRealBackBuffer->lpVtbl->Release(g_pRealBackBuffer); g_pRealBackBuffer = NULL; }
+    if (g_pEye1Surf)       { g_pEye1Surf->lpVtbl->Release(g_pEye1Surf); g_pEye1Surf = NULL; }
+    if (g_pEye2Surf)       { g_pEye2Surf->lpVtbl->Release(g_pEye2Surf); g_pEye2Surf = NULL; }
+
+    hr = g_pRealReset(This, pPresentationParameters);
+
+    LogLine("Real Reset returned hr=0x%08lX", (unsigned long)hr);
+
+    if (SUCCEEDED(hr) && pPresentationParameters) {
+        SetupStereoSurfaces(This, pPresentationParameters);
+    }
+
+    return hr;
+}
+
+/* Patch IDirect3DDevice9::Present (vtbl slot 17) and ::Reset (vtbl slot 16)
+ * to point at our hooks. The vtable pointed to by This->lpVtbl is a single
+ * shared, normally read-only structure (typically in the real d3d9.dll's
+ * .rdata), so it must be made writable with VirtualProtect before patching
+ * and restored after. Guarded by g_deviceHooked so a second CreateDevice
+ * call (should one ever happen) doesn't re-patch an already-patched vtable.
+ * Both hooks are patched together under one VirtualProtect call since
+ * they're adjacent slots on the same vtable struct. */
 static void InstallPresentHook(IDirect3DDevice9 *pDevice)
 {
     IDirect3DDevice9Vtbl *vtbl;
@@ -918,11 +1062,14 @@ static void InstallPresentHook(IDirect3DDevice9 *pDevice)
 
     g_pRealPresent = vtbl->Present;
     vtbl->Present = Hook_Present;
+    g_pRealReset = vtbl->Reset;
+    vtbl->Reset = Hook_Reset;
 
     VirtualProtect(vtbl, sizeof(*vtbl), oldProtect, &oldProtect);
 
     g_deviceHooked = TRUE;
-    LogLine("Hooked IDirect3DDevice9::Present (vtable slot 17), original=0x%p", (void *)g_pRealPresent);
+    LogLine("Hooked IDirect3DDevice9::Present (vtable slot 17), original=0x%p; ::Reset (vtable slot 16), original=0x%p",
+            (void *)g_pRealPresent, (void *)g_pRealReset);
 }
 
 /* ---- CreateDevice hook (IDirect3D9 vtable slot 16) ---------------------- */

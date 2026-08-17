@@ -1,12 +1,48 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (first real-gameplay stereo test: frozen-left/dark-right diagnosis session)
+Last updated: 2026-08-17 (session 2: second-cause diagnosis for frozen-left/dark-right, post-notes/20)
 
 ## Latest status (read this first)
 
+**Follow-up live-log session confirms notes/20's fix works exactly as designed, but proves both
+reported symptoms (frozen left, dark right) have a SECOND, still-only-partially-understood cause —
+three more low-risk fixes shipped, still NOT YET LIVE-TESTED.** Full detail in
+`notes/21-second-cause-frozen-left-dark-right-post-notes20.md`. Headline findings:
+
+- Read the live proxy log from the user's actual running gameplay session (PID 7188, already running
+  WITH notes/20's fix deployed) — confirmed **zero** premature/duplicate internal-Present hits reach
+  the real Present passthrough (331/331 logged hits are `phase=2`), i.e. notes/20's `g_eye2Presented`
+  guard genuinely works. But the eye1:eye2 register-6 draw-call skew notes/20 used as supporting
+  evidence (167:13) is **essentially unchanged after the fix (109:15)** — proof that skew was never
+  caused by the bug notes/20 fixed, and the dark-right/frozen-left symptoms need a different
+  explanation notes/20 didn't find.
+- **Three new fixes shipped in `proxy_d3d9.c`**: (1) `Hook_Present` now forces the real hardware
+  Present to always blit the full backbuffer (`NULL` src/dest/dirty rect) instead of passing the
+  game's own Present args through — our composite always redraws 100% of the backbuffer, so a
+  partial-rect optimization based on the game's own non-stereo dirty-tracking could otherwise leave
+  stale pixels on screen, i.e. look exactly like "one half frozen"; (2) a new
+  `IDirect3DDevice9::Reset` hook (previously completely unhandled) releases and recreates all three
+  `D3DPOOL_DEFAULT` surfaces around real `Reset` calls — a genuine, general D3D9 correctness gap,
+  newly relevant because this is the first session the user has been alt-tabbing during live testing;
+  (3) exact (non-throttle-sampled) per-real-frame eye1/eye2 draw-call counters logged every composite,
+  replacing race-based sampling with hard numbers for the next live-log read.
+- **Root cause of the eye1:eye2 draw-call asymmetry itself is still NOT found** — flagged honestly as
+  an open question (leading, unconfirmed hypothesis: an internal "already did per-frame setup" engine
+  flag that CandB's first invocation sets and the second never gets reset before, consistent with
+  notes/13's original "second invocation missing background" finding) rather than papered over with a
+  speculative rewrite of the double-invoke mechanism.
+- **Build clean, DLL rebuilt. Isolated self-test deliberately skipped** (not just failed) —
+  `validate.ps1`'s cleanup kills processes by name (`Psychonauts`) indiscriminately, which would risk
+  the user's own live process; its own safety-abort would prevent harm here but was judged too fragile
+  to lean on deliberately. **Not live-tested. The user needs to close the current game session; the
+  orchestrating session will then copy the new DLL in and relaunch.**
+
+## Prior milestone (first real-gameplay stereo test: frozen-left/dark-right diagnosis session, still valid)
+
 **First-ever real-gameplay test of the stereo hook (previously only exercised on the title screen)
 found two bugs — left half frozen, right half dark/corrupted — both diagnosed with real live-log
-evidence and fixed in code, but the fix is NOT YET LIVE-TESTED.** Full detail in
+evidence and fixed in code, initially believed sufficient but notes/21 (above) found a second cause
+was still needed for both.** Full detail in
 `notes/20-real-gameplay-stereo-frozen-left-dark-right.md`. Headline findings:
 
 - **Root cause 1 (frozen left, likely contributor)**: `BuildViewMatrix`'s output-buffer pointer,
