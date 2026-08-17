@@ -123,6 +123,55 @@
  * no shared resource left to contaminate. See notes/22-<name>.md for the full derivation
  * and live-log evidence.
  *
+ * Milestone 7 (this revision, notes/24): OFF-AXIS PROJECTION UPGRADE. Prior
+ * sessions' GPU-side correction (notes/14/18) already produced a genuinely
+ * PARALLEL (non-toe-in) per-eye camera - it inserts a rigid view-space
+ * translation between View and Proj, never re-aims either eye's look
+ * direction - but it reused the SAME symmetric projection frustum for both
+ * eyes, which is only correct for a stereo pair converged at INFINITE
+ * distance (zero disparity only for infinitely-far points; every finite-
+ * distance point shows disparity that only shrinks asymptotically, never
+ * reaching zero - see the analytic check in notes/24). Real VR SDKs
+ * (OpenVR/OpenXR) instead use an ASYMMETRIC/off-axis frustum per eye so
+ * that a chosen finite convergence/focal distance gets exactly zero
+ * disparity, with natural "crossed" parallax nearer than that and
+ * "uncrossed" parallax farther - this session adds that missing piece.
+ *
+ * The naive way to do this - patch the received per-draw WVP matrix's
+ * row2/col0 entry the same way the existing code patches row3/col0 for the
+ * translation - turns out to be WRONG in general (a real bug this session's
+ * own verification script caught before it ever reached the game): the
+ * translation-only patch is safe as a SINGLE matrix entry only because
+ * inserting a translation between the (unknown, untraced - see notes/14
+ * Sec1b) World*View matrix M and Proj can only ever perturb M's own row 3,
+ * and M's row 3 is the one row an AFFINE M is guaranteed to interact with
+ * Proj in a way that lands on exactly one WVP entry. A shear (needed for
+ * the off-axis frustum) has no such guarantee - it lives in M's row 2,
+ * which is NOT affine-constrained, so a single-entry patch silently assumes
+ * the camera happens to be axis-aligned at the world origin, and produces a
+ * WRONG (non-zero-at-convergence-distance) result for any other camera pose
+ * (confirmed both analytically and by a standalone Python check - see
+ * notes/24 Sec2 for the full derivation, the bug, and the fix). The
+ * general, camera-pose-agnostic fix derives the correction as a small
+ * matrix Y = Proj^-1 * (translate-then-shear) * Proj and applies
+ * WVP_new = WVP_received * Y - Y works out to differ from identity only in
+ * column 0, so the fix only ever touches 4 of the 16 received floats
+ * (row0..row3, column 0), each computed from the RECEIVED matrix's own
+ * row2/row3 values plus known projection constants (xScale, zn, zf) -
+ * still no need to trace/decompose M. Verified to reduce EXACTLY to the
+ * existing (already-shipped, working) translation-only patch when the new
+ * shear term is zero, and to produce exactly zero eye-to-eye disparity at
+ * the chosen convergence distance for arbitrary (tilted, off-origin) camera
+ * poses in the standalone verification script - see notes/24.
+ *
+ * The convergence/focal distance uses the camera's own live per-frame
+ * eye->at distance (already cached for the disabled CPU-side rewrite) - it
+ * naturally tracks wherever the game's own camera is looking each frame
+ * rather than a fixed guessed constant. The IPD half-offset remains the
+ * fixed STEREO_HALF_IPD constant, same as before (still no real headset to
+ * source real per-frame values from) - see the TODO comments below for
+ * exactly what a real OpenVR/OpenXR runtime would replace.
+ *
  * Vtable indices used (0-based, standard COM: slot 0/1/2 are always
  * QueryInterface/AddRef/Release):
  *   IDirect3D9::CreateDevice                    = slot 16
@@ -141,15 +190,105 @@
  * = ..., ->lpVtbl->Present = ...) so the compiler - not manual offset math -
  * guarantees the correct slot is patched.
  *
+ * Milestone 8 (this revision, notes/28): VR SUBMISSION PATH (additive, off by default).
+ * notes/27 proved the full D3D9Ex-shared-surface -> D3D11 -> IVRCompositor::Submit bridge works
+ * end-to-end via standalone POCs, but explicitly flagged its sync mechanism (a synchronous
+ * GPU-flush stall) as unfit for a real per-frame hot path. This session (notes/28) first replaced
+ * that with a proven non-blocking double-buffered technique (tools/vr-bridge/poc_submit_test),
+ * then discovered - empirically, via a second standalone POC
+ * (tools/vr-bridge/poc_dual_device_shared) - a real architectural constraint that changes the
+ * whole integration design: Psychonauts' own D3D9 device (the one this file hooks) is a PLAIN
+ * (non-Ex) device, created via Direct3DCreate9 -> IDirect3D9::CreateDevice (never CreateDeviceEx -
+ * confirmed by this file's own hooks, which only ever patch IDirect3D9::CreateDevice). Only a
+ * D3D9Ex device's CreateTexture can produce a shared handle that ID3D11Device::OpenSharedResource
+ * can open. A plain device CANNOT open a handle an Ex device originated (confirmed empirically:
+ * hr=0x8876086C/D3DERR_INVALIDCALL, tried both as a direct render-target and as a StretchRect
+ * destination) - so this file's own device can never render directly into anything D3D11/OpenVR
+ * can see.
+ *
+ * The working design (proven in poc_dual_device_shared, 3/3 clean runs): a SEPARATE, private
+ * D3D9Ex device ("Device A" below) is created by this DLL, matched to the same physical adapter
+ * as the game's device via LUID. Each real frame, for each eye: the game's already-rendered
+ * private eye surface (g_pEye1Surf/g_pEye2Surf - UNCHANGED, still used for the existing monitor
+ * composite) is copied to the CPU via GetRenderTargetData (on the game's own device), then
+ * memcpy'd and UpdateSurface'd into Device A's own D3DPOOL_DEFAULT shared texture (both hops
+ * individually required to stay on one device each - a real MSDN constraint, not a design choice).
+ * D3D11 opens Device A's shared texture and hands it to IVRCompositor::Submit.
+ *
+ * This CPU round trip turned out to need TWO independent non-blocking completion fences, not one:
+ * GetRenderTargetData's own readback (checked via IDirect3DSurface9::LockRect with
+ * D3DLOCK_DONOTWAIT) AND Device A's subsequent UpdateSurface, which is itself an async GPU upload
+ * needing its own fence (an IDirect3DQuery9 D3DQUERYTYPE_EVENT on Device A, checked non-blockingly)
+ * before a downstream reader touches it - discovered by a real, reproducible mismatch (a stale/
+ * torn frame reaching D3D11) when only the first fence was implemented, root-caused and fixed with
+ * a diagnostic blocking-flush test that confirmed the hypothesis before the real fix was written.
+ * Both hops are double-buffered exactly like notes/28 Part 1's proven single-hop design, so the
+ * steady-state per-frame cost is a small, fixed number of non-blocking Lock/GetData calls - never
+ * a wait - see the full derivation and real timing numbers in notes/28.
+ *
+ * ADDITIVE BY DESIGN, OFF BY DEFAULT: every new symbol below is prefixed VRBridge_/g_vr, touches
+ * NONE of the existing eye-surface/depth-stencil/composite code, and the entire path is gated
+ * behind a runtime environment-variable flag (PSYVR_ENABLE_SUBMIT=1) read once at DllMain and
+ * checked before any VR-specific work happens anywhere - with the flag unset (the default), this
+ * file's behavior is byte-for-byte identical to before this milestone. Even with the flag set, any
+ * failure at any VR bridge init/per-frame step (SteamVR absent, OpenVR call failure, etc.) simply
+ * leaves g_vrBridgeReady FALSE and the existing monitor-composite path continues completely
+ * unaffected - the VR path can never take down or degrade the proven working fallback.
+ *
+ * NOT YET LIVE-TESTED against the real game (needs SteamVR's null driver + a relaunch to pick up
+ * this DLL - out of scope for this session per the task's own safety rule about the user's already-
+ * running game session). See notes/28 for exactly what's proven standalone vs. what's still open.
+ *
+ * Milestone 9 (this revision, notes/32): REAL OPENVR-QUERIED IPD/PROJECTION DATA, replacing the
+ * notes/24 hardcoded STEREO_HALF_IPD constant and estimated g_focusDistance shear term wherever
+ * real data is actually available. Confirmed via a standalone POC (tools/vr-bridge/poc_ipd_query,
+ * run against the live null-driver runtime BEFORE this code was written) that IVRSystem returns
+ * real, plausible values even with no physical HMD: IPD = 63.0mm exactly (the standard OpenVR
+ * default - only ~3% below the notes/15 hardcoded 3.25-unit guess), GetEyeToHeadTransform exactly
+ * +/-31.5mm (perfectly symmetric under this driver), GetRecommendedRenderTargetSize = 1656x1840/
+ * eye, and GetProjectionRaw = [-1,1,-1,1] for both eyes (i.e. this driver reports NO real off-axis
+ * asymmetry - confirmed by measurement, not assumed).
+ *
+ * VRBridge_QueryRealGeometry() (called once from VRBridge_Init, right after IVRSystem is ready)
+ * converts the meters-based IPD/eye-offset values into this game's world-unit scale via
+ * WORLD_UNITS_PER_METER=100 (the notes/15/18-established "1 world unit ~= 1cm" calibration) and
+ * caches them in g_realHalfIPD[]/g_realShearK[]/g_realShearValid[]. Hook_SetVertexShaderConstantF
+ * now uses these directly in place of STEREO_HALF_IPD/the focus-distance-derived k whenever
+ * g_vrGeomValid is TRUE - and transparently falls back to the pre-existing hardcoded behavior
+ * otherwise (OpenVR not initialized, i.e. PSYVR_ENABLE_SUBMIT unset or SteamVR absent - the
+ * default case for most users of this mod, who don't have or need SteamVR just for the monitor
+ * side-by-side stereo path). This can never make the stereo correction worse than before this
+ * session, and the real per-eye offset (g_realHalfIPD, from GetEyeToHeadTransform) need not be
+ * exactly symmetric the way STEREO_HALF_IPD*sign always was, once a real headset supplies it.
+ *
+ * GetEyeToHeadTransform returns a struct (HmdMatrix34_t) BY VALUE - a new ABI wrinkle none of the
+ * prior IVRCompositor calls hit (WaitGetPoses/Submit both take/return plain values or take output
+ * pointers). Handled the same defensive way notes/27 established for this whole file: don't trust
+ * a compiler's own struct-return code generation against MSVC-compiled code, declare the hidden
+ * return-pointer parameter explicitly instead. See the comment above VRBridge_GetEyeToHeadTransform_t.
+ *
+ * GetRecommendedRenderTargetSize's real 1656x1840/eye (vs. this file's current 640x480 VR-submit
+ * eye buffers, sized to match the game's own native backbuffer) was investigated for feasibility
+ * and found to be a genuinely separate, larger undertaking - not attempted this session, documented
+ * in notes/32 Sec4 instead of risked as a rushed mid-pipeline change.
+ *
  * Build target: 32-bit (i686), matching the 32-bit Psychonauts.exe.
  */
 
+#define INITGUID
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include "../vr-bridge/openvr-sdk/headers/openvr_capi.h"
+/* Do NOT include <stdbool.h> - openvr_capi.h typedefs its own bool as char on Windows, which
+ * collides with <stdbool.h>'s #define bool _Bool if both are included in the same translation
+ * unit (documented in tools/vr-bridge/poc_openvr_init/openvr_init_poc.c, notes/25 Sec2). */
 
 typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
 typedef HRESULT (STDMETHODCALLTYPE *CreateDevice_t)(
@@ -275,6 +414,755 @@ static BOOL LoadRealD3D9(void)
     return TRUE;
 }
 
+/* Moved up from the "Stereo prototype" section below (notes/28) so the VR bridge code that
+ * immediately follows - which reads/writes these same globals (g_pDevice, g_pEye1Surf/2Surf,
+ * g_bbWidth/Height) - can reference them without a forward-declaration dance. No functional
+ * change: same globals, same lifecycle, just declared earlier in the file. */
+static IDirect3DDevice9 *g_pDevice = NULL;
+static IDirect3DSurface9 *g_pRealBackBuffer = NULL;
+static IDirect3DSurface9 *g_pEye1Surf = NULL;
+static IDirect3DSurface9 *g_pEye2Surf = NULL;
+/* notes/22: the device's single auto depth-stencil surface (EnableAutoDepthStencil=1,
+ * live-confirmed AutoDepthStencilFormat=75/D3DFMT_D24S8) was NEVER reassigned per eye -
+ * both g_pEye1Surf/g_pEye2Surf rendered against the SAME physical depth buffer the whole
+ * time, and SetDepthStencilSurface was never called anywhere in this file. Each eye now
+ * gets its own private depth-stencil surface, captured/restored exactly like the color
+ * render targets. See the comment on SetEyeAndTarget() for the full mechanism this fixes. */
+static IDirect3DSurface9 *g_pRealDepthStencil = NULL;
+static IDirect3DSurface9 *g_pEye1DepthStencil = NULL;
+static IDirect3DSurface9 *g_pEye2DepthStencil = NULL;
+static UINT g_bbWidth = 0;
+static UINT g_bbHeight = 0;
+static BOOL g_stereoReady = FALSE; /* device + both offscreen color+depth surfaces created OK */
+
+/* ======================================================================
+ * VR submission bridge (notes/28) - additive, gated behind PSYVR_ENABLE_SUBMIT=1.
+ * See the Milestone 8 header comment at the top of this file for the full design and the two
+ * real architectural findings (plain-device-cannot-open-Ex-handle; UpdateSurface needs its own
+ * fence) that shaped it.
+ * ====================================================================== */
+
+/* ---- OpenVR global entry points (declared directly, not via openvr_capi.h's dead #if 0 block -
+ * see tools/vr-bridge/poc_openvr_init/openvr_init_poc.c and notes/25 Sec2 for why). ---- */
+extern bool VR_IsRuntimeInstalled(void);
+extern bool VR_IsHmdPresent(void);
+extern uint32_t VR_InitInternal2(EVRInitError *peError, EVRApplicationType eApplicationType, const char *pStartupInfo);
+extern void VR_ShutdownInternal(void);
+extern void *VR_GetGenericInterface(const char *pchInterfaceVersion, EVRInitError *peError);
+extern const char *VR_GetVRInitErrorAsEnglishDescription(EVRInitError error);
+
+typedef IDirect3D9 *(WINAPI *Direct3DCreate9Ex9_t)(void); /* not used - Ex creation goes through Direct3DCreate9Ex below */
+typedef HRESULT (WINAPI *Direct3DCreate9Ex_t)(UINT SDKVersion, IDirect3D9Ex **ppD3D);
+static Direct3DCreate9Ex_t g_pRealDirect3DCreate9Ex = NULL;
+
+/* Real-C++-vtable dispatch fix (notes/27): this installed SteamVR build's VR_GetGenericInterface()
+ * returns a genuine C++ this-ptr, not the flat FnTable struct openvr_capi.h documents - calling
+ * through it as a flat table crashes. Dereference the real vtable and dispatch via __thiscall. */
+static void *VRBridge_RealVtable(void *thisPtr) { return *(void **)thisPtr; }
+
+typedef EVRCompositorError (__thiscall *VRBridge_WaitGetPoses_t)(void *pThis,
+    TrackedDevicePose_t *pRenderPoseArray, uint32_t unRenderPoseArrayCount,
+    TrackedDevicePose_t *pGamePoseArray, uint32_t unGamePoseArrayCount);
+typedef EVRCompositorError (__thiscall *VRBridge_Submit_t)(void *pThis,
+    EVREye eEye, const Texture_t *pTexture, const VRTextureBounds_t *pBounds, EVRSubmitFlags nSubmitFlags);
+
+/* notes/32 (Task 1): IVRSystem dispatch, same vtable-deref + __thiscall fix as IVRCompositor above.
+ * Vtable slot indices come directly from openvr_capi.h's struct VR_IVRSystem_FnTable field order
+ * (0-based, no QueryInterface/AddRef/Release prepended - IVRSystem is a plain abstract C++ class,
+ * not COM - confirmed by the already-proven slot 0 = GetRecommendedRenderTargetSize used in
+ * notes/27's own POC): 0=GetRecommendedRenderTargetSize, 2=GetProjectionRaw,
+ * 5=GetEyeToHeadTransform, 23=GetFloatTrackedDeviceProperty.
+ *
+ * GetEyeToHeadTransform returns HmdMatrix34_t (48 bytes) BY VALUE - the MSVC x86 ABI this
+ * installed SteamVR's vrclient.dll was built with passes a hidden pointer to caller-allocated
+ * return storage as the FIRST explicit parameter (right after `this`) for any large-struct-
+ * returning method. Declared explicitly here as a void-returning thiscall taking that pointer as
+ * an explicit argument, rather than trusting a compiler's own (unverified for this cross-compiler-
+ * calling-MSVC-code case) struct-return code generation - the same defensive, "don't assume the
+ * ABI, write it out" discipline notes/27 already established for this file's other OpenVR calls.
+ * GetProjectionRaw and GetFloatTrackedDeviceProperty both avoid this issue entirely (out-params /
+ * plain float return) - real evidence this pattern works: tools/vr-bridge/poc_ipd_query (notes/32)
+ * ran all four calls successfully against the live null-driver runtime before this code was
+ * written (see notes/32 Sec1 for the confirmed real numbers). */
+typedef void (__thiscall *VRBridge_GetRecommendedRenderTargetSize_t)(void *pThis, uint32_t *pW, uint32_t *pH);
+typedef void (__thiscall *VRBridge_GetProjectionRaw_t)(void *pThis, EVREye eEye, float *pL, float *pR, float *pT, float *pB);
+typedef void (__thiscall *VRBridge_GetEyeToHeadTransform_t)(void *pThis, HmdMatrix34_t *pOut, EVREye eEye);
+typedef float (__thiscall *VRBridge_GetFloatTrackedDeviceProperty_t)(void *pThis,
+    TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError);
+
+/* World-unit <-> real-world-meters conversion factor. Cross-validated across two prior sessions,
+ * not a new guess: notes/15's independent zNear/zFar-plausibility estimate ("1 world unit ~= 1cm")
+ * and notes/18's finding that the shipped STEREO_HALF_IPD=3.25 constant maps to ~6.5cm real-world
+ * separation - within 1mm of average adult human IPD (63mm) - both converge on the same ~1:1cm
+ * ratio. Used below (notes/32, Task 1) to convert OpenVR's meters-based IPD/eye-transform values
+ * into this game's world-unit scale. */
+#define WORLD_UNITS_PER_METER 100.0f
+
+/* notes/31: per-span QueryPerformanceCounter timing, added to settle notes/30's open question
+ * (does WaitGetPoses or the GetRenderTargetData/memcpy/UpdateSurface readback chain dominate the
+ * measured ~8-9ms/frame VR-bridge cost?) with real microsecond-level data instead of guessing.
+ * Zero cost when g_vrSubmitEnabled is FALSE (this code only ever runs inside VRBridge_* functions,
+ * all of which early-out on that flag). Accumulates min/avg/max over a throttled ~1sec window,
+ * matching this file's existing log-throttle convention, then resets for the next window. */
+typedef struct {
+    LONGLONG sumTicks;
+    LONGLONG minTicks;
+    LONGLONG maxTicks;
+    int count;
+    DWORD lastLogTick;
+} VRBridgeTimingStat;
+
+static LARGE_INTEGER g_vrPerfFreq;
+static BOOL g_vrPerfFreqInit = FALSE;
+
+static double VRBridge_TicksToMs(LONGLONG ticks)
+{
+    if (!g_vrPerfFreqInit) { QueryPerformanceFrequency(&g_vrPerfFreq); g_vrPerfFreqInit = TRUE; }
+    if (g_vrPerfFreq.QuadPart == 0) return 0.0;
+    return (double)ticks * 1000.0 / (double)g_vrPerfFreq.QuadPart;
+}
+
+static void VRBridge_RecordSpan(VRBridgeTimingStat *stat, LONGLONG deltaTicks, const char *label)
+{
+    DWORD now;
+
+    if (stat->count == 0) {
+        stat->minTicks = deltaTicks;
+        stat->maxTicks = deltaTicks;
+    } else {
+        if (deltaTicks < stat->minTicks) stat->minTicks = deltaTicks;
+        if (deltaTicks > stat->maxTicks) stat->maxTicks = deltaTicks;
+    }
+    stat->sumTicks += deltaTicks;
+    stat->count++;
+
+    now = GetTickCount();
+    if (stat->lastLogTick == 0 || (DWORD)(now - stat->lastLogTick) >= 1000) {
+        double avgMs = VRBridge_TicksToMs(stat->sumTicks / stat->count);
+        double minMs = VRBridge_TicksToMs(stat->minTicks);
+        double maxMs = VRBridge_TicksToMs(stat->maxTicks);
+        LogLine("VRBridge_Timing: %-22s n=%-4d avg=%.4fms min=%.4fms max=%.4fms",
+                label, stat->count, avgMs, minMs, maxMs);
+        stat->sumTicks = 0;
+        stat->count = 0;
+        stat->lastLogTick = now;
+    }
+}
+
+static VRBridgeTimingStat g_statWaitGetPoses;
+
+/* notes/31 diagnostic-only bypass flags: runtime env vars (read once alongside
+ * PSYVR_ENABLE_SUBMIT) letting an A/B comparison of WaitGetPoses vs. the per-eye pump be done by
+ * relaunching with a different env var, not a rebuild - much faster iteration while isolating which
+ * candidate actually drives the measured Present() cost. Both default OFF (normal behavior
+ * unchanged) - purely diagnostic, not meant to ship enabled. */
+static BOOL g_vrSkipWaitPoses = FALSE;
+static BOOL g_vrSkipPumpEye = FALSE;
+
+/* Per-eye double-buffered two-hop pipeline state (notes/28, proven in
+ * tools/vr-bridge/poc_dual_device_shared/dual_device_poc.c). "Device B" in that POC's terms is
+ * always g_pDevice (the game's own plain device, already tracked); "Device A" is g_pVRDeviceA
+ * below (shared across both eyes - one private D3D9Ex device backs both eyes' buffers). */
+typedef struct {
+    /* Hop 1: g_pDevice's rendered eye surface -> GetRenderTargetData -> sysmemB (game device, sysmem) */
+    IDirect3DSurface9 *sysmemB[2];
+    BOOL pendingB[2];
+    /* Hop 2: memcpy -> UpdateSurface -> Device A's own shared D3DPOOL_DEFAULT texture, fenced per-slot */
+    IDirect3DTexture9 *texA[2];
+    IDirect3DSurface9 *surfA[2];
+    HANDLE handleA[2];
+    IDirect3DQuery9 *queryA[2];
+    BOOL pendingA[2];
+    ID3D11Texture2D *tex11[2];
+    int hop1Count; /* selects which Device-A slot to write next / which to consume (hop1Count-2) */
+    int frameCount; /* per-real-frame counter, ALWAYS increments once per VRBridge_PumpEye call
+                        regardless of whether a promotion happened this frame - selects which
+                        sysmemB[] slot to write next (bCur = frameCount % 2). Must be independent
+                        of hop1Count: hop1Count only advances when a promotion actually succeeds,
+                        so using it to pick bCur/bPrev (an earlier bug) meant bCur was stuck at 0
+                        forever (see notes/29), sysmemB[1] was never written, pendingB[bPrev] was
+                        never TRUE, no promotion could ever happen, and Submit was never reached. */
+    EVREye vrEye;
+    /* notes/31: per-eye timing stats for the two candidate hot-path costs. */
+    VRBridgeTimingStat statGRTD;      /* GetRenderTargetData call alone (hop 1a) */
+    VRBridgeTimingStat statReadback;  /* LockRect+memcpy+UpdateSurface promotion chain (hop 1b), only when it actually runs */
+} VRBridgeEyeState;
+
+static BOOL g_vrSubmitEnabled = FALSE;   /* runtime flag: env var PSYVR_ENABLE_SUBMIT=1, read once at DllMain */
+static BOOL g_vrBridgeInitAttempted = FALSE;
+static BOOL g_vrBridgeReady = FALSE;     /* Device A + D3D11 + OpenVR all initialized OK */
+static IDirect3D9Ex *g_pVRD3D9Ex = NULL;
+static IDirect3DDevice9Ex *g_pVRDeviceA = NULL;
+static IDirect3DSurface9 *g_pVRSysmemAScratch = NULL; /* shared transient scratch, both eyes (used sequentially, never concurrently) */
+static ID3D11Device *g_pVRDevice11 = NULL;
+static ID3D11DeviceContext *g_pVRContext11 = NULL;
+static void *g_pVRCompositor = NULL;
+static VRBridge_WaitGetPoses_t g_pVRWaitGetPoses = NULL;
+static VRBridge_Submit_t g_pVRSubmit = NULL;
+static VRBridgeEyeState g_vrEye1, g_vrEye2; /* eye1=left, eye2=right, matching this file's existing eye numbering */
+static UINT g_vrBufWidth = 0, g_vrBufHeight = 0; /* dimensions the eye buffers above were sized for */
+
+/* notes/32 (Task 1): real per-eye geometry sourced from OpenVR, replacing the hardcoded
+ * STEREO_HALF_IPD/focus-distance estimate wherever it's actually available. g_pVRSystem/its
+ * function pointers are only non-NULL when g_vrSubmitEnabled=1 AND VRBridge_Init reached the
+ * IVRSystem step successfully - the stereo correction in Hook_SetVertexShaderConstantF (which
+ * runs unconditionally, VR-submit on or off) checks g_vrGeomValid and falls back to the original
+ * hardcoded constants whenever it's FALSE, so users without SteamVR installed at all keep getting
+ * exactly the pre-existing, already-live-tested/mod-repo-pushed monitor-stereo behavior. */
+static void *g_pVRSystem = NULL;
+static VRBridge_GetRecommendedRenderTargetSize_t g_pVRGetRecommendedRTSize = NULL;
+static VRBridge_GetProjectionRaw_t g_pVRGetProjectionRaw = NULL;
+static VRBridge_GetEyeToHeadTransform_t g_pVRGetEyeToHeadTransform = NULL;
+static VRBridge_GetFloatTrackedDeviceProperty_t g_pVRGetFloatProp = NULL;
+
+static BOOL g_vrGeomValid = FALSE;
+static float g_realHalfIPD[2] = { 0.0f, 0.0f };  /* world units, SIGNED per eye (index 0=left/eye1,
+                                                     1=right/eye2) - directly usable as `d`, no
+                                                     separate sign multiply needed (unlike the old
+                                                     STEREO_HALF_IPD*sign pattern), since a real
+                                                     headset's eye offsets need not be symmetric. */
+static float g_realShearK[2] = { 0.0f, 0.0f };   /* dimensionless GetProjectionRaw (l+r)/2 tangent-
+                                                     space frustum-center offset per eye - directly
+                                                     usable as the off-axis shear coefficient `k`
+                                                     (see the derivation above STEREO_WVP_REGISTER;
+                                                     k = (l+r)/2 is derived in notes/32 Sec2). */
+static BOOL g_realShearValid[2] = { FALSE, FALSE }; /* FALSE when GetProjectionRaw reports an
+                                                        exactly-symmetric frustum (as this null
+                                                        driver does - confirmed, not assumed, see
+                                                        notes/32 Sec1) - i.e. no real off-axis data
+                                                        to use, so Y30 keeps the existing
+                                                        focus-distance-estimated k instead. */
+
+/* Reads PSYVR_ENABLE_SUBMIT once. Default OFF - the whole VR path is inert unless explicitly
+ * requested, per this session's explicit "don't risk destabilizing the working monitor path"
+ * requirement. Set the env var to "1" (e.g. before launching the game) to enable. */
+static void VRBridge_ReadEnableFlag(void)
+{
+    char buf[8];
+    DWORD len = GetEnvironmentVariableA("PSYVR_ENABLE_SUBMIT", buf, sizeof(buf));
+    g_vrSubmitEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    LogLine("VRBridge: PSYVR_ENABLE_SUBMIT=%s -> g_vrSubmitEnabled=%d",
+            (len > 0 && len < sizeof(buf)) ? buf : "(unset)", g_vrSubmitEnabled ? 1 : 0);
+
+    /* notes/31 diagnostic-only A/B toggles - see the comment on g_vrSkipWaitPoses above. */
+    len = GetEnvironmentVariableA("PSYVR_SKIP_WAITPOSES", buf, sizeof(buf));
+    g_vrSkipWaitPoses = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    len = GetEnvironmentVariableA("PSYVR_SKIP_PUMPEYE", buf, sizeof(buf));
+    g_vrSkipPumpEye = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_vrSkipWaitPoses || g_vrSkipPumpEye) {
+        LogLine("VRBridge: diagnostic bypass flags - g_vrSkipWaitPoses=%d g_vrSkipPumpEye=%d",
+                g_vrSkipWaitPoses ? 1 : 0, g_vrSkipPumpEye ? 1 : 0);
+    }
+}
+
+static void VRBridge_ReleaseEyeBuffers(VRBridgeEyeState *eye)
+{
+    int s;
+    for (s = 0; s < 2; s++) {
+        if (eye->tex11[s])  { eye->tex11[s]->lpVtbl->Release(eye->tex11[s]); eye->tex11[s] = NULL; }
+        if (eye->queryA[s]) { eye->queryA[s]->lpVtbl->Release(eye->queryA[s]); eye->queryA[s] = NULL; }
+        if (eye->surfA[s])  { eye->surfA[s]->lpVtbl->Release(eye->surfA[s]); eye->surfA[s] = NULL; }
+        if (eye->texA[s])   { eye->texA[s]->lpVtbl->Release(eye->texA[s]); eye->texA[s] = NULL; }
+        if (eye->sysmemB[s]) { eye->sysmemB[s]->lpVtbl->Release(eye->sysmemB[s]); eye->sysmemB[s] = NULL; }
+        eye->pendingB[s] = FALSE;
+        eye->pendingA[s] = FALSE;
+        eye->handleA[s] = NULL;
+    }
+    eye->hop1Count = 0;
+    eye->frameCount = 0;
+}
+
+/* Creates one eye's double-buffered pipeline surfaces at the given dimensions (matching the
+ * game's current eye render targets - g_bbWidth/g_bbHeight). Defensive throughout: any failure
+ * releases what was partially created and returns FALSE, leaving the VR path inert for this eye
+ * without touching anything else. */
+static BOOL VRBridge_CreateEyeBuffers(VRBridgeEyeState *eye, EVREye vrEye, UINT w, UINT h)
+{
+    int s;
+    HRESULT hr;
+
+    eye->vrEye = vrEye;
+
+    for (s = 0; s < 2; s++) {
+        hr = g_pDevice->lpVtbl->CreateOffscreenPlainSurface(g_pDevice, w, h, D3DFMT_A8R8G8B8,
+                                                              D3DPOOL_SYSTEMMEM, &eye->sysmemB[s], NULL);
+        if (FAILED(hr)) { LogLine("VRBridge: CreateOffscreenPlainSurface (sysmemB[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = g_pVRDeviceA->lpVtbl->CreateTexture(g_pVRDeviceA, w, h, 1, D3DUSAGE_RENDERTARGET,
+                                                  D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &eye->texA[s], &eye->handleA[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: CreateTexture (texA[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = eye->texA[s]->lpVtbl->GetSurfaceLevel(eye->texA[s], 0, &eye->surfA[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: GetSurfaceLevel (surfA[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = g_pVRDeviceA->lpVtbl->CreateQuery(g_pVRDeviceA, D3DQUERYTYPE_EVENT, &eye->queryA[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: CreateQuery (queryA[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+
+        hr = g_pVRDevice11->lpVtbl->OpenSharedResource(g_pVRDevice11, eye->handleA[s], &IID_ID3D11Texture2D, (void **)&eye->tex11[s]);
+        if (FAILED(hr)) { LogLine("VRBridge: OpenSharedResource (tex11[%d]) failed hr=0x%08lX", s, (unsigned long)hr); return FALSE; }
+    }
+
+    LogLine("VRBridge: eye buffers created OK (eEye=%d, %ux%u)", (int)vrEye, w, h);
+    return TRUE;
+}
+
+/* notes/32 (Task 1): query real per-eye geometry from IVRSystem and cache it (converted to this
+ * game's world-unit scale) for Hook_SetVertexShaderConstantF to consume instead of the hardcoded
+ * STEREO_HALF_IPD/focus-distance estimate. Called once from VRBridge_Init, right after IVRSystem
+ * is confirmed ready. Fully defensive: any missing function pointer leaves g_vrGeomValid FALSE and
+ * every caller transparently keeps using the pre-existing hardcoded fallback - this can never make
+ * the stereo correction worse than before this session, only better when real data is available.
+ * See notes/32 Sec1 for the exact real numbers this returned against the live null-driver runtime
+ * (confirmed once via tools/vr-bridge/poc_ipd_query BEFORE this code was written) and Sec2 for the
+ * k = (l+r)/2 derivation. */
+static void VRBridge_QueryRealGeometry(void)
+{
+    int e;
+
+    if (!g_pVRGetFloatProp || !g_pVRGetEyeToHeadTransform || !g_pVRGetProjectionRaw) {
+        LogLine("VRBridge_QueryRealGeometry: IVRSystem function pointers not ready - keeping hardcoded STEREO_HALF_IPD/focus-distance fallback");
+        return;
+    }
+
+    {
+        ETrackedPropertyError propErr = ETrackedPropertyError_TrackedProp_Success;
+        float ipdMeters = g_pVRGetFloatProp(g_pVRSystem, k_unTrackedDeviceIndex_Hmd,
+                                             ETrackedDeviceProperty_Prop_UserIpdMeters_Float, &propErr);
+        LogLine("VRBridge_QueryRealGeometry: real IPD = %.6f m (%.2f mm), err=%d",
+                ipdMeters, ipdMeters * 1000.0f, (int)propErr);
+    }
+
+    for (e = 0; e < 2; e++) {
+        EVREye vrEye = (e == 0) ? EVREye_Eye_Left : EVREye_Eye_Right;
+        HmdMatrix34_t m;
+        float l = 0.0f, r = 0.0f, t = 0.0f, b = 0.0f;
+
+        ZeroMemory(&m, sizeof(m));
+        g_pVRGetEyeToHeadTransform(g_pVRSystem, &m, vrEye);
+        /* notes/32 Sec2: m.m[0][3] is the eye's X offset from the head origin, in meters, SIGNED
+         * (negative=left of head-forward axis, positive=right) - this directly IS `d` (the eye
+         * offset the stereo correction inserts along the camera's right vector) once converted to
+         * world units. No separate sign multiply needed, unlike STEREO_HALF_IPD*sign - a real
+         * headset's two eye offsets need not be exactly symmetric. */
+        g_realHalfIPD[e] = m.m[0][3] * WORLD_UNITS_PER_METER;
+
+        g_pVRGetProjectionRaw(g_pVRSystem, vrEye, &l, &r, &t, &b);
+        /* notes/32 Sec2: k = (l+r)/2 - the raw tangent-space frustum-center offset directly maps
+         * onto this file's existing shear coefficient `k` (X' = X + k*Z inserted before the game's
+         * own symmetric-width Proj is applied) because a genuine asymmetric frustum with fixed
+         * angular width (r-l unchanged) is mathematically identical to a symmetric frustum sheared
+         * by its center offset - the standard "shift-lens" stereo-camera equivalence. Derivation:
+         * the frustum-center ray satisfies X/(-Z) = (l+r)/2 in eye space (RH, Z negative in front);
+         * the correction's own "clip_x==0" condition is X + k*Z == 0 -> X = -k*Z; equating the two
+         * gives k = (l+r)/2 directly, no unit conversion needed (both sides are dimensionless
+         * tangent ratios already in the same world-unit-per-world-unit space this file already
+         * works in). */
+        g_realShearK[e] = (l + r) * 0.5f;
+        g_realShearValid[e] = (fabsf(g_realShearK[e]) > 1e-4f);
+
+        LogLine("VRBridge_QueryRealGeometry: eye=%d eyeToHead.x=%.6fm (%.3f world units) "
+                "projRaw l=%.4f r=%.4f t=%.4f b=%.4f centerOffset=%.6f%s",
+                e, m.m[0][3], g_realHalfIPD[e], l, r, t, b, g_realShearK[e],
+                g_realShearValid[e] ? "" : " (symmetric - no real off-axis data, keeping focus-distance k fallback)");
+    }
+
+    if (g_pVRGetRecommendedRTSize) {
+        uint32_t rw = 0, rh = 0;
+        g_pVRGetRecommendedRTSize(g_pVRSystem, &rw, &rh);
+        LogLine("VRBridge_QueryRealGeometry: GetRecommendedRenderTargetSize = %u x %u per eye "
+                "(current VR-submit eye buffers are %ux%u, matching the game's own backbuffer - "
+                "see notes/32 Sec4 for why this session did not change that)",
+                rw, rh, g_bbWidth, g_bbHeight);
+    }
+
+    g_vrGeomValid = TRUE;
+    LogLine("VRBridge_QueryRealGeometry: g_vrGeomValid = TRUE - stereo correction now uses real "
+            "OpenVR-sourced IPD/eye-offset values instead of the hardcoded STEREO_HALF_IPD constant");
+}
+
+/* One-time init: private D3D9Ex device matched to the game's adapter, D3D11 device, OpenVR init +
+ * IVRCompositor. Called lazily from SetupStereoSurfaces the first time g_vrSubmitEnabled is TRUE
+ * and the game's own device/backbuffer dims are known. Never called more than once per process
+ * (guarded by g_vrBridgeInitAttempted) - a failed attempt is NOT retried every frame/Reset. */
+static void VRBridge_Init(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
+{
+    HRESULT hr;
+    LUID gameLuid;
+    IDirect3D9 *pGameD3D9 = NULL;
+    IDXGIFactory1 *pFactory = NULL;
+    IDXGIAdapter1 *pChosenAdapter = NULL;
+    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
+    D3D_FEATURE_LEVEL gotLevel;
+    UINT i;
+
+    g_vrBridgeInitAttempted = TRUE;
+
+    if (!g_hRealD3D9) { LogLine("VRBridge_Init: ERROR real d3d9.dll not loaded"); return; }
+    g_pRealDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hRealD3D9, "Direct3DCreate9Ex");
+    if (!g_pRealDirect3DCreate9Ex) { LogLine("VRBridge_Init: ERROR Direct3DCreate9Ex not exported by real d3d9.dll"); return; }
+
+    hr = g_pRealDirect3DCreate9Ex(D3D_SDK_VERSION, &g_pVRD3D9Ex);
+    if (FAILED(hr) || !g_pVRD3D9Ex) { LogLine("VRBridge_Init: Direct3DCreate9Ex failed hr=0x%08lX", (unsigned long)hr); return; }
+
+    /* Match Device A to the SAME physical adapter the game's own device is using (required for a
+     * valid shared handle even on a single-GPU machine - notes/25 Sec3a). Get the game device's
+     * adapter LUID via its own IDirect3D9 (GetDirect3D), not assumed to be adapter 0. */
+    hr = pGameDevice->lpVtbl->GetDirect3D(pGameDevice, &pGameD3D9);
+    if (FAILED(hr) || !pGameD3D9) { LogLine("VRBridge_Init: GetDirect3D (game device) failed hr=0x%08lX", (unsigned long)hr); return; }
+    {
+        D3DADAPTER_IDENTIFIER9 ident;
+        UINT gameAdapter = D3DADAPTER_DEFAULT; /* CreateDevice's Adapter arg isn't retrievable from the device itself;
+                                                    D3DADAPTER_DEFAULT (0) matches this project's confirmed single-GPU setup
+                                                    (notes/25/27: NVIDIA GTX 1660 SUPER, the only adapter). */
+        hr = pGameD3D9->lpVtbl->GetAdapterIdentifier(pGameD3D9, gameAdapter, 0, &ident);
+        if (FAILED(hr)) { LogLine("VRBridge_Init: GetAdapterIdentifier failed hr=0x%08lX", (unsigned long)hr); pGameD3D9->lpVtbl->Release(pGameD3D9); return; }
+        LogLine("VRBridge_Init: game device adapter = \"%s\"", ident.Description);
+    }
+    pGameD3D9->lpVtbl->Release(pGameD3D9);
+
+    hr = g_pVRD3D9Ex->lpVtbl->GetAdapterLUID(g_pVRD3D9Ex, D3DADAPTER_DEFAULT, &gameLuid);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: GetAdapterLUID failed hr=0x%08lX", (unsigned long)hr); return; }
+
+    {
+        WNDCLASSEXA wc;
+        HWND hwnd;
+        D3DPRESENT_PARAMETERS pp;
+
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DefWindowProcA;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = "PsyVR_BridgeDeviceA";
+        RegisterClassExA(&wc);
+        hwnd = CreateWindowExA(0, wc.lpszClassName, "PsyVR bridge device A", WS_OVERLAPPEDWINDOW,
+                                0, 0, 64, 64, NULL, NULL, wc.hInstance, NULL);
+        if (!hwnd) { LogLine("VRBridge_Init: CreateWindowExA failed"); return; }
+
+        ZeroMemory(&pp, sizeof(pp));
+        pp.Windowed = TRUE;
+        pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        pp.hDeviceWindow = hwnd;
+        pp.BackBufferFormat = D3DFMT_UNKNOWN;
+        pp.BackBufferWidth = 64;
+        pp.BackBufferHeight = 64;
+        pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+
+        hr = g_pVRD3D9Ex->lpVtbl->CreateDeviceEx(g_pVRD3D9Ex, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
+            D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED | D3DCREATE_FPU_PRESERVE,
+            &pp, NULL, &g_pVRDeviceA);
+        if (FAILED(hr) || !g_pVRDeviceA) { LogLine("VRBridge_Init: CreateDeviceEx (Device A) failed hr=0x%08lX", (unsigned long)hr); return; }
+    }
+    LogLine("VRBridge_Init: private D3D9Ex Device A created OK");
+
+    hr = g_pVRDeviceA->lpVtbl->CreateOffscreenPlainSurface(g_pVRDeviceA, w, h, D3DFMT_A8R8G8B8,
+                                                             D3DPOOL_SYSTEMMEM, &g_pVRSysmemAScratch, NULL);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: CreateOffscreenPlainSurface (scratch) failed hr=0x%08lX", (unsigned long)hr); return; }
+
+    hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&pFactory);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: CreateDXGIFactory1 failed hr=0x%08lX", (unsigned long)hr); return; }
+    for (i = 0;; i++) {
+        IDXGIAdapter1 *pAdapter = NULL;
+        DXGI_ADAPTER_DESC1 desc;
+        hr = pFactory->lpVtbl->EnumAdapters1(pFactory, i, &pAdapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        pAdapter->lpVtbl->GetDesc1(pAdapter, &desc);
+        if (desc.AdapterLuid.LowPart == gameLuid.LowPart && desc.AdapterLuid.HighPart == gameLuid.HighPart) {
+            pChosenAdapter = pAdapter;
+            break;
+        }
+        pAdapter->lpVtbl->Release(pAdapter);
+    }
+    if (!pChosenAdapter) { LogLine("VRBridge_Init: no matching DXGI adapter found"); pFactory->lpVtbl->Release(pFactory); return; }
+
+    hr = D3D11CreateDevice((IDXGIAdapter *)pChosenAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                            D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+                            D3D11_SDK_VERSION, &g_pVRDevice11, &gotLevel, &g_pVRContext11);
+    pChosenAdapter->lpVtbl->Release(pChosenAdapter);
+    pFactory->lpVtbl->Release(pFactory);
+    if (FAILED(hr)) { LogLine("VRBridge_Init: D3D11CreateDevice failed hr=0x%08lX", (unsigned long)hr); return; }
+    LogLine("VRBridge_Init: D3D11 device created OK, feature level=0x%X", gotLevel);
+
+    {
+        EVRInitError err = EVRInitError_VRInitError_None;
+        uint32_t token = VR_InitInternal2(&err, EVRApplicationType_VRApplication_Scene, NULL);
+        LogLine("VRBridge_Init: VR_InitInternal2 -> token=%u error=%d (%s)", token, (int)err, VR_GetVRInitErrorAsEnglishDescription(err));
+        if (!(err == EVRInitError_VRInitError_None && token != 0)) return;
+    }
+    {
+        EVRInitError compErr = EVRInitError_VRInitError_None;
+        void **vtbl;
+        g_pVRCompositor = VR_GetGenericInterface(IVRCompositor_Version, &compErr);
+        if (!g_pVRCompositor) { LogLine("VRBridge_Init: VR_GetGenericInterface(IVRCompositor) failed error=%d", (int)compErr); return; }
+        vtbl = (void **)VRBridge_RealVtable(g_pVRCompositor);
+        g_pVRWaitGetPoses = (VRBridge_WaitGetPoses_t)vtbl[2];
+        g_pVRSubmit = (VRBridge_Submit_t)vtbl[6];
+        LogLine("VRBridge_Init: IVRCompositor ready (vtable=%p)", (void *)vtbl);
+    }
+    {
+        /* notes/32 (Task 1): IVRSystem, for real IPD/eye-transform/off-axis-frustum/render-target-
+         * size queries - a genuine improvement even without a physical headset (see the file-header
+         * Milestone 9 comment), but NOT load-bearing for Submit itself (IVRCompositor above is) -
+         * so a failure here logs and continues rather than aborting VRBridge_Init early; the
+         * existing hardcoded stereo-correction fallback (g_vrGeomValid stays FALSE) covers it. */
+        EVRInitError sysErr = EVRInitError_VRInitError_None;
+        g_pVRSystem = VR_GetGenericInterface(IVRSystem_Version, &sysErr);
+        if (!g_pVRSystem) {
+            LogLine("VRBridge_Init: VR_GetGenericInterface(IVRSystem) failed error=%d - real geometry queries unavailable, keeping hardcoded stereo-correction fallback", (int)sysErr);
+        } else {
+            void **sysVtbl = (void **)VRBridge_RealVtable(g_pVRSystem);
+            g_pVRGetRecommendedRTSize = (VRBridge_GetRecommendedRenderTargetSize_t)sysVtbl[0];
+            g_pVRGetProjectionRaw = (VRBridge_GetProjectionRaw_t)sysVtbl[2];
+            g_pVRGetEyeToHeadTransform = (VRBridge_GetEyeToHeadTransform_t)sysVtbl[5];
+            g_pVRGetFloatProp = (VRBridge_GetFloatTrackedDeviceProperty_t)sysVtbl[23];
+            LogLine("VRBridge_Init: IVRSystem ready (vtable=%p)", (void *)sysVtbl);
+            VRBridge_QueryRealGeometry();
+        }
+    }
+
+    if (!VRBridge_CreateEyeBuffers(&g_vrEye1, EVREye_Eye_Left, w, h) ||
+        !VRBridge_CreateEyeBuffers(&g_vrEye2, EVREye_Eye_Right, w, h)) {
+        LogLine("VRBridge_Init: eye buffer creation failed - VR bridge NOT ready");
+        return;
+    }
+
+    g_vrBufWidth = w;
+    g_vrBufHeight = h;
+    g_vrBridgeReady = TRUE;
+    LogLine("VRBridge_Init: SUCCESS - g_vrBridgeReady = TRUE (%ux%u per eye)", w, h);
+}
+
+/* Called from SetupStereoSurfaces (device creation AND every Reset) once the existing monitor-
+ * composite path's own surfaces are confirmed ready. Lazily inits Device A/D3D11/OpenVR on first
+ * call; on every call (including after a Reset with new dimensions) ensures the eye buffers match
+ * the CURRENT g_bbWidth/g_bbHeight, recreating them if the size changed. Fully defensive - any
+ * failure leaves g_vrBridgeReady FALSE and the monitor composite path is completely unaffected. */
+static void VRBridge_OnStereoSurfacesReady(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
+{
+    if (!g_vrSubmitEnabled) return;
+
+    if (!g_vrBridgeInitAttempted) {
+        VRBridge_Init(pGameDevice, w, h);
+        return;
+    }
+    if (!g_pVRDeviceA || !g_pVRDevice11) return; /* init failed earlier - stay inert, don't retry every frame */
+
+    if (g_vrBridgeReady && (w != g_vrBufWidth || h != g_vrBufHeight)) {
+        LogLine("VRBridge: dimensions changed (%ux%u -> %ux%u), recreating eye buffers", g_vrBufWidth, g_vrBufHeight, w, h);
+        g_vrBridgeReady = FALSE;
+        VRBridge_ReleaseEyeBuffers(&g_vrEye1);
+        VRBridge_ReleaseEyeBuffers(&g_vrEye2);
+        if (VRBridge_CreateEyeBuffers(&g_vrEye1, EVREye_Eye_Left, w, h) &&
+            VRBridge_CreateEyeBuffers(&g_vrEye2, EVREye_Eye_Right, w, h)) {
+            g_vrBufWidth = w; g_vrBufHeight = h;
+            g_vrBridgeReady = TRUE;
+        }
+    }
+}
+
+/* The per-eye, per-real-frame pump: hop 1 (game device readback -> promote to Device A when
+ * ready, non-blocking) then hop 2 (check Device A's oldest pending upload; if its fence is
+ * signaled, Submit that texture to the compositor). Mirrors
+ * tools/vr-bridge/poc_dual_device_shared/dual_device_poc.c's proven Part 2 loop exactly, just
+ * driven once per real Present-frame instead of a fixed iteration count. Never blocks: every
+ * readiness check is a single non-blocking Lock/GetData call, and an unready buffer is simply
+ * skipped this frame (dropped/retried next frame) rather than waited on. */
+static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeSurf)
+{
+    /* bCur/bPrev MUST be driven by a counter that advances every call (frameCount), NOT by
+     * hop1Count - hop1Count only advances once a promotion actually succeeds (see below), so
+     * deriving bCur from it created a deadlock (notes/29): bCur stuck at 0 forever, sysmemB[1]
+     * never written, pendingB[bPrev] never TRUE, promotion (and therefore Submit) never reached. */
+    int bCur = eye->frameCount % 2;
+    int bPrev = (bCur + 1) % 2;
+    HRESULT hr;
+    eye->frameCount++;
+
+    /* --- Hop 1a: kick off this frame's readback into the CURRENT sysmemB slot. ---
+     * notes/31: timed alone (GetRenderTargetData call only) to separate its cost from the
+     * LockRect/memcpy/UpdateSurface chain below, which notes/28 already measured as sub-0.1ms in
+     * isolation against a synthetic Clear()-only workload but never against the real game scene. */
+    {
+        LARGE_INTEGER tG0, tG1;
+        char label[32];
+        QueryPerformanceCounter(&tG0);
+        hr = g_pDevice->lpVtbl->GetRenderTargetData(g_pDevice, pGameEyeSurf, eye->sysmemB[bCur]);
+        QueryPerformanceCounter(&tG1);
+        _snprintf(label, sizeof(label), "GetRenderTargetData[%d]", (int)eye->vrEye);
+        VRBridge_RecordSpan(&eye->statGRTD, tG1.QuadPart - tG0.QuadPart, label);
+    }
+    if (FAILED(hr)) return; /* leave pendingB[bCur] as-is; try again next frame */
+    eye->pendingB[bCur] = TRUE;
+
+    /* --- Hop 1b: non-blocking check of the OTHER (previous-frame) sysmemB slot; if ready, promote
+     * it into Device A's next free slot. --- */
+    if (eye->pendingB[bPrev]) {
+        D3DLOCKED_RECT lockedB;
+        LARGE_INTEGER tR0, tR1;
+        BOOL didWork = FALSE;
+        HRESULT lockHr;
+        QueryPerformanceCounter(&tR0);
+        lockHr = eye->sysmemB[bPrev]->lpVtbl->LockRect(eye->sysmemB[bPrev], &lockedB, NULL,
+                                                        D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
+        if (lockHr == S_OK) {
+            didWork = TRUE;
+            int aCur = eye->hop1Count % 2;
+            BOOL aSlotFree = TRUE;
+            if (eye->pendingA[aCur]) {
+                HRESULT qHr = eye->queryA[aCur]->lpVtbl->GetData(eye->queryA[aCur], NULL, 0, 0);
+                aSlotFree = (qHr == S_OK);
+            }
+            if (aSlotFree) {
+                D3DLOCKED_RECT lockedA;
+                hr = g_pVRSysmemAScratch->lpVtbl->LockRect(g_pVRSysmemAScratch, &lockedA, NULL, 0);
+                if (SUCCEEDED(hr)) {
+                    UINT y;
+                    for (y = 0; y < g_vrBufHeight; y++) {
+                        memcpy((BYTE *)lockedA.pBits + (size_t)y * lockedA.Pitch,
+                               (BYTE *)lockedB.pBits + (size_t)y * lockedB.Pitch,
+                               (size_t)g_vrBufWidth * 4);
+                    }
+                    g_pVRSysmemAScratch->lpVtbl->UnlockRect(g_pVRSysmemAScratch);
+
+                    hr = g_pVRDeviceA->lpVtbl->UpdateSurface(g_pVRDeviceA, g_pVRSysmemAScratch, NULL, eye->surfA[aCur], NULL);
+                    if (SUCCEEDED(hr)) {
+                        eye->queryA[aCur]->lpVtbl->Issue(eye->queryA[aCur], D3DISSUE_END);
+                        eye->queryA[aCur]->lpVtbl->GetData(eye->queryA[aCur], NULL, 0, D3DGETDATA_FLUSH); /* kick, non-blocking */
+                        eye->pendingA[aCur] = TRUE;
+                        eye->hop1Count++;
+                    }
+                }
+            }
+            /* else: Device A backpressure - drop this frame's promotion, no wait, try again next frame */
+            eye->sysmemB[bPrev]->lpVtbl->UnlockRect(eye->sysmemB[bPrev]);
+        }
+        /* else lockHr != S_OK (e.g. D3DERR_WASSTILLDRAWING): the readback isn't done yet - do NOT
+         * call UnlockRect (no successful Lock to match it), just leave this slot pending and check
+         * again next frame. */
+        if (didWork) {
+            /* notes/31: only record the span when the chain actually ran end-to-end (LockRect
+             * succeeded AND the rest executed) - a D3DERR_WASSTILLDRAWING skip is a near-zero-cost
+             * non-blocking poll, not part of the real readback-chain cost being measured here. */
+            char label[32];
+            QueryPerformanceCounter(&tR1);
+            _snprintf(label, sizeof(label), "ReadbackChain[%d]", (int)eye->vrEye);
+            VRBridge_RecordSpan(&eye->statReadback, tR1.QuadPart - tR0.QuadPart, label);
+        }
+    }
+
+    /* --- Hop 2: non-blocking check of the oldest Device-A slot with a pending upload; if its
+     * fence is signaled, Submit that texture to the compositor. --- */
+    if (eye->hop1Count >= 2 && g_pVRSubmit) {
+        int aConsume = (eye->hop1Count - 2) % 2;
+        if (eye->pendingA[aConsume]) {
+            HRESULT qHr = eye->queryA[aConsume]->lpVtbl->GetData(eye->queryA[aConsume], NULL, 0, 0);
+            if (qHr == S_OK) {
+                Texture_t tex;
+                EVRCompositorError subErr;
+                tex.handle = (void *)eye->tex11[aConsume];
+                tex.eType = ETextureType_TextureType_DirectX;
+                tex.eColorSpace = EColorSpace_ColorSpace_Auto;
+                subErr = g_pVRSubmit(g_pVRCompositor, eye->vrEye, &tex, NULL, EVRSubmitFlags_Submit_Default);
+                if (subErr != EVRCompositorError_VRCompositorError_None) {
+                    static DWORD s_lastErrLog = 0;
+                    DWORD now = GetTickCount();
+                    if (s_lastErrLog == 0 || (DWORD)(now - s_lastErrLog) >= 2000) {
+                        LogLine("VRBridge: Submit(eye=%d) error=%d", (int)eye->vrEye, (int)subErr);
+                        s_lastErrLog = now;
+                    }
+                } else {
+                    /* notes/29: the success path previously had NO log statement at all, which is
+                     * why 1700+ real frames of (it turned out, never-firing) per-frame submission
+                     * produced zero log evidence either way - throttled ~1/sec per eye so this is
+                     * verifiable going forward without flooding the log every frame. */
+                    static DWORD s_lastOkLog[2] = { 0, 0 };
+                    DWORD now = GetTickCount();
+                    int idx = (eye->vrEye == EVREye_Eye_Left) ? 0 : 1;
+                    if (s_lastOkLog[idx] == 0 || (DWORD)(now - s_lastOkLog[idx]) >= 1000) {
+                        LogLine("VRBridge: Submit(eye=%d) OK (frame=%d)", (int)eye->vrEye, eye->frameCount);
+                        s_lastOkLog[idx] = now;
+                    }
+                }
+            }
+            /* else: not ready yet - skip this frame's submit for this eye, no wait, try again next frame */
+        }
+    }
+}
+
+/* notes/31: split from the original single VRBridge_OnFrameComposited (which called WaitGetPoses
+ * AND the per-eye pump together, both from CandB_AfterBoth_asm - i.e. AFTER both eyes had already
+ * finished rendering). Direct instrumentation this session found WaitGetPoses costs a real,
+ * consistent ~25ms/call, confirmed REQUIRED for Submit to succeed (skipping it entirely restores
+ * full non-bridge framerate but breaks Submit with VRCompositorError_DoNotHaveFocus - see the
+ * PresentationInterval comment on Hook_CreateDevice for the parallel double-pacing finding).
+ * Standard OpenVR usage calls WaitGetPoses as early as possible each frame (right after the
+ * previous Present, at the TOP of the next frame's work) specifically so its compositor-side wait
+ * overlaps with the game's own CPU-side per-frame simulation, instead of sitting as pure added
+ * tail latency after rendering is already done. This file's hook points make that possible: call
+ * VRBridge_PumpPoses() from Hook_Present right after the real hardware Present succeeds (this
+ * frame is fully done; the NEXT frame's CPU-side game logic starts immediately after, giving the
+ * wait real work to overlap with) and keep VRBridge_PumpEyes() (which needs the actual rendered eye
+ * surfaces) at its original call site in CandB_AfterBoth_asm. */
+static void VRBridge_PumpPoses(void)
+{
+    if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
+    if (!g_pVRWaitGetPoses || g_vrSkipWaitPoses) return;
+
+    {
+        TrackedDevicePose_t renderPoses[64], gamePoses[64];
+        LARGE_INTEGER tW0, tW1;
+        ZeroMemory(renderPoses, sizeof(renderPoses));
+        ZeroMemory(gamePoses, sizeof(gamePoses));
+        QueryPerformanceCounter(&tW0);
+        g_pVRWaitGetPoses(g_pVRCompositor, renderPoses, 64, gamePoses, 64);
+        QueryPerformanceCounter(&tW1);
+        VRBridge_RecordSpan(&g_statWaitGetPoses, tW1.QuadPart - tW0.QuadPart, "WaitGetPoses");
+    }
+}
+
+/* Called once per real Present-frame from CandB_AfterBoth_asm, once both eyes have finished
+ * rendering into g_pEye1Surf/g_pEye2Surf - unchanged from before except WaitGetPoses itself moved
+ * out (see VRBridge_PumpPoses above). */
+static void VRBridge_OnFrameComposited(void)
+{
+    if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
+    if (!g_pEye1Surf || !g_pEye2Surf) return;
+
+    if (!g_vrSkipPumpEye) {
+        VRBridge_PumpEye(&g_vrEye1, g_pEye1Surf);
+        VRBridge_PumpEye(&g_vrEye2, g_pEye2Surf);
+    }
+}
+
+static void VRBridge_Shutdown(void)
+{
+    if (!g_vrBridgeInitAttempted) return;
+    LogLine("VRBridge_Shutdown: releasing VR bridge resources");
+
+    VRBridge_ReleaseEyeBuffers(&g_vrEye1);
+    VRBridge_ReleaseEyeBuffers(&g_vrEye2);
+
+    if (g_pVRCompositor) { VR_ShutdownInternal(); g_pVRCompositor = NULL; }
+    if (g_pVRSysmemAScratch) { g_pVRSysmemAScratch->lpVtbl->Release(g_pVRSysmemAScratch); g_pVRSysmemAScratch = NULL; }
+    if (g_pVRContext11) { g_pVRContext11->lpVtbl->Release(g_pVRContext11); g_pVRContext11 = NULL; }
+    if (g_pVRDevice11) { g_pVRDevice11->lpVtbl->Release(g_pVRDevice11); g_pVRDevice11 = NULL; }
+    if (g_pVRDeviceA) { g_pVRDeviceA->lpVtbl->Release(g_pVRDeviceA); g_pVRDeviceA = NULL; }
+    if (g_pVRD3D9Ex) { g_pVRD3D9Ex->lpVtbl->Release(g_pVRD3D9Ex); g_pVRD3D9Ex = NULL; }
+
+    /* notes/32: g_pVRSystem is owned by the same VR_InitInternal2/VR_ShutdownInternal lifecycle as
+     * g_pVRCompositor (both come from the same VR_GetGenericInterface pool) - no separate release
+     * call exists or is needed, just drop the cached pointers/function pointers and the derived
+     * geometry cache so a future re-Init starts clean. */
+    g_pVRSystem = NULL;
+    g_pVRGetRecommendedRTSize = NULL;
+    g_pVRGetProjectionRaw = NULL;
+    g_pVRGetEyeToHeadTransform = NULL;
+    g_pVRGetFloatProp = NULL;
+    g_vrGeomValid = FALSE;
+
+    g_vrBridgeReady = FALSE;
+    g_vrBridgeInitAttempted = FALSE;
+}
+
 /* ======================================================================
  * Stereo prototype: inline hooks into Psychonauts.exe's own code
  * ====================================================================== */
@@ -307,29 +1195,67 @@ typedef struct { float x, y, z; } Vec3;
  * similarly-framed shot gives a ratio of ~0.0315; applied to ~195 world
  * units that is ~6.1 units full separation, i.e. ~3.05 half-offset - very
  * close to the task's own suggested "~6-7 world units" ballpark. 3.25 (6.5
- * full) was chosen as a round number in that range. */
+ * full) was chosen as a round number in that range.
+ *
+ * FALLBACK ONLY as of notes/32 (Task 1): this fixed constant is now used
+ * only when real OpenVR data isn't available (g_vrGeomValid == FALSE - i.e.
+ * PSYVR_ENABLE_SUBMIT isn't set, or SteamVR/OpenVR init failed). When it IS
+ * available, Hook_SetVertexShaderConstantF uses g_realHalfIPD[] instead -
+ * the REAL per-eye IVRSystem::GetEyeToHeadTransform offset, converted to
+ * world units via WORLD_UNITS_PER_METER. Confirmed against the live
+ * null-driver runtime (notes/32 Sec1): real IPD = 63.0mm exactly (the
+ * standard OpenVR default), real half-IPD = 3.15cm = 3.15 world units - only
+ * ~3% below this hardcoded 3.25 guess, a genuine (if modest) cross-
+ * validation of the original notes/15 estimate. */
 #define STEREO_HALF_IPD 3.25f
 
-static IDirect3DDevice9 *g_pDevice = NULL;
-static IDirect3DSurface9 *g_pRealBackBuffer = NULL;
-static IDirect3DSurface9 *g_pEye1Surf = NULL;
-static IDirect3DSurface9 *g_pEye2Surf = NULL;
-/* notes/22: the device's single auto depth-stencil surface (EnableAutoDepthStencil=1,
- * live-confirmed AutoDepthStencilFormat=75/D3DFMT_D24S8) was NEVER reassigned per eye -
- * both g_pEye1Surf/g_pEye2Surf rendered against the SAME physical depth buffer the whole
- * time, and SetDepthStencilSurface was never called anywhere in this file. Each eye now
- * gets its own private depth-stencil surface, captured/restored exactly like the color
- * render targets. See the comment on SetEyeAndTarget() for the full mechanism this fixes. */
-static IDirect3DSurface9 *g_pRealDepthStencil = NULL;
-static IDirect3DSurface9 *g_pEye1DepthStencil = NULL;
-static IDirect3DSurface9 *g_pEye2DepthStencil = NULL;
-static UINT g_bbWidth = 0;
-static UINT g_bbHeight = 0;
-static BOOL g_stereoReady = FALSE; /* device + both offscreen color+depth surfaces created OK */
+/* notes/24: convergence/focal distance for the off-axis projection below -
+ * the one depth at which both eyes' projected image of the same point has
+ * ZERO disparity (see the derivation above Hook_SetVertexShaderConstantF).
+ * Deliberately NOT a fixed constant: g_focusDistance is recomputed every
+ * real frame from the camera's own live eye->at distance (BVM_OnEntry_asm
+ * already caches eye/at for the disabled CPU-side rewrite; this session
+ * reuses that same cached data) - a cheap, well-motivated choice for a
+ * third-person camera that already follows a target, so the convergence
+ * point naturally tracks wherever the game itself is already aiming each
+ * frame instead of needing a scene-specific guessed constant.
+ *
+ * FALLBACK ONLY as of notes/32 (Task 1): notes/24's original TODO here
+ * asked for IVRSystem::GetProjectionMatrix (a full asymmetric 4x4, which
+ * would need its own struct-return ABI handling and would still need
+ * decomposing back into this file's k/Y20/Y30 terms). This session used
+ * IVRSystem::GetProjectionRaw instead (real per-eye tangent bounds, no
+ * struct-return issue, no decomposition needed - see g_realShearK/
+ * VRBridge_QueryRealGeometry) precisely because the task called it out as
+ * the more direct API for this. When GetProjectionRaw reports a genuinely
+ * asymmetric frustum (g_realShearValid[eyeIdx]), its real k = (l+r)/2
+ * REPLACES this focus-distance estimate entirely for the shear term. This
+ * null-driver runtime reports an exactly symmetric frustum for both eyes
+ * (confirmed, not assumed - notes/32 Sec1), so g_focusDistance's estimate
+ * remains in active use in every configuration actually tested this
+ * session; it will be automatically superseded the moment a real headset
+ * (or any driver reporting real per-eye asymmetry) is connected, with no
+ * further code changes needed. */
+#define STEREO_FOCUS_DISTANCE_MIN 25.0f /* world units - clamp floor so a
+                                            close `at` point never produces
+                                            a near-zero/negative convergence
+                                            distance and an extreme shear */
+#define STEREO_FOCUS_DISTANCE_DEFAULT 200.0f /* fallback before the first
+                                                 real BVM cache of the
+                                                 session - matches the title
+                                                 screen's own observed
+                                                 ~190-200 unit eye->at
+                                                 framing (notes/08/09) */
 
 static BOOL g_frameCamCached = FALSE;
 static Vec3 g_baseEye, g_baseAt, g_baseUp, g_rightVec;
 static void *g_camPOutMatrix = NULL;
+/* notes/24: off-axis convergence/focal distance, recomputed each real frame
+ * from the live eye->at distance - see the comment on
+ * STEREO_FOCUS_DISTANCE_MIN/DEFAULT above for the reasoning. Starts at the
+ * DEFAULT fallback so the very first correction (before BVM_OnEntry_asm's
+ * first hit of the session) uses a sane value rather than 0. */
+static float g_focusDistance = STEREO_FOCUS_DISTANCE_DEFAULT;
 
 /* notes/14: the raw view-matrix rewrite from notes/13 never reached the GPU
  * because it happens after that frame's ONE shader-constant upload already
@@ -357,6 +1283,15 @@ static void *g_camPOutMatrix = NULL;
 #define ADDR_FOV_MUL_CONST ((float  *)0x00793444u) /* ...then multiply by this (notes/07 disasm) */
 static float g_projXScale = 0.0f;
 static BOOL g_projXScaleValid = FALSE;
+/* notes/24: zn/zf, needed (alongside xScale) for the off-axis correction's
+ * A=zf/(zn-zf) and B=zn*zf/(zn-zf) terms - see the derivation above
+ * Hook_SetVertexShaderConstantF. BuildProjectionMatrix's signature
+ * (pOutMatrix, rawFov, Aspect, zn, zf) was already established in notes/07;
+ * only rawFov/Aspect were read before this session. Captured the same way
+ * (from entry ARGUMENTS, not the output buffer - see the large comment
+ * block above g_projXScale for why the output buffer is unsafe to cache). */
+static float g_projZNear = 10.0f;   /* live-confirmed default (notes/06) */
+static float g_projZFar = 50000.0f; /* live-confirmed default (notes/06) */
 
 /* Trampoline entry points (allocated executable memory, filled in by
  * InstallInlineHooks). Calling through these runs the REAL, unmodified
@@ -421,6 +1356,17 @@ void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
         g_rightVec = Vec3Normalize(Vec3Cross(fwd, g_baseUp));
     }
 
+    /* notes/24: off-axis convergence distance for THIS frame - see the
+     * comment on STEREO_FOCUS_DISTANCE_MIN/DEFAULT and the top-of-file
+     * Milestone 7 note for the full reasoning. Uses the real eye->at
+     * distance, clamped away from zero/near-zero so a degenerate close
+     * `at` point can't produce an extreme shear. */
+    {
+        Vec3 eyeToAt = Vec3Sub(g_baseAt, g_baseEye);
+        float dist = sqrtf(eyeToAt.x * eyeToAt.x + eyeToAt.y * eyeToAt.y + eyeToAt.z * eyeToAt.z);
+        g_focusDistance = (dist > STEREO_FOCUS_DISTANCE_MIN) ? dist : STEREO_FOCUS_DISTANCE_MIN;
+    }
+
     g_frameCamCached = TRUE;
 
     {
@@ -444,8 +1390,8 @@ void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
  * disassembled in notes/07 (fovy = rawFov/ADDR_FOV_DIV_CONST*ADDR_FOV_MUL_CONST,
  * then xScale = cot(fovy/2)/Aspect) - see the comment on g_projXScale above
  * for why this replaced an earlier pointer-caching approach. */
-void __cdecl BPM_OnEntry_asm(float rawFov, float aspect) asm("BPM_OnEntry_asm");
-void __cdecl BPM_OnEntry_asm(float rawFov, float aspect)
+void __cdecl BPM_OnEntry_asm(float rawFov, float aspect, float zn, float zf) asm("BPM_OnEntry_asm");
+void __cdecl BPM_OnEntry_asm(float rawFov, float aspect, float zn, float zf)
 {
     double divConst = *ADDR_FOV_DIV_CONST;
     float mulConst = *ADDR_FOV_MUL_CONST;
@@ -459,12 +1405,19 @@ void __cdecl BPM_OnEntry_asm(float rawFov, float aspect)
     g_projXScale = 1.0f / (tanf(fovy * 0.5f) * aspect);
     g_projXScaleValid = TRUE;
 
+    /* notes/24: zn/zf for the off-axis A/B terms - sanity-guarded the same
+     * way as fovy above rather than trusting arbitrary stack contents. */
+    if (zn > 0.0f && zf > zn) {
+        g_projZNear = zn;
+        g_projZFar = zf;
+    }
+
     {
         static DWORD s_lastLog = 0;
         DWORD now = GetTickCount();
         if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
-            LogLine("BPM cache SET: rawFov=%.3f aspect=%.4f fovy=%.4f xScale=%.4f",
-                    rawFov, aspect, fovy, g_projXScale);
+            LogLine("BPM cache SET: rawFov=%.3f aspect=%.4f fovy=%.4f xScale=%.4f zn=%.3f zf=%.3f",
+                    rawFov, aspect, fovy, g_projXScale, g_projZNear, g_projZFar);
             s_lastLog = now;
         }
     }
@@ -631,6 +1584,15 @@ void __cdecl CandB_AfterBoth_asm(void)
 {
     g_stereoPhase = STEREO_PHASE_IDLE;
     if (!g_stereoReady || !g_pDevice || !g_pRealBackBuffer) return;
+
+    /* notes/28: both eyes' private render targets (g_pEye1Surf/g_pEye2Surf) are now fully
+     * rendered for this frame - the natural point to pump the additive VR submission path, BEFORE
+     * the render target is switched back to the real backbuffer below. Inert unless
+     * PSYVR_ENABLE_SUBMIT=1 (see VRBridge_OnFrameComposited's own guard); never touches
+     * g_pRealBackBuffer or anything else the existing monitor composite (Hook_Present, below)
+     * depends on. */
+    VRBridge_OnFrameComposited();
+
     g_pDevice->lpVtbl->SetRenderTarget(g_pDevice, 0, g_pRealBackBuffer);
     if (g_pRealDepthStencil) {
         g_pDevice->lpVtbl->SetDepthStencilSurface(g_pDevice, g_pRealDepthStencil);
@@ -685,19 +1647,24 @@ __attribute__((naked)) void Hook_BuildViewMatrix(void)
 }
 
 /* Same tail-jmp shape as Hook_BuildViewMatrix, adapted for
- * BuildProjectionMatrix(pOutMatrix, rawFov, Aspect, zn, zf) - only rawFov
- * and Aspect (both raw 4-byte float stack args - pushed/read as plain
- * 32-bit values here, exactly how __cdecl already represents them on the
- * stack) are needed. */
+ * BuildProjectionMatrix(pOutMatrix, rawFov, Aspect, zn, zf) - all four raw
+ * 4-byte float/stack args are read exactly as __cdecl already represents
+ * them on the stack. notes/24 extends this to also read zn/zf (previously
+ * only rawFov/Aspect were needed); the stack layout itself was already
+ * established in notes/07 and is unchanged here - only which fields this
+ * hook happens to read is new. */
 __attribute__((naked)) void Hook_BuildProjectionMatrix(void)
 {
     __asm__ __volatile__(
         "movl 8(%esp), %eax\n\t"   /* rawFov */
         "movl 12(%esp), %ecx\n\t"  /* Aspect */
+        "movl 16(%esp), %edx\n\t"  /* zn */
+        "pushl 20(%esp)\n\t"       /* zf (esp unchanged so far, offset still valid) */
+        "pushl %edx\n\t"
         "pushl %ecx\n\t"
         "pushl %eax\n\t"
         "call BPM_OnEntry_asm\n\t"
-        "addl $8, %esp\n\t"
+        "addl $16, %esp\n\t"
         "jmp *BPM_Trampoline_asm\n\t"
     );
 }
@@ -845,6 +1812,14 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
                     g_pEye1DepthStencil && g_pEye2DepthStencil;
 
     LogLine("Stereo ready = %d", g_stereoReady ? 1 : 0);
+
+    /* notes/28: additive VR submission path - only does anything if PSYVR_ENABLE_SUBMIT=1 was set
+     * (default off). Called after the existing monitor-composite surfaces are confirmed ready so
+     * the VR bridge's own eye buffers can be sized to match g_bbWidth/g_bbHeight exactly - runs on
+     * both initial CreateDevice AND every Reset (this same function handles both, unchanged). */
+    if (g_stereoReady) {
+        VRBridge_OnStereoSurfacesReady(pDevice, g_bbWidth, g_bbHeight);
+    }
 }
 
 /* Register that carries the per-draw clip-space composite matrix identified
@@ -883,7 +1858,43 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
  * magnitude" character (a real, reproducible, magnitude-scaling effect, but
  * the wrong effect) rather than clean lateral parallax. Fixed by patching
  * flat index 3, not 12. Re-verified per notes/18's controlled 0/3.25
- * screenshot comparison. */
+ * screenshot comparison.
+ *
+ * notes/24 UPGRADE (off-axis/asymmetric frustum, replacing the symmetric-
+ * frustum-reused-for-both-eyes approach above): the single-entry patch
+ * above is exact ONLY for a pure rigid translation (no re-aim) - it is kept
+ * conceptually (the math below reduces to exactly this when the new shear
+ * term is zero) but is now computed as part of a small 4-entry patch
+ * instead of one line, because a real off-axis frustum needs a SHEAR term
+ * too (zero disparity at a chosen finite convergence distance, instead of
+ * only at infinity), and a shear cannot be expressed as a single safe
+ * matrix entry the way the translation can (see the long comment in the
+ * Milestone 7 header at the top of this file for exactly why, and
+ * notes/24 Sec2 for the full derivation and the bug this session's own
+ * verification script caught before it ever reached the game).
+ *
+ * Derivation summary: model the per-eye adjustment as a single combined
+ * matrix X (translate by -d, then shear x by k*z) inserted between the
+ * (unknown, untraced) World*View matrix M and the known Proj:
+ *   WVP_new = M * X * Proj = (M*Proj) * (Proj^-1 * X * Proj) = WVP_recv * Y
+ * Y depends only on Proj (known: xScale, zn, zf) and X (known: d, k) - NOT
+ * on M - and works out to differ from the identity only in column 0, so:
+ *   WVP_new[r][0] = WVP_recv[r][0] + WVP_recv[r][2]*Y20 + WVP_recv[r][3]*Y30
+ *   WVP_new[r][c] = WVP_recv[r][c]                        for c != 0
+ * with (A = zf/(zn-zf), B = zn*zf/(zn-zf), both from the known projection):
+ *   Y20 = (-d) * xScale / B
+ *   Y30 = (-k - A*d/B) * xScale
+ * k itself is chosen so a point on the ORIGINAL (un-offset) camera axis at
+ * the convergence distance `focus` gets exactly zero disparity: k = -d/focus
+ * (derived by requiring x_clip == 0 at eye-space X=0, Z=-focus - RH eye
+ * space has negative Z in front of the camera). With k=0 (focus->infinity)
+ * this reduces EXACTLY to the old translation-only patch - verified both
+ * algebraically and numerically (debug_Y.py in the session's scratchpad).
+ *
+ * In the TRANSPOSED buffer this hook actually receives (upload[c][r] =
+ * WVP[r][c], same convention as notes/18), WVP's column 0 (r=0..3) maps to
+ * upload's ENTIRE ROW 0 - flat indices 0,1,2,3 - and WVP_recv[r][2]/[r][3]
+ * map to upload[2][r]/upload[3][r] - flat indices 8+r/12+r. */
 #define STEREO_WVP_REGISTER 6
 
 static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
@@ -898,16 +1909,53 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
 
         float patched[16];
         float xScale = g_projXScale;
+        float zn = g_projZNear;
+        float zf = g_projZFar;
         float sign = (g_stereoPhase == STEREO_PHASE_EYE1) ? -1.0f : 1.0f;
-        float d = STEREO_HALF_IPD * sign;
+        int eyeIdx = (g_stereoPhase == STEREO_PHASE_EYE1) ? 0 : 1;
+        float focus = g_focusDistance;
+        float d, k;
+        BOOL usingRealIPD = g_vrGeomValid;
+        BOOL usingRealShear;
+        float A = zf / (zn - zf);
+        float B = zn * zf / (zn - zf);
+        float Y20, Y30;
+        int r;
+
+        /* notes/32 (Task 1): use real OpenVR-sourced per-eye geometry when available
+         * (g_vrGeomValid, set by VRBridge_QueryRealGeometry once IVRSystem is ready), falling back
+         * to the pre-existing hardcoded STEREO_HALF_IPD/focus-distance estimate otherwise - so this
+         * path behaves identically to before this session whenever OpenVR isn't initialized (the
+         * VR-submit flag is off, or SteamVR isn't installed at all). */
+        if (usingRealIPD) {
+            d = g_realHalfIPD[eyeIdx];
+        } else {
+            d = STEREO_HALF_IPD * sign;
+        }
+        /* notes/24: k = -d/focus - the eye-space shear that puts zero disparity exactly at the
+         * convergence distance, see the derivation comment above STEREO_WVP_REGISTER. notes/32:
+         * when OpenVR reports a genuinely asymmetric frustum (g_realShearValid[eyeIdx]), use its
+         * real k = (l+r)/2 directly instead - this driver reports an exactly symmetric frustum
+         * (confirmed, notes/32 Sec1), so this branch is exercised only once real headset data with
+         * real per-eye asymmetry is available; until then this reduces to the line below. */
+        usingRealShear = usingRealIPD && g_realShearValid[eyeIdx];
+        if (usingRealShear) {
+            k = g_realShearK[eyeIdx];
+        } else {
+            k = (-d) / focus;
+        }
+        Y20 = (-d) * xScale / B;
+        Y30 = (-k - A * d / B) * xScale;
 
         memcpy(patched, pConstantData, sizeof(patched));
-        /* notes/18: index 3, NOT 12 - see the derivation comment above
-         * STEREO_WVP_REGISTER. The uploaded buffer is Transpose(WVP)
-         * (confirmed live, notes/17), so WVP's row3/col0 element (the one
-         * the closed-form correction targets) lives at flat index 3 in
-         * this already-transposed buffer, not index 12. */
-        patched[3] += (-d) * xScale;
+        /* notes/24: full off-axis column-0 patch - reduces exactly to
+         * notes/18's single-entry translation patch when Y20==0 (k==0).
+         * See the derivation comment above STEREO_WVP_REGISTER for the
+         * flat-index mapping (WVP column 0 -> upload row 0, flat 0..3;
+         * WVP[r][2]/[r][3] -> upload flat 8+r/12+r). */
+        for (r = 0; r < 4; r++) {
+            patched[r] = pConstantData[r] + pConstantData[8 + r] * Y20 + pConstantData[12 + r] * Y30;
+        }
 
         /* notes/21: exact per-eye draw-call counters, see comment on
          * g_svscfCountEye1/2 above. */
@@ -921,8 +1969,9 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
             static DWORD s_lastLog = 0;
             DWORD now = GetTickCount();
             if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
-                LogLine("SVSCF stereo-correct: reg=%u phase=%ld xScale=%.4f d=%.3f delta=%.4f",
-                        StartRegister, g_stereoPhase, xScale, d, (-d) * xScale);
+                LogLine("SVSCF stereo-correct: reg=%u phase=%ld xScale=%.4f d=%.3f focus=%.2f k=%.6f Y20=%.6f Y30=%.4f dSrc=%s kSrc=%s",
+                        StartRegister, g_stereoPhase, xScale, d, focus, k, Y20, Y30,
+                        usingRealIPD ? "openvr" : "hardcoded", usingRealShear ? "openvr" : "focus-est");
                 s_lastLog = now;
             }
         }
@@ -1064,7 +2113,33 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
      * origDirtyRgn log fields above to confirm post-relaunch whether the
      * game was ever actually passing non-NULL values here. hDestWindowOverride
      * is passed through unmodified (unrelated to dirty-rect behavior). */
-    return g_pRealPresent(This, NULL, NULL, hDestWindowOverride, NULL);
+    /* notes/31: time the REAL hardware Present call itself - unconditional (not gated on
+     * g_vrSubmitEnabled) so the SAME instrumented build can also measure a true VR-bridge-OFF
+     * baseline with the identical direct methodology, not just when the bridge is active. This was
+     * added after the per-span WaitGetPoses/GetRenderTargetData/readback-chain timing (above/below)
+     * came back summing to only ~1.3ms/frame while the aggregate regression looked far larger - the
+     * missing cost has to be somewhere, and the real hardware Present call (which blocks on the
+     * GPU/compositor/vsync) is the next most likely place a GPU-side cost could surface, even
+     * though none of our own CPU-side D3D9 calls measure as slow. This also turned out to be the
+     * only DIRECT (non-double-counted) per-real-frame counter in this file - see the g_frameCounter
+     * comment revision below. */
+    {
+        static VRBridgeTimingStat s_statRealPresent;
+        LARGE_INTEGER tP0, tP1;
+        HRESULT presentHr;
+        QueryPerformanceCounter(&tP0);
+        presentHr = g_pRealPresent(This, NULL, NULL, hDestWindowOverride, NULL);
+        QueryPerformanceCounter(&tP1);
+        VRBridge_RecordSpan(&s_statRealPresent, tP1.QuadPart - tP0.QuadPart, "RealPresentCall");
+
+        /* notes/31: WaitGetPoses moved here (see VRBridge_PumpPoses's own comment) - called right
+         * after the real hardware Present returns, i.e. at the very start of the next frame's work,
+         * so its ~25ms compositor wait can overlap with the game's own CPU-side simulation for that
+         * next frame instead of sitting entirely after CandB has already finished rendering it. */
+        VRBridge_PumpPoses();
+
+        return presentHr;
+    }
 }
 
 /* notes/21: the game runs Windowed=1 (confirmed in the CreateDevice log) -
@@ -1110,6 +2185,14 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(
     if (g_pRealDepthStencil)  { g_pRealDepthStencil->lpVtbl->Release(g_pRealDepthStencil); g_pRealDepthStencil = NULL; }
     if (g_pEye1DepthStencil)  { g_pEye1DepthStencil->lpVtbl->Release(g_pEye1DepthStencil); g_pEye1DepthStencil = NULL; }
     if (g_pEye2DepthStencil)  { g_pEye2DepthStencil->lpVtbl->Release(g_pEye2DepthStencil); g_pEye2DepthStencil = NULL; }
+
+    /* notes/31: same PresentationInterval override as Hook_CreateDevice - a Reset (e.g. Alt+Tab)
+     * could otherwise revert the desktop swap chain to vsync-on, re-introducing the redundant
+     * double-pacing against WaitGetPoses. */
+    if (g_vrSubmitEnabled && pPresentationParameters &&
+        pPresentationParameters->PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE) {
+        pPresentationParameters->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
 
     hr = g_pRealReset(This, pPresentationParameters);
 
@@ -1192,6 +2275,26 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
         LogLine("  WARNING: pPresentationParameters is NULL");
     }
 
+    /* notes/31: when the VR bridge is active, WaitGetPoses (called once/frame, required for
+     * IVRCompositor::Submit to succeed - see the VRBridge_OnFrameComposited comment) is ITSELF a
+     * real, measured ~25ms/frame blocking wait, paced by the OpenVR compositor - confirmed via
+     * direct A/B instrumentation (skipping it entirely restored the full non-bridge framerate, but
+     * broke Submit with VRCompositorError_DoNotHaveFocus, proving it's required, not optional). The
+     * game's own desktop-mirror swap chain requesting D3DPRESENT_INTERVAL_DEFAULT (vsync-on,
+     * confirmed via the log line above: PresentationInterval=0x0) stacks a SECOND, independent
+     * blocking wait (~14ms at this monitor's refresh rate) serially after WaitGetPoses's own wait -
+     * two separate frame-pacing mechanisms compounding, when only one (WaitGetPoses, the real VR
+     * timing source) should gate the frame. Forcing the desktop swap chain to
+     * D3DPRESENT_INTERVAL_IMMEDIATE removes the redundant second wait; the on-screen window may tear
+     * (irrelevant - it is only ever a monitor preview once a real HMD is presenting the actual view
+     * via Submit). Only applied when g_vrSubmitEnabled, so the non-VR path is completely unaffected. */
+    if (g_vrSubmitEnabled && pPresentationParameters &&
+        pPresentationParameters->PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE) {
+        LogLine("VRBridge: forcing PresentationInterval 0x%X -> D3DPRESENT_INTERVAL_IMMEDIATE (avoid double frame-pacing against WaitGetPoses)",
+                pPresentationParameters->PresentationInterval);
+        pPresentationParameters->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
+
     hr = g_pRealCreateDevice(This, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
                               pPresentationParameters, ppReturnedDeviceInterface);
 
@@ -1272,9 +2375,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         if (!InstallInlineHooks()) {
             LogLine("ERROR: InstallInlineHooks failed - stereo prototype disabled, proxy still runs as pure observer");
         }
+        VRBridge_ReadEnableFlag(); /* notes/28: PSYVR_ENABLE_SUBMIT=1 opts in, default off */
         break;
     case DLL_PROCESS_DETACH:
         LogLine("==== psychonautsvr proxy d3d9.dll: DLL_PROCESS_DETACH (pid=%lu) ====", GetCurrentProcessId());
+        VRBridge_Shutdown();
         if (g_hRealD3D9) {
             FreeLibrary(g_hRealD3D9);
             g_hRealD3D9 = NULL;
