@@ -1,13 +1,53 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 9: non-blocking double-buffered sync mechanism fixed and verified
-(1000-6000x faster than the old blocking helper, zero correctness regressions); a real architectural
-constraint found empirically (the game's plain D3D9 device cannot open a D3D9Ex-originated shared
-handle) and worked around with a fully-validated, fully non-blocking two-hop CPU-round-trip pipeline;
-that design wired into the real `proxy_d3d9.c` additively, gated off by default — compiles/links
-clean, NOT yet live-tested against the real game — full detail in notes/28)
+Last updated: 2026-08-17 (session 10: notes/28's real proxy_d3d9.c VR submission integration got its
+first live test — init succeeded but 1763+ frames produced ZERO Submit log evidence; investigated and
+found a REAL deadlock bug, not a missing log line, confirmed independently via SteamVR's own
+compositor-side log; fixed and rebuilt, NOT yet live-tested since the user's session was still running
+the old buggy DLL — full detail in notes/29)
 
-## Non-blocking sync mechanism + real proxy_d3d9.c VR submission integration (2026-08-17, session 9)
+## Submit deadlock bug found and fixed — real bug, not a missing log line (2026-08-17, session 10)
+
+**notes/28's VR submission integration was deployed into the user's real, running game (PID 23696,
+`PSYVR_ENABLE_SUBMIT=1`) for the first time — init succeeded cleanly (D3D9Ex/D3D11 devices, OpenVR,
+IVRCompositor, eye buffers, `g_vrBridgeReady=TRUE`) but across 1763+ frames there was zero log
+evidence the per-frame `Submit` call was ever reached.** Investigated and found a real, reproducible
+deadlock, not just a missing log statement. Full detail in
+`notes/29-submit-never-fired-frame-counter-deadlock-fix.md`. Headline findings:
+
+- **Root cause, found by reading the code**: `VRBridge_PumpEye`'s double-buffer slot selector
+  (`bCur`) was computed from `eye->hop1Count % 2` — but `hop1Count` only advances once a promotion
+  fully succeeds, which itself requires the OTHER buffer slot to already hold valid data, which
+  requires `bCur` to have alternated to it first, which requires `hop1Count` to have advanced first.
+  A closed circular dependency: `bCur` is permanently stuck at 0, `sysmemB[1]` is never written,
+  `hop1Count` never leaves 0, and the `Submit` gate (`hop1Count >= 2`) is never satisfied — Submit is
+  never even attempted, not just failing silently.
+- **Independently confirmed via SteamVR's own compositor-side log**, read-only, without touching the
+  live process: `D:\Program Files (x86)\Steam\logs\vrclient_Psychonauts.txt` ends at `"Capturing
+  Scene Focus"` with nothing after it, while the same log for the notes/27 POC that DID successfully
+  call Submit (`vrclient_submit_test_poc.txt`) shows `"Loading shaders"`/`"Created shared texture"`
+  appearing within 15ms of its own `"Capturing Scene Focus"` line — hard, compositor-side proof no
+  frame was ever received from the Psychonauts process, matching the code-level diagnosis exactly.
+- **This settles the task's own core ambiguity precisely**: NOT "Submit is probably working but
+  unverifiable" — a real bug prevented Submit from ever being reached at all. A genuinely missing
+  success-path log statement was also real and separately fixed (throttled ~1/sec per eye, matching
+  this codebase's existing convention), but it was not the cause of the silence — the deadlock was.
+- **Fixed**: added a proper per-call `frameCount` field to `VRBridgeEyeState`, incremented
+  unconditionally once per `VRBridge_PumpEye` call, and switched `bCur`/`bPrev` to derive from it
+  instead of `hop1Count` (which stays correctly used only for `aCur`/`aConsume`, Device A's own
+  buffer index) — matching the proven standalone POC's design exactly, where the loop's own external
+  iteration counter and `hop1Count` were always two separate variables. Build clean (same two
+  pre-existing, unrelated warnings as notes/28), `d3d9.dll`/`openvr_api.dll` rebuilt.
+- **NOT yet live-tested**: the user's live session (PID 23696) was still running the OLD buggy DLL
+  the entire time (no kill, no attach, no write to the loaded DLL) — **the user needs to close the
+  current session so the fixed DLL can be deployed and relaunched**, then check the live proxy log
+  for the new `"VRBridge: Submit(eye=%d) OK"` lines and cross-check
+  `vrclient_Psychonauts.txt` for the same shader/texture-creation signature the working POC showed.
+- **Not pushed to the mod repo this session, per explicit instruction** — unverified fix, needs a
+  real relaunch first; the same "don't push what hasn't been live-tested" practice this project has
+  followed since notes/22/23.
+
+## Prior milestone (non-blocking sync mechanism + real proxy_d3d9.c VR submission integration, still valid as background, 2026-08-17)
 
 **Picked up exactly where notes/27 left off — its own explicitly-flagged "this sync mechanism is a
 blocking stall, wrong for a per-frame hot path" caveat is now fixed and measured (1000-6000x faster),
