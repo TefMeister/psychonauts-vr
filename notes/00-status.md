@@ -1,7 +1,60 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 5: off-axis projection upgrade implemented + math-verified, NOT yet
-live-tested; VR-runtime-integration scoping written up)
+Last updated: 2026-08-17 (session 6: VR runtime bridge scaffolding — SteamVR confirmed NOT installed
+(blocker, needs user go-ahead), OpenVR SDK vendored, and the crux D3D9Ex→D3D11 shared-surface
+interop question PROVEN working with a standalone, game-free proof-of-concept)
+
+## VR runtime bridge scaffolding — crux shared-surface interop PROVEN, SteamVR install still needed (2026-08-17)
+
+**The single riskiest open technical question from the prior session's VR-runtime scoping — can a
+D3D9Ex shared surface actually be opened and read correctly from a separate D3D11 device — is now
+answered YES, with real, repeated, live evidence on this machine's actual GPU (NVIDIA GTX 1660
+SUPER).** A standalone, fully game-free proof-of-concept (`tools/vr-bridge/poc_shared_surface/`)
+creates a D3D9Ex shared render target, clears it to two different known colors in sequence, and
+reads back byte-exact pixel data from a completely separate `ID3D11Device` both times — 4/4 clean
+runs, zero mismatches, proving genuine live GPU-memory sharing rather than a one-shot copy. This is
+the specific mechanism the prior session identified as "the realistic bridging path" for getting
+Psychonauts' D3D9 rendering into OpenVR's D3D11-only `IVRCompositor::Submit` — now proven to
+actually work here, not just plausible on paper. Full detail in
+`notes/25-vr-runtime-bridge-scaffolding.md`.
+
+- **SteamVR is confirmed NOT installed on this machine** (checked three independent ways: running
+  processes, Steam library manifests, and a filesystem search across all local drives) — this is a
+  real blocker, flagged per this session's task rules as needing **the user's explicit go-ahead**
+  before installing, rather than installed unilaterally. A stale `openvrpaths.vrpath` registration
+  pointing at a since-removed `C:` drive Steam install was found and is a red herring, not evidence
+  of a usable install.
+- **OpenVR SDK vendored** (headers + win32 import lib + DLL only, ~13.6MB, via sparse shallow git
+  clone with the nested `.git` stripped afterward — plain vendored files, not a submodule) into
+  `tools/vr-bridge/openvr-sdk/`. A second small proof-of-concept
+  (`tools/vr-bridge/poc_openvr_init/`) confirms it links and calls correctly into the real
+  `openvr_api.dll` — `VR_InitInternal2` returns a clean, correct `VRInitError_Init_
+  InstallationNotFound` (error 100), exactly the expected result with SteamVR absent, and becomes a
+  ready-made smoke test for once SteamVR is installed. Two real header quirks in the upstream SDK
+  were found and worked around (dead/outdated `#if 0`-wrapped prototypes in `openvr_capi.h`; a
+  `bool`-typedef collision with `<stdbool.h>`) — documented in the POC source for future reuse in
+  the real integration.
+- **Null-driver (headset-free testing) configuration researched and documented in full**, refining
+  the prior session's writeup with exact, cross-checked file paths/keys and one durability fix not
+  previously known: the two `default.vrsettings` files get overwritten on every SteamVR update, but
+  a per-user override file (`<Steam>\userdata\<SteamID>\config\steamvr.vrsettings`) persists across
+  updates and is the right durable place for these settings. Still not executable this session
+  (needs SteamVR installed first).
+- **Honest scope boundary, by design**: this session deliberately proved the riskiest piece
+  standalone (no game, no debugger, no SteamVR) rather than jumping to game integration — wiring any
+  of this into `tools/proxy-d3d9/proxy_d3d9.c` is explicitly a separate, later piece of work. The
+  user's own game (PID 16672, later PID 21588 — apparently restarted by the user mid-session) was
+  running throughout and was never touched (no attach, no kill, no file write), consistent with this
+  project's standing safety rule.
+- **Concrete next steps**: (1) user decides whether to install SteamVR (~1-2GB, free, via Steam) —
+  once done, rerun `poc_openvr_init.exe` as a smoke test and follow §5 of notes/25 to enable the null
+  driver; (2) extend the shared-surface POC from one solid-color clear to a real per-frame pipeline
+  with non-stalling synchronization; (3) once both of those are solid, begin the actual
+  `proxy_d3d9.c` integration (create a second D3D9Ex+D3D11 device pair alongside the game's own
+  device, wire the existing per-eye render targets to shared surfaces, call `IVRCompositor::Submit`)
+  — still gated on the still-outstanding notes/24 in-game live-test of the off-axis projection
+  upgrade below, which remains the higher-priority correctness item for whenever the user's current
+  game session ends.
 
 ## Off-axis (asymmetric frustum) projection upgrade — implemented, math-verified, not yet live-tested (2026-08-17)
 
