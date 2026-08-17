@@ -1,12 +1,52 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 10: notes/28's real proxy_d3d9.c VR submission integration got its
-first live test — init succeeded but 1763+ frames produced ZERO Submit log evidence; investigated and
-found a REAL deadlock bug, not a missing log line, confirmed independently via SteamVR's own
-compositor-side log; fixed and rebuilt, NOT yet live-tested since the user's session was still running
-the old buggy DLL — full detail in notes/29)
+Last updated: 2026-08-17 (session 11: notes/29's deadlock fix LIVE-TESTED and CONFIRMED WORKING —
+Submit fires every frame, proven two independent ways (proxy log + SteamVR compositor log, agreeing
+to the millisecond). Also investigated the user's "noticeably laggier" report with real measured
+evidence: VR-bridge path costs ~8-9ms/frame (~119fps baseline -> ~57-60fps with the bridge on),
+confirmed NOT caused by Submit itself (cost is nearly identical whether Submit succeeds or not) —
+full detail in notes/30)
 
-## Submit deadlock bug found and fixed — real bug, not a missing log line (2026-08-17, session 10)
+## Submit fix live-verified working; VR-bridge performance cost measured with real evidence (2026-08-17, session 11)
+
+**notes/29's deadlock fix was deployed into the user's live game (PID 18284,
+`PSYVR_ENABLE_SUBMIT=1`) and is now confirmed, with hard evidence, to actually work.** Full detail in
+`notes/30-submit-live-confirmed-and-performance-cost-measured.md`. Headline findings:
+
+- **Submit confirmed firing every frame, two independent ways**: the live proxy log shows
+  `"VRBridge: Submit(eye=N) OK (frame=N)"` for both eyes continuously (100+ lines, frame counter
+  climbing steadily to 1637+ and counting), and SteamVR's own compositor log
+  (`vrclient_Psychonauts.txt`) shows `"Loading shaders"`/`"Created shared texture ... 640x480"` (6
+  lines, matching both eyes) appearing 23ms after `"Capturing Scene Focus"` — landing within 1ms of
+  the proxy log's own first `"Submit(eye=0) OK"` timestamp. The two independently-logged systems
+  agree to the millisecond; this is the same signature the notes/27 working POC showed and the
+  notes/29 broken session never reached.
+- **The user's "noticeably laggier" report investigated with real evidence, not dismissed.** Using
+  the pre-existing throttled `Present() hit - total frame #N` log line as a precise per-second fps
+  sample, six pre-VR-bridge sessions earlier in the same log file (~1.7 hours of real play) average a
+  stable ~119fps (8.4ms/frame); both the broken (notes/29) and fixed (this session) VR-bridge
+  sessions average ~57-60fps (16.8-17.6ms/frame) — a real, reproducible ~2x frame-time regression
+  (+8-9ms/frame), same machine, same log format.
+- **A genuinely useful negative result**: the broken session (Submit never succeeds, ever) and the
+  fixed session (Submit succeeds every frame) cost almost exactly the same — which rules OUT
+  `IVRCompositor::Submit` itself as the dominant cost, since it barely executes at all in the broken
+  session yet the frame-time hit is identical. The real cost is in code that runs unconditionally
+  every frame regardless of Submit's outcome: `WaitGetPoses` (once/frame) and the
+  `GetRenderTargetData`+`LockRect`+`memcpy`+`UpdateSurface` readback chain (twice/frame, one per eye).
+- **Honestly flagged, not overclaimed**: the available data cannot cleanly separate `WaitGetPoses`'s
+  cost from the readback chain's cost — both run unconditionally in both sessions equally, so
+  notes/28's "GetRenderTargetData is the likely culprit" hypothesis is partially supported, not
+  proven. A concrete, cheap next step (per-span `QueryPerformanceCounter` timing around each
+  candidate, guarded behind the existing flag) is specified in notes/30 §4 but not implemented —
+  needs a redeploy+relaunch this session deliberately didn't risk against the just-verified working
+  Submit path.
+- **No code changes this session** — `proxy_d3d9.c` unchanged from notes/29. A safe optimization
+  (e.g. every-other-frame readback) was considered but documented for a future session rather than
+  implemented, since it couldn't be verified without touching the live process again.
+- **Not pushed to the mod repo** — per this session's explicit instruction, the user must personally
+  test and approve before anything goes to `psychonauts-vr`.
+
+## Prior milestone (Submit deadlock bug found and fixed — real bug, not a missing log line, session 10, still valid as background)
 
 **notes/28's VR submission integration was deployed into the user's real, running game (PID 23696,
 `PSYVR_ENABLE_SUBMIT=1`) for the first time — init succeeded cleanly (D3D9Ex/D3D11 devices, OpenVR,
