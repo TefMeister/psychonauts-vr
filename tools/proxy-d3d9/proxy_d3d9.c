@@ -123,6 +123,55 @@
  * no shared resource left to contaminate. See notes/22-<name>.md for the full derivation
  * and live-log evidence.
  *
+ * Milestone 7 (this revision, notes/24): OFF-AXIS PROJECTION UPGRADE. Prior
+ * sessions' GPU-side correction (notes/14/18) already produced a genuinely
+ * PARALLEL (non-toe-in) per-eye camera - it inserts a rigid view-space
+ * translation between View and Proj, never re-aims either eye's look
+ * direction - but it reused the SAME symmetric projection frustum for both
+ * eyes, which is only correct for a stereo pair converged at INFINITE
+ * distance (zero disparity only for infinitely-far points; every finite-
+ * distance point shows disparity that only shrinks asymptotically, never
+ * reaching zero - see the analytic check in notes/24). Real VR SDKs
+ * (OpenVR/OpenXR) instead use an ASYMMETRIC/off-axis frustum per eye so
+ * that a chosen finite convergence/focal distance gets exactly zero
+ * disparity, with natural "crossed" parallax nearer than that and
+ * "uncrossed" parallax farther - this session adds that missing piece.
+ *
+ * The naive way to do this - patch the received per-draw WVP matrix's
+ * row2/col0 entry the same way the existing code patches row3/col0 for the
+ * translation - turns out to be WRONG in general (a real bug this session's
+ * own verification script caught before it ever reached the game): the
+ * translation-only patch is safe as a SINGLE matrix entry only because
+ * inserting a translation between the (unknown, untraced - see notes/14
+ * Sec1b) World*View matrix M and Proj can only ever perturb M's own row 3,
+ * and M's row 3 is the one row an AFFINE M is guaranteed to interact with
+ * Proj in a way that lands on exactly one WVP entry. A shear (needed for
+ * the off-axis frustum) has no such guarantee - it lives in M's row 2,
+ * which is NOT affine-constrained, so a single-entry patch silently assumes
+ * the camera happens to be axis-aligned at the world origin, and produces a
+ * WRONG (non-zero-at-convergence-distance) result for any other camera pose
+ * (confirmed both analytically and by a standalone Python check - see
+ * notes/24 Sec2 for the full derivation, the bug, and the fix). The
+ * general, camera-pose-agnostic fix derives the correction as a small
+ * matrix Y = Proj^-1 * (translate-then-shear) * Proj and applies
+ * WVP_new = WVP_received * Y - Y works out to differ from identity only in
+ * column 0, so the fix only ever touches 4 of the 16 received floats
+ * (row0..row3, column 0), each computed from the RECEIVED matrix's own
+ * row2/row3 values plus known projection constants (xScale, zn, zf) -
+ * still no need to trace/decompose M. Verified to reduce EXACTLY to the
+ * existing (already-shipped, working) translation-only patch when the new
+ * shear term is zero, and to produce exactly zero eye-to-eye disparity at
+ * the chosen convergence distance for arbitrary (tilted, off-origin) camera
+ * poses in the standalone verification script - see notes/24.
+ *
+ * The convergence/focal distance uses the camera's own live per-frame
+ * eye->at distance (already cached for the disabled CPU-side rewrite) - it
+ * naturally tracks wherever the game's own camera is looking each frame
+ * rather than a fixed guessed constant. The IPD half-offset remains the
+ * fixed STEREO_HALF_IPD constant, same as before (still no real headset to
+ * source real per-frame values from) - see the TODO comments below for
+ * exactly what a real OpenVR/OpenXR runtime would replace.
+ *
  * Vtable indices used (0-based, standard COM: slot 0/1/2 are always
  * QueryInterface/AddRef/Release):
  *   IDirect3D9::CreateDevice                    = slot 16
@@ -307,8 +356,48 @@ typedef struct { float x, y, z; } Vec3;
  * similarly-framed shot gives a ratio of ~0.0315; applied to ~195 world
  * units that is ~6.1 units full separation, i.e. ~3.05 half-offset - very
  * close to the task's own suggested "~6-7 world units" ballpark. 3.25 (6.5
- * full) was chosen as a round number in that range. */
+ * full) was chosen as a round number in that range.
+ *
+ * TODO(real headset): this is a placeholder for real per-eye IPD data. Once
+ * an OpenVR/OpenXR runtime is available, replace this fixed constant with
+ * the runtime's own reported IPD (e.g. OpenVR's
+ * IVRSystem::GetFloatTrackedDeviceProperty(..., Prop_UserIpdMeters_Float),
+ * converted into this game's world-unit scale via the same ~1 world unit =
+ * ~1cm calibration notes/15 cross-validated) - ideally sampled live each
+ * frame rather than cached once, since real headsets allow runtime IPD
+ * adjustment. */
 #define STEREO_HALF_IPD 3.25f
+
+/* notes/24: convergence/focal distance for the off-axis projection below -
+ * the one depth at which both eyes' projected image of the same point has
+ * ZERO disparity (see the derivation above Hook_SetVertexShaderConstantF).
+ * Deliberately NOT a fixed constant: g_focusDistance is recomputed every
+ * real frame from the camera's own live eye->at distance (BVM_OnEntry_asm
+ * already caches eye/at for the disabled CPU-side rewrite; this session
+ * reuses that same cached data) - a cheap, well-motivated choice for a
+ * third-person camera that already follows a target, so the convergence
+ * point naturally tracks wherever the game itself is already aiming each
+ * frame instead of needing a scene-specific guessed constant.
+ *
+ * TODO(real headset): a real OpenVR/OpenXR runtime does not need this
+ * estimation step at all - it supplies each eye's already-correct
+ * asymmetric projection matrix directly (IVRSystem::GetProjectionMatrix /
+ * xrLocateViews), computed from the actual physical display geometry, not
+ * a convergence-distance guess. This whole g_focusDistance mechanism only
+ * exists to approximate that in the no-headset case; once real per-eye
+ * projection matrices are available this file should consume THOSE
+ * directly instead of re-deriving an off-axis frustum from a fixed FOV +
+ * an estimated focal distance. */
+#define STEREO_FOCUS_DISTANCE_MIN 25.0f /* world units - clamp floor so a
+                                            close `at` point never produces
+                                            a near-zero/negative convergence
+                                            distance and an extreme shear */
+#define STEREO_FOCUS_DISTANCE_DEFAULT 200.0f /* fallback before the first
+                                                 real BVM cache of the
+                                                 session - matches the title
+                                                 screen's own observed
+                                                 ~190-200 unit eye->at
+                                                 framing (notes/08/09) */
 
 static IDirect3DDevice9 *g_pDevice = NULL;
 static IDirect3DSurface9 *g_pRealBackBuffer = NULL;
@@ -330,6 +419,12 @@ static BOOL g_stereoReady = FALSE; /* device + both offscreen color+depth surfac
 static BOOL g_frameCamCached = FALSE;
 static Vec3 g_baseEye, g_baseAt, g_baseUp, g_rightVec;
 static void *g_camPOutMatrix = NULL;
+/* notes/24: off-axis convergence/focal distance, recomputed each real frame
+ * from the live eye->at distance - see the comment on
+ * STEREO_FOCUS_DISTANCE_MIN/DEFAULT above for the reasoning. Starts at the
+ * DEFAULT fallback so the very first correction (before BVM_OnEntry_asm's
+ * first hit of the session) uses a sane value rather than 0. */
+static float g_focusDistance = STEREO_FOCUS_DISTANCE_DEFAULT;
 
 /* notes/14: the raw view-matrix rewrite from notes/13 never reached the GPU
  * because it happens after that frame's ONE shader-constant upload already
@@ -357,6 +452,15 @@ static void *g_camPOutMatrix = NULL;
 #define ADDR_FOV_MUL_CONST ((float  *)0x00793444u) /* ...then multiply by this (notes/07 disasm) */
 static float g_projXScale = 0.0f;
 static BOOL g_projXScaleValid = FALSE;
+/* notes/24: zn/zf, needed (alongside xScale) for the off-axis correction's
+ * A=zf/(zn-zf) and B=zn*zf/(zn-zf) terms - see the derivation above
+ * Hook_SetVertexShaderConstantF. BuildProjectionMatrix's signature
+ * (pOutMatrix, rawFov, Aspect, zn, zf) was already established in notes/07;
+ * only rawFov/Aspect were read before this session. Captured the same way
+ * (from entry ARGUMENTS, not the output buffer - see the large comment
+ * block above g_projXScale for why the output buffer is unsafe to cache). */
+static float g_projZNear = 10.0f;   /* live-confirmed default (notes/06) */
+static float g_projZFar = 50000.0f; /* live-confirmed default (notes/06) */
 
 /* Trampoline entry points (allocated executable memory, filled in by
  * InstallInlineHooks). Calling through these runs the REAL, unmodified
@@ -421,6 +525,17 @@ void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
         g_rightVec = Vec3Normalize(Vec3Cross(fwd, g_baseUp));
     }
 
+    /* notes/24: off-axis convergence distance for THIS frame - see the
+     * comment on STEREO_FOCUS_DISTANCE_MIN/DEFAULT and the top-of-file
+     * Milestone 7 note for the full reasoning. Uses the real eye->at
+     * distance, clamped away from zero/near-zero so a degenerate close
+     * `at` point can't produce an extreme shear. */
+    {
+        Vec3 eyeToAt = Vec3Sub(g_baseAt, g_baseEye);
+        float dist = sqrtf(eyeToAt.x * eyeToAt.x + eyeToAt.y * eyeToAt.y + eyeToAt.z * eyeToAt.z);
+        g_focusDistance = (dist > STEREO_FOCUS_DISTANCE_MIN) ? dist : STEREO_FOCUS_DISTANCE_MIN;
+    }
+
     g_frameCamCached = TRUE;
 
     {
@@ -444,8 +559,8 @@ void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
  * disassembled in notes/07 (fovy = rawFov/ADDR_FOV_DIV_CONST*ADDR_FOV_MUL_CONST,
  * then xScale = cot(fovy/2)/Aspect) - see the comment on g_projXScale above
  * for why this replaced an earlier pointer-caching approach. */
-void __cdecl BPM_OnEntry_asm(float rawFov, float aspect) asm("BPM_OnEntry_asm");
-void __cdecl BPM_OnEntry_asm(float rawFov, float aspect)
+void __cdecl BPM_OnEntry_asm(float rawFov, float aspect, float zn, float zf) asm("BPM_OnEntry_asm");
+void __cdecl BPM_OnEntry_asm(float rawFov, float aspect, float zn, float zf)
 {
     double divConst = *ADDR_FOV_DIV_CONST;
     float mulConst = *ADDR_FOV_MUL_CONST;
@@ -459,12 +574,19 @@ void __cdecl BPM_OnEntry_asm(float rawFov, float aspect)
     g_projXScale = 1.0f / (tanf(fovy * 0.5f) * aspect);
     g_projXScaleValid = TRUE;
 
+    /* notes/24: zn/zf for the off-axis A/B terms - sanity-guarded the same
+     * way as fovy above rather than trusting arbitrary stack contents. */
+    if (zn > 0.0f && zf > zn) {
+        g_projZNear = zn;
+        g_projZFar = zf;
+    }
+
     {
         static DWORD s_lastLog = 0;
         DWORD now = GetTickCount();
         if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
-            LogLine("BPM cache SET: rawFov=%.3f aspect=%.4f fovy=%.4f xScale=%.4f",
-                    rawFov, aspect, fovy, g_projXScale);
+            LogLine("BPM cache SET: rawFov=%.3f aspect=%.4f fovy=%.4f xScale=%.4f zn=%.3f zf=%.3f",
+                    rawFov, aspect, fovy, g_projXScale, g_projZNear, g_projZFar);
             s_lastLog = now;
         }
     }
@@ -685,19 +807,24 @@ __attribute__((naked)) void Hook_BuildViewMatrix(void)
 }
 
 /* Same tail-jmp shape as Hook_BuildViewMatrix, adapted for
- * BuildProjectionMatrix(pOutMatrix, rawFov, Aspect, zn, zf) - only rawFov
- * and Aspect (both raw 4-byte float stack args - pushed/read as plain
- * 32-bit values here, exactly how __cdecl already represents them on the
- * stack) are needed. */
+ * BuildProjectionMatrix(pOutMatrix, rawFov, Aspect, zn, zf) - all four raw
+ * 4-byte float/stack args are read exactly as __cdecl already represents
+ * them on the stack. notes/24 extends this to also read zn/zf (previously
+ * only rawFov/Aspect were needed); the stack layout itself was already
+ * established in notes/07 and is unchanged here - only which fields this
+ * hook happens to read is new. */
 __attribute__((naked)) void Hook_BuildProjectionMatrix(void)
 {
     __asm__ __volatile__(
         "movl 8(%esp), %eax\n\t"   /* rawFov */
         "movl 12(%esp), %ecx\n\t"  /* Aspect */
+        "movl 16(%esp), %edx\n\t"  /* zn */
+        "pushl 20(%esp)\n\t"       /* zf (esp unchanged so far, offset still valid) */
+        "pushl %edx\n\t"
         "pushl %ecx\n\t"
         "pushl %eax\n\t"
         "call BPM_OnEntry_asm\n\t"
-        "addl $8, %esp\n\t"
+        "addl $16, %esp\n\t"
         "jmp *BPM_Trampoline_asm\n\t"
     );
 }
@@ -883,7 +1010,43 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
  * magnitude" character (a real, reproducible, magnitude-scaling effect, but
  * the wrong effect) rather than clean lateral parallax. Fixed by patching
  * flat index 3, not 12. Re-verified per notes/18's controlled 0/3.25
- * screenshot comparison. */
+ * screenshot comparison.
+ *
+ * notes/24 UPGRADE (off-axis/asymmetric frustum, replacing the symmetric-
+ * frustum-reused-for-both-eyes approach above): the single-entry patch
+ * above is exact ONLY for a pure rigid translation (no re-aim) - it is kept
+ * conceptually (the math below reduces to exactly this when the new shear
+ * term is zero) but is now computed as part of a small 4-entry patch
+ * instead of one line, because a real off-axis frustum needs a SHEAR term
+ * too (zero disparity at a chosen finite convergence distance, instead of
+ * only at infinity), and a shear cannot be expressed as a single safe
+ * matrix entry the way the translation can (see the long comment in the
+ * Milestone 7 header at the top of this file for exactly why, and
+ * notes/24 Sec2 for the full derivation and the bug this session's own
+ * verification script caught before it ever reached the game).
+ *
+ * Derivation summary: model the per-eye adjustment as a single combined
+ * matrix X (translate by -d, then shear x by k*z) inserted between the
+ * (unknown, untraced) World*View matrix M and the known Proj:
+ *   WVP_new = M * X * Proj = (M*Proj) * (Proj^-1 * X * Proj) = WVP_recv * Y
+ * Y depends only on Proj (known: xScale, zn, zf) and X (known: d, k) - NOT
+ * on M - and works out to differ from the identity only in column 0, so:
+ *   WVP_new[r][0] = WVP_recv[r][0] + WVP_recv[r][2]*Y20 + WVP_recv[r][3]*Y30
+ *   WVP_new[r][c] = WVP_recv[r][c]                        for c != 0
+ * with (A = zf/(zn-zf), B = zn*zf/(zn-zf), both from the known projection):
+ *   Y20 = (-d) * xScale / B
+ *   Y30 = (-k - A*d/B) * xScale
+ * k itself is chosen so a point on the ORIGINAL (un-offset) camera axis at
+ * the convergence distance `focus` gets exactly zero disparity: k = -d/focus
+ * (derived by requiring x_clip == 0 at eye-space X=0, Z=-focus - RH eye
+ * space has negative Z in front of the camera). With k=0 (focus->infinity)
+ * this reduces EXACTLY to the old translation-only patch - verified both
+ * algebraically and numerically (debug_Y.py in the session's scratchpad).
+ *
+ * In the TRANSPOSED buffer this hook actually receives (upload[c][r] =
+ * WVP[r][c], same convention as notes/18), WVP's column 0 (r=0..3) maps to
+ * upload's ENTIRE ROW 0 - flat indices 0,1,2,3 - and WVP_recv[r][2]/[r][3]
+ * map to upload[2][r]/upload[3][r] - flat indices 8+r/12+r. */
 #define STEREO_WVP_REGISTER 6
 
 static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
@@ -898,16 +1061,30 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
 
         float patched[16];
         float xScale = g_projXScale;
+        float zn = g_projZNear;
+        float zf = g_projZFar;
         float sign = (g_stereoPhase == STEREO_PHASE_EYE1) ? -1.0f : 1.0f;
         float d = STEREO_HALF_IPD * sign;
+        float focus = g_focusDistance;
+        /* notes/24: k = -d/focus - the eye-space shear that puts zero
+         * disparity exactly at the convergence distance, see the
+         * derivation comment above STEREO_WVP_REGISTER. */
+        float k = (-d) / focus;
+        float A = zf / (zn - zf);
+        float B = zn * zf / (zn - zf);
+        float Y20 = (-d) * xScale / B;
+        float Y30 = (-k - A * d / B) * xScale;
+        int r;
 
         memcpy(patched, pConstantData, sizeof(patched));
-        /* notes/18: index 3, NOT 12 - see the derivation comment above
-         * STEREO_WVP_REGISTER. The uploaded buffer is Transpose(WVP)
-         * (confirmed live, notes/17), so WVP's row3/col0 element (the one
-         * the closed-form correction targets) lives at flat index 3 in
-         * this already-transposed buffer, not index 12. */
-        patched[3] += (-d) * xScale;
+        /* notes/24: full off-axis column-0 patch - reduces exactly to
+         * notes/18's single-entry translation patch when Y20==0 (k==0).
+         * See the derivation comment above STEREO_WVP_REGISTER for the
+         * flat-index mapping (WVP column 0 -> upload row 0, flat 0..3;
+         * WVP[r][2]/[r][3] -> upload flat 8+r/12+r). */
+        for (r = 0; r < 4; r++) {
+            patched[r] = pConstantData[r] + pConstantData[8 + r] * Y20 + pConstantData[12 + r] * Y30;
+        }
 
         /* notes/21: exact per-eye draw-call counters, see comment on
          * g_svscfCountEye1/2 above. */
@@ -921,8 +1098,8 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
             static DWORD s_lastLog = 0;
             DWORD now = GetTickCount();
             if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
-                LogLine("SVSCF stereo-correct: reg=%u phase=%ld xScale=%.4f d=%.3f delta=%.4f",
-                        StartRegister, g_stereoPhase, xScale, d, (-d) * xScale);
+                LogLine("SVSCF stereo-correct: reg=%u phase=%ld xScale=%.4f d=%.3f focus=%.2f k=%.6f Y20=%.6f Y30=%.4f",
+                        StartRegister, g_stereoPhase, xScale, d, focus, k, Y20, Y30);
                 s_lastLog = now;
             }
         }
