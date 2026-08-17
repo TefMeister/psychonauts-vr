@@ -1,8 +1,33 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 4: MILESTONE — real-gameplay stereo rendering confirmed working, user-verified)
+Last updated: 2026-08-17 (session 5: off-axis projection upgrade implemented + math-verified, NOT yet
+live-tested; VR-runtime-integration scoping written up)
 
-## MILESTONE: real-gameplay stereo rendering works, confirmed by the user (2026-08-17)
+## Off-axis (asymmetric frustum) projection upgrade — implemented, math-verified, not yet live-tested (2026-08-17)
+
+**The stereo correction was upgraded from a parallel-axis offset with a symmetric (shared) projection
+frustum — correct only for zero disparity at infinite distance — to a genuine off-axis/asymmetric
+frustum with zero disparity at a chosen finite convergence distance, the technique real VR SDKs use
+internally.** The user's own game (PID 9188) was running for the entire session, so the usual isolated
+in-game screenshot self-test could not be performed; instead the math was verified three independent
+ways with standalone (game-free) scripts, one of which caught and drove the fix of a real bug (a naive
+single-matrix-entry patch that only worked for a trivial axis-aligned-at-origin test camera) before it
+ever reached compiled code. Build is clean; **not pushed to the mod repo** (unverified in-game, per this
+project's own standing practice — see notes/22 for precedent). Full derivation, the bug, and the fix are
+in `notes/24-off-axis-projection-upgrade-and-vr-runtime-scoping.md`.
+
+- **Next step for a future session**: once the user closes the current game session, copy the new DLL
+  in, relaunch, and re-run the same 0/3.25/60-unit controlled screenshot comparison notes/14/18 used,
+  plus an off-axis-specific check (log-compare the new `Y20`/`Y30`/`focus` fields against the live
+  `BVM cache SET` eye/at data). If it holds up, push to the mod repo then.
+- **VR runtime integration (OpenVR/OpenXR) scoped, not implemented**, per this session's task: confirmed
+  (via research, not assumption) that modern OpenVR has **no D3D9 support at all** in
+  `IVRCompositor::Submit` — a real, concrete obstacle, not a hypothetical one. The realistic path is a
+  D3D9Ex shared-surface bridge into a second, minimal D3D11 device purely for compositor submission.
+  SteamVR's null driver is confirmed to support genuinely headset-free frame-submission-path testing.
+  Full writeup in notes/24 §2.
+
+## Prior milestone (real-gameplay stereo rendering confirmed working, user-verified, 2026-08-17)
 
 **The user played real, player-controlled gameplay against the notes/22 (shared-depth-stencil-fix)
 build and confirmed, in their own words: "the game is running absolutely fine on both sides."** This
