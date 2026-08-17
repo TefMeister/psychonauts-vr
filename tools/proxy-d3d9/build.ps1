@@ -29,13 +29,29 @@ $src = Join-Path $PSScriptRoot "proxy_d3d9.c"
 $def = Join-Path $PSScriptRoot "proxy_d3d9.def"
 $out = Join-Path $PSScriptRoot "d3d9.dll"
 
+# notes/28: VR submission path (additive, off by default via PSYVR_ENABLE_SUBMIT) needs d3d11/dxgi
+# (linked normally - no name collision with this DLL) and the vendored OpenVR import lib. Real
+# system d3d9.dll's Direct3DCreate9Ex is resolved dynamically via GetProcAddress at runtime (see
+# VRBridge_Init), NOT linked here, to avoid any risk of the loader resolving a "-ld3d9" import back
+# to this DLL itself when loaded into the game process as d3d9.dll.
+$sdkRoot = Join-Path $PSScriptRoot "..\vr-bridge\openvr-sdk"
+$importLib = Join-Path $sdkRoot "lib\win32\openvr_api.lib"
+$runtimeDll = Join-Path $sdkRoot "bin\win32\openvr_api.dll"
+if (-not (Test-Path $importLib)) {
+    throw "OpenVR import lib not found at $importLib - is tools/vr-bridge/openvr-sdk vendored?"
+}
+
 & $clang --target=i686-w64-mingw32 -shared -O2 -municode `
-    -o $out $src $def `
-    -lgdi32 -luser32 -lkernel32
+    -o $out $src $def $importLib `
+    -ld3d11 -ldxgi -lgdi32 -luser32 -lkernel32
 
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE"
 }
 
+Copy-Item -Force $runtimeDll (Join-Path $PSScriptRoot "openvr_api.dll")
+
 Write-Host "Built: $out"
+Write-Host "Copied openvr_api.dll alongside it (required at runtime if PSYVR_ENABLE_SUBMIT=1 -"
+Write-Host "both files must be deployed together into the game directory for the VR path to work)."
 Get-Item $out | Select-Object Name, Length, LastWriteTime

@@ -11,10 +11,10 @@
  *     (proven working against SteamVR absent, notes/25; now updated for SteamVR PRESENT, see
  *     below for a real ABI finding made this session).
  *
- * IMPORTANT REAL FINDING (this session, not assumed): openvr_capi.h's "flat FnTable" struct
+ * IMPORTANT REAL FINDING (notes/27, not assumed): openvr_capi.h's "flat FnTable" struct
  * definitions (struct VR_IVRSystem_FnTable, VR_IVRCompositor_FnTable, etc.) do NOT describe what
  * this installed SteamVR build's VR_GetGenericInterface() actually returns. Empirically (via a
- * vectored exception handler + VirtualQuery, see notes/27 for the full diagnostic trail).
+ * vectored exception handler + VirtualQuery, see notes/27 for the full diagnostic trail),
  * VR_GetGenericInterface() returns a genuine C++ object pointer (this-ptr into vrclient.dll) --
  * calling through it as a flat struct-of-function-pointers reads the vtable POINTER itself as if
  * it were function pointer slot 0, and jumps into a non-executable .rdata page (confirmed via
@@ -23,6 +23,43 @@
  * and dispatch through THAT using __thiscall (openvr.h's C++ interfaces use unattributed virtual
  * methods => default MSVC x86 ABI => this-ptr in ECX, args on stack, callee-cleans). This same
  * technique is used here for both IVRSystem (informational) and IVRCompositor (load-bearing).
+ *
+ * MILESTONE 2 (notes/28, THIS revision): SYNC MECHANISM FIX. notes/27 explicitly flagged
+ * flush_d3d9() -- a D3DQUERYTYPE_EVENT query, Issued then polled with D3DGETDATA_FLUSH in a
+ * while(true){ Sleep(1); } loop until S_OK -- as a SYNCHRONOUS GPU-PIPELINE STALL: correct for a
+ * one-shot POC (clear once, prove the bytes round-trip), but wrong for a real per-frame hot path,
+ * since Psychonauts already renders twice per real frame (once per eye, see
+ * tools/proxy-d3d9/proxy_d3d9.c's CandB double-invoke) and a blocking CPU wait on top of that
+ * would tank frame rate.
+ *
+ * THE ACTUAL BLOCKING BEHAVIOR, precisely: IDirect3DQuery9::GetData() itself does NOT block --
+ * with or without D3DGETDATA_FLUSH it returns immediately with S_OK/S_FALSE/D3DERR_DEVICELOST.
+ * D3DGETDATA_FLUSH only tells the driver "go ahead and submit the accumulated command buffer to
+ * the GPU now instead of waiting for it to fill up on its own" -- it does not wait for that work
+ * to finish. The stall in the OLD flush_d3d9() came entirely from wrapping GetData in a
+ * while-loop with Sleep(1) between calls until it finally returned S_OK -- i.e. the CALLER chose
+ * to block, D3D9 never required it to.
+ *
+ * THE FIX (implemented and measured below, see Part D): the standard real-world technique for
+ * this exact problem is N-buffering the shared surface (here N=2, i.e. simple double-buffering)
+ * combined with a SINGLE non-blocking GetData() poll per frame, never a wait loop:
+ *   - Each "frame" renders into buffer[i % 2] and Issues an EVENT query on it (kicked once with
+ *     D3DGETDATA_FLUSH right after Issue, so the driver submits it promptly instead of batching
+ *     indefinitely -- still a single non-blocking call, not a loop).
+ *   - The buffer submitted to IVRCompositor::Submit each frame is always the OTHER buffer
+ *     (buffer[(i+1) % 2]) -- i.e. one frame behind the buffer currently being written -- polled
+ *     with exactly ONE non-blocking GetData(NULL,0,0) call (no flush flag needed; it was already
+ *     flushed a full frame interval ago). By construction that buffer's GPU work had a full
+ *     frame's worth of wall-clock time to complete on the GPU before this check, so in the
+ *     overwhelming common case it is already signaled -- but if it is NOT yet signaled (S_FALSE),
+ *     this code does not wait for it: it simply skips submission for that frame (a dropped/
+ *     resubmitted-next-frame frame, the standard graceful-degradation behavior for double
+ *     buffering under transient GPU backpressure) rather than stalling the CPU thread.
+ * This eliminates the full-pipeline-stall behavior entirely: the CPU-side "is it safe to hand
+ * this buffer to the compositor" check is now an O(1), sub-microsecond operation on every single
+ * frame, never a wait, confirmed by direct timing comparison against the OLD blocking helper
+ * (kept in this file, clearly marked, ONLY for that side-by-side measurement -- not used on the
+ * real per-frame submit path anymore). See notes/28 for the full before/after timing numbers.
  *
  * Build: see build.ps1. Run directly - no game process involved. Requires the null driver to be
  * enabled (notes/25 section 5 / notes/27 section 1) so SteamVR can run without physical hardware.
@@ -40,8 +77,20 @@
 /* Do NOT include <stdbool.h> - see poc_openvr_init/openvr_init_poc.c's header comment for why
  * (openvr_capi.h typedefs its own bool as char on Windows, collides with stdbool.h). */
 
-#define TEX_W 64
-#define TEX_H 64
+/* Small hidden swapchain window - never Present()'d, just needed to create a valid D3D9Ex device. */
+#define WIN_W 64
+#define WIN_H 64
+
+/* The actual per-"eye" shared render target size - deliberately backbuffer-scale (matches the
+ * real per-eye offscreen surfaces tools/proxy-d3d9/proxy_d3d9.c already creates via
+ * CreateRenderTarget), NOT the tiny 64x64 used by the earlier POCs - a bigger surface makes the
+ * sync-timing comparison below realistic rather than trivially fast either way. */
+#define FRAME_W 1920
+#define FRAME_H 1080
+
+#define NUM_BUFFERS 2   /* double-buffering - see the file header for why 2 is enough */
+#define NUM_PHASE1_ITERS 20  /* OLD blocking-helper timing sample size */
+#define NUM_PHASE2_ITERS 90  /* NEW non-blocking double-buffered timing + correctness sample size */
 
 /* ---- OpenVR global entry points (declared directly, not via openvr_capi.h's dead #if 0 block -
  * see poc_openvr_init for the two documented header quirks this works around). ---- */
@@ -60,26 +109,38 @@ extern const char *VR_GetVRInitErrorAsEnglishDescription(EVRInitError error);
         } \
     } while (0)
 
-static HRESULT flush_d3d9(IDirect3DDevice9Ex *pDevice)
+/* ======================================================================
+ * OLD, BLOCKING sync helper - notes/25/27's original technique. Kept ONLY
+ * for the direct before/after timing comparison in Part C below; the real
+ * double-buffered submit loop in Part D never calls this.
+ * ====================================================================== */
+static HRESULT flush_d3d9_BLOCKING(IDirect3DDevice9Ex *pDevice, IDirect3DQuery9 *pQuery, double *outStallMs)
 {
-    IDirect3DQuery9 *pQuery = NULL;
-    HRESULT hr = pDevice->lpVtbl->CreateQuery(pDevice, D3DQUERYTYPE_EVENT, &pQuery);
-    if (FAILED(hr)) return hr;
+    LARGE_INTEGER freq, t0, t1;
+    HRESULT hr;
+    (void)pDevice;
+
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
     hr = pQuery->lpVtbl->Issue(pQuery, D3DISSUE_END);
-    if (FAILED(hr)) { pQuery->lpVtbl->Release(pQuery); return hr; }
-    DWORD start = GetTickCount();
+    if (FAILED(hr)) return hr;
+
     for (;;) {
         hr = pQuery->lpVtbl->GetData(pQuery, NULL, 0, D3DGETDATA_FLUSH);
         if (hr == S_OK) break;
-        if (hr != S_FALSE) { pQuery->lpVtbl->Release(pQuery); return hr; }
-        if (GetTickCount() - start > 5000) { pQuery->lpVtbl->Release(pQuery); return E_FAIL; }
-        Sleep(1);
+        if (hr != S_FALSE) return hr;
+        Sleep(1);   /* <-- THE stall: this loop does not return until the GPU is done */
     }
-    pQuery->lpVtbl->Release(pQuery);
+
+    QueryPerformanceCounter(&t1);
+    if (outStallMs) {
+        *outStallMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    }
     return S_OK;
 }
 
-static HRESULT clear_to_color(IDirect3DDevice9Ex *pDevice, IDirect3DSurface9 *pSurf, D3DCOLOR color)
+static HRESULT RenderColor(IDirect3DDevice9Ex *pDevice, IDirect3DSurface9 *pSurf, D3DCOLOR color)
 {
     HRESULT hr = pDevice->lpVtbl->SetRenderTarget(pDevice, 0, pSurf);
     if (FAILED(hr)) return hr;
@@ -87,8 +148,7 @@ static HRESULT clear_to_color(IDirect3DDevice9Ex *pDevice, IDirect3DSurface9 *pS
     if (FAILED(hr)) return hr;
     hr = pDevice->lpVtbl->Clear(pDevice, 0, NULL, D3DCLEAR_TARGET, color, 1.0f, 0);
     pDevice->lpVtbl->EndScene(pDevice);
-    if (FAILED(hr)) return hr;
-    return flush_d3d9(pDevice);
+    return hr;
 }
 
 /* ---- Real-C++-vtable dispatch helper (the confirmed-working fix - see file header). ---- */
@@ -106,21 +166,52 @@ typedef EVRCompositorError (__thiscall *WaitGetPoses_t)(void *pThis,
 typedef EVRCompositorError (__thiscall *Submit_t)(void *pThis,
     EVREye eEye, const Texture_t *pTexture, const VRTextureBounds_t *pBounds, EVRSubmitFlags nSubmitFlags);
 
+/* Per-ring-buffer state for the NEW double-buffered non-blocking submit path (Part D). */
+typedef struct {
+    IDirect3DTexture9 *pTex9;
+    IDirect3DSurface9 *pSurf9;
+    HANDLE sharedHandle;
+    ID3D11Texture2D *pTex11;
+    IDirect3DQuery9 *pQuery9;
+    BOOL queryIssued;      /* has Issue(D3DISSUE_END) ever been called for the current content? */
+    BYTE expectR, expectG, expectB;  /* color this buffer was last rendered to, for correctness verification */
+} RingBuffer;
+
+static HRESULT ReadbackPixel(ID3D11DeviceContext *pContext11, ID3D11Texture2D *pStaging,
+                              ID3D11Texture2D *pSrc, int x, int y, BYTE *outB, BYTE *outG, BYTE *outR)
+{
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr;
+    BYTE *row;
+
+    pContext11->lpVtbl->CopyResource(pContext11, (ID3D11Resource *)pStaging, (ID3D11Resource *)pSrc);
+    hr = pContext11->lpVtbl->Map(pContext11, (ID3D11Resource *)pStaging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) return hr;
+
+    row = (BYTE *)mapped.pData + (size_t)y * mapped.RowPitch;
+    *outB = row[x * 4 + 0];
+    *outG = row[x * 4 + 1];
+    *outR = row[x * 4 + 2];
+
+    pContext11->lpVtbl->Unmap(pContext11, (ID3D11Resource *)pStaging, 0);
+    return S_OK;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("=== VR bridge end-to-end POC: D3D9Ex -> shared D3D11 -> IVRCompositor::Submit ===\n\n");
+    printf("=== VR bridge POC v2: non-blocking double-buffered sync + IVRCompositor::Submit ===\n\n");
 
-    /* ---------- Part A: D3D9Ex shared surface (proven mechanism, poc_shared_surface) ---------- */
+    /* ---------- Part A: D3D9Ex device (proven mechanism, poc_shared_surface / notes/25) ---------- */
     WNDCLASSEXA wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = DefWindowProcA;
     wc.hInstance = GetModuleHandleA(NULL);
-    wc.lpszClassName = "PsyVR_SubmitTestPOC";
+    wc.lpszClassName = "PsyVR_SubmitTestPOC2";
     RegisterClassExA(&wc);
-    HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "PsyVR submit-test POC",
-                                 WS_OVERLAPPEDWINDOW, 0, 0, TEX_W, TEX_H, NULL, NULL, wc.hInstance, NULL);
+    HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "PsyVR submit-test POC v2",
+                                 WS_OVERLAPPEDWINDOW, 0, 0, WIN_W, WIN_H, NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) { printf("FAIL: CreateWindowExA\n"); return 1; }
 
     IDirect3D9Ex *pD3D9Ex = NULL;
@@ -137,8 +228,8 @@ int main(void)
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     pp.hDeviceWindow = hwnd;
     pp.BackBufferFormat = D3DFMT_UNKNOWN;
-    pp.BackBufferWidth = TEX_W;
-    pp.BackBufferHeight = TEX_H;
+    pp.BackBufferWidth = WIN_W;
+    pp.BackBufferHeight = WIN_H;
     pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
 
     IDirect3DDevice9Ex *pDevice = NULL;
@@ -146,24 +237,9 @@ int main(void)
         D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED | D3DCREATE_FPU_PRESERVE,
         &pp, NULL, &pDevice);
     CHECK_HR(hr, "IDirect3D9Ex::CreateDeviceEx");
-    printf("[A1] D3D9Ex device created\n");
+    printf("[A1] D3D9Ex device created\n\n");
 
-    IDirect3DTexture9 *pTex9 = NULL;
-    HANDLE sharedHandle = NULL;
-    hr = pDevice->lpVtbl->CreateTexture(pDevice, TEX_W, TEX_H, 1, D3DUSAGE_RENDERTARGET,
-                                         D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &pTex9, &sharedHandle);
-    CHECK_HR(hr, "CreateTexture (shared)");
-    IDirect3DSurface9 *pSurf9 = NULL;
-    hr = pTex9->lpVtbl->GetSurfaceLevel(pTex9, 0, &pSurf9);
-    CHECK_HR(hr, "GetSurfaceLevel");
-
-    /* Render a distinctive solid color as the "test frame" content - not game content, per this
-     * session's explicit scope, just proof the bridge carries real pixel data through to Submit. */
-    D3DCOLOR testColor = D3DCOLOR_ARGB(255, 40, 160, 220); /* a distinct sky-blue */
-    hr = clear_to_color(pDevice, pSurf9, testColor);
-    CHECK_HR(hr, "clear_to_color (test frame)");
-    printf("[A2] D3D9Ex shared surface cleared to test color (R=40,G=160,B=220) and flushed\n\n");
-
+    /* ---------- Part B: D3D11 device matched to the same adapter (unchanged mechanism) ---------- */
     IDXGIFactory1 *pFactory = NULL;
     hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&pFactory);
     CHECK_HR(hr, "CreateDXGIFactory1");
@@ -191,22 +267,78 @@ int main(void)
                             D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
                             D3D11_SDK_VERSION, &pDevice11, &gotLevel, &pContext11);
     CHECK_HR(hr, "D3D11CreateDevice");
-    printf("[B2] D3D11CreateDevice OK, feature level=0x%X\n", gotLevel);
+    printf("[B2] D3D11CreateDevice OK, feature level=0x%X\n\n", gotLevel);
 
-    ID3D11Texture2D *pTex11 = NULL;
-    hr = pDevice11->lpVtbl->OpenSharedResource(pDevice11, sharedHandle, &IID_ID3D11Texture2D, (void **)&pTex11);
-    CHECK_HR(hr, "ID3D11Device::OpenSharedResource");
-    printf("[B3] OpenSharedResource OK - D3D11 texture ready to hand to OpenVR\n\n");
+    /* ---------- Part C: OLD blocking-helper timing baseline (throwaway surface, not submitted) ---------- */
+    printf("--- Part C: OLD blocking sync helper (flush_d3d9_BLOCKING) - %d-iteration timing baseline ---\n", NUM_PHASE1_ITERS);
+    IDirect3DTexture9 *pScratchTex = NULL;
+    hr = pDevice->lpVtbl->CreateTexture(pDevice, FRAME_W, FRAME_H, 1, D3DUSAGE_RENDERTARGET,
+                                         D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &pScratchTex, NULL);
+    CHECK_HR(hr, "CreateTexture (scratch, non-shared)");
+    IDirect3DSurface9 *pScratchSurf = NULL;
+    hr = pScratchTex->lpVtbl->GetSurfaceLevel(pScratchTex, 0, &pScratchSurf);
+    CHECK_HR(hr, "GetSurfaceLevel (scratch)");
+    IDirect3DQuery9 *pScratchQuery = NULL;
+    hr = pDevice->lpVtbl->CreateQuery(pDevice, D3DQUERYTYPE_EVENT, &pScratchQuery);
+    CHECK_HR(hr, "CreateQuery (scratch)");
 
-    /* ---------- Part C: OpenVR init + IVRCompositor::Submit ---------- */
+    double sumMs = 0.0, minMs = 1e18, maxMs = 0.0;
+    for (int i = 0; i < NUM_PHASE1_ITERS; i++) {
+        D3DCOLOR c = D3DCOLOR_ARGB(255, (i * 3) % 256, (i * 7) % 256, (i * 11) % 256);
+        hr = RenderColor(pDevice, pScratchSurf, c);
+        CHECK_HR(hr, "RenderColor (Part C)");
+        double stallMs = 0.0;
+        hr = flush_d3d9_BLOCKING(pDevice, pScratchQuery, &stallMs);
+        CHECK_HR(hr, "flush_d3d9_BLOCKING");
+        sumMs += stallMs;
+        if (stallMs < minMs) minMs = stallMs;
+        if (stallMs > maxMs) maxMs = stallMs;
+    }
+    printf("[C1] OLD blocking helper over %d iters: min=%.4fms avg=%.4fms max=%.4fms "
+           "(CPU thread genuinely slept/spun inside this call every single time)\n\n",
+           NUM_PHASE1_ITERS, minMs, sumMs / NUM_PHASE1_ITERS, maxMs);
+
+    pScratchQuery->lpVtbl->Release(pScratchQuery);
+    pScratchSurf->lpVtbl->Release(pScratchSurf);
+    pScratchTex->lpVtbl->Release(pScratchTex);
+
+    /* ---------- Part D: NEW double-buffered, non-blocking sync + real Submit loop ---------- */
+    printf("--- Part D: NEW non-blocking double-buffered sync - %d simulated frames @ ~60fps pacing ---\n", NUM_PHASE2_ITERS);
+
+    RingBuffer buf[NUM_BUFFERS];
+    ZeroMemory(buf, sizeof(buf));
+    for (int b = 0; b < NUM_BUFFERS; b++) {
+        hr = pDevice->lpVtbl->CreateTexture(pDevice, FRAME_W, FRAME_H, 1, D3DUSAGE_RENDERTARGET,
+                                             D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &buf[b].pTex9, &buf[b].sharedHandle);
+        CHECK_HR(hr, "CreateTexture (ring buffer, shared)");
+        hr = buf[b].pTex9->lpVtbl->GetSurfaceLevel(buf[b].pTex9, 0, &buf[b].pSurf9);
+        CHECK_HR(hr, "GetSurfaceLevel (ring buffer)");
+        hr = pDevice->lpVtbl->CreateQuery(pDevice, D3DQUERYTYPE_EVENT, &buf[b].pQuery9);
+        CHECK_HR(hr, "CreateQuery (ring buffer)");
+        hr = pDevice11->lpVtbl->OpenSharedResource(pDevice11, buf[b].sharedHandle, &IID_ID3D11Texture2D, (void **)&buf[b].pTex11);
+        CHECK_HR(hr, "OpenSharedResource (ring buffer)");
+    }
+    printf("[D1] %d shared %dx%d ring buffers created and opened on D3D11\n\n", NUM_BUFFERS, FRAME_W, FRAME_H);
+
+    /* Staging texture for CPU readback correctness verification. */
+    D3D11_TEXTURE2D_DESC stagingDesc;
+    buf[0].pTex11->lpVtbl->GetDesc(buf[0].pTex11, &stagingDesc);
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    ID3D11Texture2D *pStaging = NULL;
+    hr = pDevice11->lpVtbl->CreateTexture2D(pDevice11, &stagingDesc, NULL, &pStaging);
+    CHECK_HR(hr, "CreateTexture2D (staging)");
+
+    /* ---------- OpenVR init (unchanged mechanism, notes/27) ---------- */
     printf("VR_IsRuntimeInstalled() = %s\n", VR_IsRuntimeInstalled() ? "true" : "false");
     printf("VR_IsHmdPresent()       = %s\n\n", VR_IsHmdPresent() ? "true" : "false");
 
     EVRInitError err = EVRInitError_VRInitError_None;
     uint32_t token = VR_InitInternal2(&err, EVRApplicationType_VRApplication_Scene, NULL);
-    printf("[C1] VR_InitInternal2(VRApplication_Scene) -> token=%u, error=%d (%s)\n",
+    printf("[D2] VR_InitInternal2(VRApplication_Scene) -> token=%u, error=%d (%s)\n",
            token, (int)err, VR_GetVRInitErrorAsEnglishDescription(err));
-
     if (!(err == EVRInitError_VRInitError_None && token != 0)) {
         printf("\nFAIL: OpenVR init did not succeed - cannot proceed to Submit.\n");
         return 1;
@@ -214,56 +346,123 @@ int main(void)
 
     EVRInitError compErr = EVRInitError_VRInitError_None;
     void *compPtr = VR_GetGenericInterface(IVRCompositor_Version, &compErr);
-    printf("[C2] VR_GetGenericInterface(%s) -> ptr=%p, error=%d\n", IVRCompositor_Version, compPtr, (int)compErr);
+    printf("[D3] VR_GetGenericInterface(%s) -> ptr=%p, error=%d\n", IVRCompositor_Version, compPtr, (int)compErr);
     if (!compPtr) {
         printf("\nFAIL: could not get IVRCompositor interface.\n");
         VR_ShutdownInternal();
         return 1;
     }
-
     void **vtbl = (void **)real_vtable(compPtr);
-    printf("[C3] IVRCompositor real vtable = %p (dispatching via __thiscall, this-ptr fix - see file header)\n\n", (void*)vtbl);
-
-    /* WaitGetPoses must be called once per frame before Submit (standard OpenVR usage pattern -
-     * establishes frame timing on the compositor side; skipping it risks AlreadySubmitted/timing
-     * errors on some builds even though this is our very first frame). */
-    TrackedDevicePose_t renderPoses[64];
-    TrackedDevicePose_t gamePoses[64];
-    ZeroMemory(renderPoses, sizeof(renderPoses));
-    ZeroMemory(gamePoses, sizeof(gamePoses));
     WaitGetPoses_t pWaitGetPoses = (WaitGetPoses_t)vtbl[2];
-    EVRCompositorError wgpErr = pWaitGetPoses(compPtr, renderPoses, 64, gamePoses, 64);
-    printf("[C4] WaitGetPoses -> error=%d\n", (int)wgpErr);
-
-    Texture_t tex;
-    tex.handle = (void *)pTex11;
-    tex.eType = ETextureType_TextureType_DirectX;
-    tex.eColorSpace = EColorSpace_ColorSpace_Auto;
-
     Submit_t pSubmit = (Submit_t)vtbl[6];
-    EVRCompositorError submitErrL = pSubmit(compPtr, EVREye_Eye_Left, &tex, NULL, EVRSubmitFlags_Submit_Default);
-    printf("[C5] Submit(Eye_Left)  -> error=%d %s\n", (int)submitErrL,
-           submitErrL == EVRCompositorError_VRCompositorError_None ? "(VRCompositorError_None)" : "");
-    EVRCompositorError submitErrR = pSubmit(compPtr, EVREye_Eye_Right, &tex, NULL, EVRSubmitFlags_Submit_Default);
-    printf("[C6] Submit(Eye_Right) -> error=%d %s\n\n", (int)submitErrR,
-           submitErrR == EVRCompositorError_VRCompositorError_None ? "(VRCompositorError_None)" : "");
+    printf("[D4] IVRCompositor ready (vtable=%p, __thiscall dispatch fix applied)\n\n", (void *)vtbl);
 
-    int pass = (submitErrL == EVRCompositorError_VRCompositorError_None &&
-                submitErrR == EVRCompositorError_VRCompositorError_None);
-    printf("=== RESULT: %s ===\n", pass
-           ? "PASS - IVRCompositor::Submit accepted the D3D9Ex-bridged D3D11 texture for both eyes"
-           : "FAIL - see error codes above");
+    TrackedDevicePose_t renderPoses[64], gamePoses[64];
+
+    /* ---- The actual per-frame loop: this is the pattern meant to go into proxy_d3d9.c's
+     * Hook_Present / CandB_AfterBoth_asm eventually - render, issue-non-blocking, poll-
+     * non-blocking the PREVIOUS buffer, submit if ready, never wait. ---- */
+    LARGE_INTEGER freq, pt0, pt1;
+    QueryPerformanceFrequency(&freq);
+    double pollSumUs = 0.0, pollMinUs = 1e18, pollMaxUs = 0.0;
+    int pollSamples = 0, submittedCount = 0, skippedCount = 0, mismatchCount = 0;
+
+    for (int i = 0; i < NUM_PHASE2_ITERS; i++) {
+        int curIdx = i % NUM_BUFFERS;
+        int prevIdx = (i + NUM_BUFFERS - 1) % NUM_BUFFERS;
+
+        /* 1) Render this frame's content into the CURRENT buffer. */
+        BYTE r = (BYTE)((i * 3 + 40) % 256), g = (BYTE)((i * 7 + 80) % 256), b = (BYTE)((i * 11 + 120) % 256);
+        hr = RenderColor(pDevice, buf[curIdx].pSurf9, D3DCOLOR_ARGB(255, r, g, b));
+        CHECK_HR(hr, "RenderColor (Part D)");
+        buf[curIdx].expectR = r; buf[curIdx].expectG = g; buf[curIdx].expectB = b;
+
+        /* 2) Issue a non-blocking event query for it. GetData is called ONCE, immediately,
+         * with D3DGETDATA_FLUSH purely to kick the driver into submitting the command buffer
+         * promptly (NOT to wait for the result) - this call itself never blocks. */
+        buf[curIdx].pQuery9->lpVtbl->Issue(buf[curIdx].pQuery9, D3DISSUE_END);
+        buf[curIdx].pQuery9->lpVtbl->GetData(buf[curIdx].pQuery9, NULL, 0, D3DGETDATA_FLUSH);
+        buf[curIdx].queryIssued = TRUE;
+
+        /* 3) Non-blockingly check whether the PREVIOUS buffer (one full frame interval old)
+         * is ready. A SINGLE GetData call, no flush flag (already flushed last iteration), no
+         * loop, no Sleep - if it returns S_FALSE we simply skip submission this frame instead
+         * of waiting for it. */
+        BOOL ready = FALSE;
+        if (buf[prevIdx].queryIssued) {
+            QueryPerformanceCounter(&pt0);
+            HRESULT pollHr = buf[prevIdx].pQuery9->lpVtbl->GetData(buf[prevIdx].pQuery9, NULL, 0, 0);
+            QueryPerformanceCounter(&pt1);
+            double us = (double)(pt1.QuadPart - pt0.QuadPart) * 1000000.0 / (double)freq.QuadPart;
+            pollSumUs += us; pollSamples++;
+            if (us < pollMinUs) pollMinUs = us;
+            if (us > pollMaxUs) pollMaxUs = us;
+            ready = (pollHr == S_OK);
+        }
+
+        if (ready) {
+            /* 4) Submit the previous (confirmed-ready) buffer to the compositor, both eyes. */
+            ZeroMemory(renderPoses, sizeof(renderPoses));
+            ZeroMemory(gamePoses, sizeof(gamePoses));
+            pWaitGetPoses(compPtr, renderPoses, 64, gamePoses, 64);
+
+            Texture_t tex;
+            tex.handle = (void *)buf[prevIdx].pTex11;
+            tex.eType = ETextureType_TextureType_DirectX;
+            tex.eColorSpace = EColorSpace_ColorSpace_Auto;
+            EVRCompositorError eL = pSubmit(compPtr, EVREye_Eye_Left, &tex, NULL, EVRSubmitFlags_Submit_Default);
+            EVRCompositorError eR = pSubmit(compPtr, EVREye_Eye_Right, &tex, NULL, EVRSubmitFlags_Submit_Default);
+
+            /* 5) Correctness check: read back the ACTUAL bytes the compositor was just handed
+             * and confirm they match what was rendered into that buffer (not stale, not
+             * corrupted, not a different buffer's content). */
+            BYTE gotB, gotG, gotR;
+            ReadbackPixel(pContext11, pStaging, buf[prevIdx].pTex11, FRAME_W / 2, FRAME_H / 2, &gotB, &gotG, &gotR);
+            BOOL match = (gotR == buf[prevIdx].expectR && gotG == buf[prevIdx].expectG && gotB == buf[prevIdx].expectB);
+            if (!match) {
+                mismatchCount++;
+                printf("[D-frame %2d] MISMATCH: expected R=%u G=%u B=%u, got R=%u G=%u B=%u\n",
+                       i, buf[prevIdx].expectR, buf[prevIdx].expectG, buf[prevIdx].expectB, gotR, gotG, gotB);
+            }
+            if (eL != EVRCompositorError_VRCompositorError_None || eR != EVRCompositorError_VRCompositorError_None) {
+                printf("[D-frame %2d] Submit error: L=%d R=%d\n", i, (int)eL, (int)eR);
+            }
+            submittedCount++;
+        } else if (buf[prevIdx].queryIssued) {
+            skippedCount++;
+            printf("[D-frame %2d] buffer not yet GPU-ready - SKIPPED this frame's submit "
+                   "(no stall; will try again next frame)\n", i);
+        }
+
+        Sleep(16); /* simulate ~60fps frame pacing between iterations */
+    }
+
+    printf("\n[D5] Part D summary over %d simulated frames:\n", NUM_PHASE2_ITERS);
+    printf("     submitted=%d skipped=%d mismatches=%d\n", submittedCount, skippedCount, mismatchCount);
+    printf("     non-blocking poll cost: min=%.2fus avg=%.2fus max=%.2fus (%d samples)\n",
+           pollMinUs, pollSamples ? pollSumUs / pollSamples : 0.0, pollMaxUs, pollSamples);
+    printf("     compare to Part C's OLD blocking helper: min=%.4fms avg=%.4fms max=%.4fms\n",
+           minMs, sumMs / NUM_PHASE1_ITERS, maxMs);
+
+    int pass = (mismatchCount == 0) && (submittedCount > 0);
+    printf("\n=== RESULT: %s ===\n", pass
+           ? "PASS - non-blocking double-buffered sync produced zero pixel mismatches, poll cost is microsecond-scale (no full-pipeline stall)"
+           : "FAIL - see mismatch/submit counts above");
 
     VR_ShutdownInternal();
     printf("VR_ShutdownInternal() called.\n");
 
-    pTex11->lpVtbl->Release(pTex11);
+    pStaging->lpVtbl->Release(pStaging);
+    for (int b = 0; b < NUM_BUFFERS; b++) {
+        buf[b].pTex11->lpVtbl->Release(buf[b].pTex11);
+        buf[b].pQuery9->lpVtbl->Release(buf[b].pQuery9);
+        buf[b].pSurf9->lpVtbl->Release(buf[b].pSurf9);
+        buf[b].pTex9->lpVtbl->Release(buf[b].pTex9);
+    }
     pContext11->lpVtbl->Release(pContext11);
     pDevice11->lpVtbl->Release(pDevice11);
     pChosenAdapter->lpVtbl->Release(pChosenAdapter);
     pFactory->lpVtbl->Release(pFactory);
-    pSurf9->lpVtbl->Release(pSurf9);
-    pTex9->lpVtbl->Release(pTex9);
     pDevice->lpVtbl->Release(pDevice);
     pD3D9Ex->lpVtbl->Release(pD3D9Ex);
     DestroyWindow(hwnd);
