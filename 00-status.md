@@ -1,13 +1,39 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 3: eye-parity refutes culling hypothesis, shared-depth-stencil fix shipped)
+Last updated: 2026-08-17 (session 4: MILESTONE — real-gameplay stereo rendering confirmed working, user-verified)
 
-## Latest status (read this first)
+## MILESTONE: real-gameplay stereo rendering works, confirmed by the user (2026-08-17)
+
+**The user played real, player-controlled gameplay against the notes/22 (shared-depth-stencil-fix)
+build and confirmed, in their own words: "the game is running absolutely fine on both sides."** This
+is the first time in the project's history that real gameplay — not just the title screen's scripted
+attract-mode camera — has been confirmed working in stereo on both eyes, by the person actually
+looking at the screen. The frozen-left/dark-right bug that survived two prior rounds of targeted fixes
+(notes/20, notes/21) before notes/22 found and fixed the actual root cause (both eyes sharing one
+physical depth-stencil surface) is resolved. Full arc and write-up in
+`notes/23-gameplay-stereo-working-milestone.md`. This project has gone from "can we hook D3D9 at all"
+to "working stereo rendering in real gameplay, user-confirmed" — the biggest working milestone so far.
+
+- **One small remaining cosmetic issue, diagnosed but not yet fixed**: the main pause/menu UI screen's
+  left eye renders completely black (distinct from the title screen and real gameplay, both of which
+  work correctly). Ruled out via the full live log: not a draw-call omission (every logged eye1/eye2
+  pair is exactly matched or both zero, never asymmetric) and not a `StretchRect` failure (always
+  `S_OK`). Leading, unconfirmed hypothesis: the fixed-world-unit parallax correction may push the
+  menu's likely close-up camera framing outside one eye's frustum. Not blind-fixed — reproducing it
+  safely requires the user to be at that specific screen with the log capturing the moment, which
+  wasn't available this session (the user's own game was already running live and was not
+  interfered with). See notes/23 §5 for the full diagnosis and the concrete cheap next step.
+- **No code changes this session** — `proxy_d3d9.c` is unchanged from notes/22's fix.
+- **Mod repo updated**: `USAGE.md`/README now describe gameplay stereo rendering as working
+  (user-confirmed), not "title-screen-only, experimental."
+
+## Prior milestone (eye-parity refutes culling, shared-depth-stencil fix shipped, still valid as background)
 
 **The eye1:eye2 draw-call asymmetry that drove notes/20 and notes/21 was proven NOT REAL — a hard
 per-frame count from the user's own live gameplay session showed 206/206 exact matches (16960:16960)
 — and a genuinely new, well-evidenced structural bug was found and fixed instead: both eyes shared the
-device's single depth-stencil surface the entire time.** Still NOT YET LIVE-TESTED (the user's game was
+device's single depth-stencil surface the entire time.** This fix is now confirmed working (see the
+MILESTONE section above) — at the time notes/22 shipped it was NOT YET LIVE-TESTED (the user's game was
 already running mid-level for the whole session; per this project's standing safety rule it was never
 touched). Full detail in `notes/22-eye-parity-refutes-culling-shared-depth-stencil-fix.md`. Headline
 findings:
