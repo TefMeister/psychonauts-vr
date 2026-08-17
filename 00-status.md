@@ -1,17 +1,57 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 11: notes/29's deadlock fix LIVE-TESTED and CONFIRMED WORKING —
-Submit fires every frame, proven two independent ways (proxy log + SteamVR compositor log, agreeing
-to the millisecond). Also investigated the user's "noticeably laggier" report with real measured
-evidence: VR-bridge path costs ~8-9ms/frame (~119fps baseline -> ~57-60fps with the bridge on),
-confirmed NOT caused by Submit itself (cost is nearly identical whether Submit succeeds or not) —
-full detail in notes/30)
+Last updated: 2026-08-17 (session 12: notes/30's open question settled with real per-span timing —
+the dominant VR-bridge cost is `IVRCompositor::WaitGetPoses` (~25-27ms/call, required for Submit to
+work, confirmed via A/B testing), NOT `GetRenderTargetData`/the readback chain (measured negligible,
+<1ms/frame combined). Two architecture fixes implemented and verified safe but measured to have ~zero
+fps impact given WaitGetPoses's cost is externally imposed by SteamVR's compositor. Also found and
+corrected two methodology bugs: this project's "offscreen" test convention triggers Windows DWM
+occlusion-throttling (invalidates fps timing), and notes/28-30's own frame counter double-counts
+(true baseline is ~60fps, not the previously-reported ~119fps) — full detail in notes/31)
 
-## Submit fix live-verified working; VR-bridge performance cost measured with real evidence (2026-08-17, session 11)
+## Real per-span timing settles WaitGetPoses vs. GetRenderTargetData; two methodology bugs found (2026-08-17, session 12)
+
+**notes/30 flagged an open question (does WaitGetPoses or the GetRenderTargetData/readback chain
+dominate the VR-bridge's measured performance cost?) and specified exactly the fix: per-span
+QueryPerformanceCounter timing. This session implemented that, then chased the result through real
+A/B experiments (not just logging) to a settled, well-evidenced answer.** Full detail in
+`notes/31-waitgetposes-is-the-real-cost-present-double-pacing-fixed.md`. Headline findings:
+
+- **`GetRenderTargetData`/readback chain definitively ruled out**: measured at <1ms/frame combined
+  for both eyes (GetRenderTargetData ~0.01ms, the LockRect+memcpy+UpdateSurface chain ~0.4ms/eye) —
+  notes/28's own hypothesis does not hold up against real data.
+- **`IVRCompositor::WaitGetPoses` confirmed as the real, dominant cost: ~25-27ms/call, every call**,
+  and confirmed REQUIRED (not misused) via a direct A/B test — skipping it restores full baseline
+  framerate but breaks every `Submit` call (`VRCompositorError_DoNotHaveFocus`). Two independent,
+  correct architecture fixes (removing a redundant double-vsync stack against the game's own device;
+  repositioning the call to the OpenVR-standard "right after Present" call site) were implemented,
+  verified not to break Submit, but honestly measured to have ~zero fps effect this session — the
+  cost is an external floor imposed by SteamVR's own compositor, not fixable from this project's code.
+- **A real testing-methodology bug found**: this project's "offscreen" test convention
+  (`move-window-offscreen.ps1`) triggers Windows DWM occlusion-throttling, independently capping real
+  `Present()` at ~30fps regardless of VR-bridge state — this would have invalidated any fps
+  comparison done under it. All future timing-sensitive tests must use a visible window.
+- **A retroactive correction to notes/28/29/30's own fps numbers**: their shared frame-counter method
+  double-counts (CandB's per-eye internal Present() hook calls both increment the counter, but only
+  one per frame is real) — true baseline is **~60fps** (not ~119fps), true pre-this-session VR-bridge
+  rate **~28-30fps** (not ~57-60fps). The *relative* ~2x regression finding stays valid; only the
+  absolute numbers were inflated. ~60fps baseline matches the user's own stated expectation for 2x
+  (stereo) rendering on this hardware.
+- **Honestly unresolved**: whether the ~25-27ms WaitGetPoses cost is specific to SteamVR's null
+  driver (no physical HMD to derive real vsync timing from — plausible, doesn't match the null
+  driver's own declared 90Hz setting) or would also occur against a real headset — this project has
+  no physical VR hardware to test either way.
+- **Submit re-verified working** after all changes, same evidence method as notes/29/30 (proxy log
+  `Submit(eye=N) OK` lines climbing continuously, both eyes) in every configuration tested.
+- **Deployed**: the final instrumented+fixed build was deployed into the game directory (additive,
+  off by default without `PSYVR_ENABLE_SUBMIT=1` — the prior notes/29 build was backed up first).
+  Not pushed to the mod repo (this session's own instruction: modding-notes/dev-archive only).
+
+## Prior milestone (Submit fix live-verified working; VR-bridge performance cost measured with real evidence, session 11, still valid as background)
 
 **notes/29's deadlock fix was deployed into the user's live game (PID 18284,
 `PSYVR_ENABLE_SUBMIT=1`) and is now confirmed, with hard evidence, to actually work.** Full detail in
-`30-submit-live-confirmed-and-performance-cost-measured.md`. Headline findings:
+`notes/30-submit-live-confirmed-and-performance-cost-measured.md`. Headline findings:
 
 - **Submit confirmed firing every frame, two independent ways**: the live proxy log shows
   `"VRBridge: Submit(eye=N) OK (frame=N)"` for both eyes continuously (100+ lines, frame counter
