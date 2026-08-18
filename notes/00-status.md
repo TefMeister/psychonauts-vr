@@ -1,6 +1,26 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-18 afternoon (session 35: the notes/23 BLACK-LEFT-EYE BUG is root-caused
+Last updated: 2026-08-18 afternoon #2 (session 36: audited ALL 455 of the game's vertex
+shaders — every 3D shader (including all 403 skinned/bone-palette ones) transforms through the
+already-corrected c6 matrix, REFUTING the long-standing "skinned geometry uncorrected"
+limitation; the 10 remaining shaders are pure screen-space UI, which DID bypass correction (HUD
+at infinity in VR) — fixed with a new UI-depth feature (default 2m, PSYVR_UI_DEPTH), verified
+quantitatively via eye-dump cross-correlation with a clean control run. Full detail in notes/36)
+
+## Session 36 (2026-08-18 afternoon #2): shader audit + UI depth
+
+- 455/455 vertex shaders dumped (PSYVR_REG_HISTO=1) and analyzed (tools/proxy-d3d9/vs_analyze.py):
+  445 end position math with m4x4 vs c6 (already stereo+tracking corrected — skinned INCLUDED),
+  10 are screen-space UI (oPos = input + c50, zero parallax).
+- UI-depth: UI shaders identified by bytecode signature at CreateVertexShader, binds tracked,
+  per-draw c50.x shifted per eye by -d*xScale/depth. Text band measured 16px between eyes
+  (15.5 predicted), 3D bands unchanged, depth=0 control restores 0px.
+- Not yet released (would be v0.1.3-alpha). USAGE.md's skinned limitation needs removing.
+- Full detail in `notes/36-shader-audit-skinned-refuted-and-ui-depth.md`.
+
+## Prior header (session 35)
+
+(session 35: the notes/23 BLACK-LEFT-EYE BUG is root-caused
 and FIXED, user-verified — the engine re-binds the real backbuffer mid-eye-pass on the
 brain/title screen; fixed with three eye-phase redirects (RT bind, StretchRect read, DS bind).
 Also: VR eye buffers now render at 2x game resolution by default (PSYVR_RENDER_SCALE 1-4),
