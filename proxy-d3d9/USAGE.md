@@ -1,8 +1,9 @@
 # Proxy `d3d9.dll` — usage
 
-**v0.1.5-alpha** *(launcher/config-only update: the DLL binaries are byte-identical to
-v0.1.4-alpha — this version adds ready-made launcher `.bat` files, including a Meta Quest 3
-pre-tuned one, and documents a v0.1.4 logging regression; see Known issues).*
+**v0.1.6-alpha** *(launcher/config-only update: the DLL binaries are byte-identical to
+v0.1.4-alpha — v0.1.5 added ready-made launcher `.bat` files including a Meta Quest 3
+pre-tuned one; v0.1.6 corrects that launcher's FOV default after real-hardware testing
+found the HUD becomes invisible at FOV scale >~1.2 — see Known issues).*
 This is the mod's core component: a `d3d9.dll` that loads in place of the
 system one (standard Windows DLL search order, the same mechanism dxwrapper and most D3D9 mods
 use). It does three things now:
@@ -76,9 +77,20 @@ real headset** — that is exactly what this release exists to test.
 
 ## Known issues / limitations
 
-- **Head tracking is untested on real hardware.** It's on by default with the VR bridge; if
-  anything about the motion feels wrong (inverted axis, wrong scale, judder), set
-  `PSYVR_DISABLE_TRACKING=1` to get v0.1.0 behavior back, and please note WHICH axis felt wrong.
+- **HUD invisible at `PSYVR_FOV_SCALE` above ~1.2 (found 2026-08-19, real-hardware playtest).**
+  The game's screen-space HUD spans the full frame, so widening the 3D FOV pushes HUD
+  corners to the far periphery — at the Quest 3's geometric match value of 1.5 they land at
+  ≈±47°, beyond the lens's clear zone and each eye's nasal crop, making the HUD effectively
+  invisible. Planned fix: scale UI x/y by `1/PSYVR_FOV_SCALE` in the existing UI-shader
+  constant patch so the HUD keeps its native angular size (dev-archive notes/42). Until then
+  the Quest 3 launcher defaults to the 1.2 compromise (HUD visible, most zoom removed).
+- **Head tracking: now confirmed working on real hardware** (Quest 3 playtests 2026-08-18
+  and 2026-08-19, dev-archive notes/40 and 42) — motion tracks correctly and comfortably.
+  Two real limitations remain: the engine's frustum culling doesn't know about head rotation,
+  so looking far off the game camera's axis (e.g. over your shoulder) shows unrendered black
+  void until the game camera turns (fix queued, notes/40); and distant LOD billboard sprites
+  (trees/bushes) look doubled/cross-eyed in stereo (fix queued, notes/40).
+  `PSYVR_DISABLE_TRACKING=1` still restores the fixed-view behavior if wanted.
 - **Performance (corrected from v0.1.0's known-issues list)**: the previously-reported
   ~28-31fps ceiling was an artifact of SteamVR's headset-free null driver, not the mod — with a
   real HMD, the bridge sustains the headset's native refresh (72Hz measured) with large
