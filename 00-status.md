@@ -1,6 +1,122 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 13: the hardcoded STEREO_HALF_IPD=3.25 constant and the
+Last updated: 2026-08-18 late afternoon #2 (session 39: AUTONOMOUS GAMEPLAY ENTRY VERIFIED
+end-to-end — synthetic input drove the game from cold title screen through the menu's blue
+CONTINUE door into real Whispering Rock gameplay (world-space camera coords + HUD visible in
+the eye dump), zero human keypresses. Door trigger = jump while on/over the card, via
+micro-step+jump loop. Script: tools/input/enter_gameplay.ps1. The full test loop is now
+scriptable. Tonight's headset test (v0.1.4-alpha) is the next event. Details in notes/39)
+
+## Session 39 (2026-08-18): autonomous gameplay entry verified
+
+- Route: SPACE at title -> UP x3, LEFT x1 -> blue CONTINUE card (middle of three) ->
+  micro-steps with a jump after each -> save loads -> gameplay. Verified via BVM camera
+  coords jumping to the notes/22 world-space region + eye-dump showing Raz + HUD in-level.
+- Full detail in `notes/39-autonomous-gameplay-entry-verified.md`.
+
+## Prior header (session 38)
+
+(Last updated: 2026-08-18 late afternoon (session 38: the notes/15-18 INPUT BLOCKER IS SOLVED —
+plain SendInput with scan codes + genuinely-foreground game window advances the title screen
+and navigates the menu, verified twice via eye-dump diffs. Autonomous gameplay testing is now
+possible (menu-item selection deliberately deferred pending user guidance on save slots).
+Also: v0.1.4-alpha released with the PSYVR_FOV_SCALE knob + launcher bat asset; notes/37
+housekeeping cleared. Tonight's headset test should use v0.1.4. Full detail in notes/38)
+
+## Session 38 (2026-08-18 late afternoon): input blocker solved, v0.1.4 shipped
+
+- SendInput(SCANCODE) + SetForegroundWindow (verified, abort-on-fail) + hands-off protocol =
+  working synthetic input. SPACE advanced title->menu; RIGHT walked Raz across the brain.
+  Old debugger-based buffer forgery (notes/15-18) bypassed the real input stack - that was the
+  whole problem. Helper: tools/input/send_key.ps1.
+- v0.1.4-alpha: PSYVR_FOV_SCALE knob + suggested-value logging + Launch-Psychonauts-VR.bat.
+- Full detail in `notes/38-input-blocker-solved-sendinput.md`.
+
+## Prior header (session 37)
+
+(Last updated: 2026-08-18 afternoon #3 (session 37: PSYVR_FOV_SCALE knob implemented and
+numerically verified — the compositor maps eye textures onto the headset's ~80°+ frustum, so
+the game's ~52° fovy reads as zoomed-in; the knob scales rawFov in place at the BPM hook and
+the log now prints a suggested value from the real HMD tangents. PSYVR_RENDER_SCALE=3 validated
+live (1920x1440/eye, readback 3.7ms/eye on the dev GTX 1660). Shipping as v0.1.4-alpha.
+Tonight's headset test is the next event. Full detail in notes/37)
+
+## Session 37 (2026-08-18 afternoon #3): FOV knob + 3x validation
+
+- `PSYVR_FOV_SCALE` (0.5..2.5, default 1.0 = exact no-op): three x87 instructions patch rawFov
+  on the stack at Hook_BuildProjectionMatrix entry; observer cache, game projection, culling,
+  and stereo correction all follow automatically. Verified at 1.3 against analytic prediction.
+- `VRBridge_QueryRealGeometry` logs `suggested PSYVR_FOV_SCALE` computed from real HMD tangents.
+- 3x render scale validated with live bridge; combined regression at defaults healthy.
+- Full detail in `notes/37-fov-scale-knob-and-3x-scale-validation.md`.
+
+## Prior header (session 36)
+
+(Last updated: 2026-08-18 afternoon #2 (session 36: audited ALL 455 of the game's vertex
+shaders — every 3D shader (including all 403 skinned/bone-palette ones) transforms through the
+already-corrected c6 matrix, REFUTING the long-standing "skinned geometry uncorrected"
+limitation; the 10 remaining shaders are pure screen-space UI, which DID bypass correction (HUD
+at infinity in VR) — fixed with a new UI-depth feature (default 2m, PSYVR_UI_DEPTH), verified
+quantitatively via eye-dump cross-correlation with a clean control run. Full detail in notes/36)
+
+## Session 36 (2026-08-18 afternoon #2): shader audit + UI depth
+
+- 455/455 vertex shaders dumped (PSYVR_REG_HISTO=1) and analyzed (tools/proxy-d3d9/vs_analyze.py):
+  445 end position math with m4x4 vs c6 (already stereo+tracking corrected — skinned INCLUDED),
+  10 are screen-space UI (oPos = input + c50, zero parallax).
+- UI-depth: UI shaders identified by bytecode signature at CreateVertexShader, binds tracked,
+  per-draw c50.x shifted per eye by -d*xScale/depth. Text band measured 16px between eyes
+  (15.5 predicted), 3D bands unchanged, depth=0 control restores 0px.
+- Not yet released (would be v0.1.3-alpha). USAGE.md's skinned limitation needs removing.
+- Full detail in `notes/36-shader-audit-skinned-refuted-and-ui-depth.md`.
+
+## Prior header (session 35)
+
+(session 35: the notes/23 BLACK-LEFT-EYE BUG is root-caused
+and FIXED, user-verified — the engine re-binds the real backbuffer mid-eye-pass on the
+brain/title screen; fixed with three eye-phase redirects (RT bind, StretchRect read, DS bind).
+Also: VR eye buffers now render at 2x game resolution by default (PSYVR_RENDER_SCALE 1-4),
+F11 recenters head tracking, and new PSYVR_DUMP_EYES / PSYVR_TRACE_FRAME diagnostics. All
+verified live at 1x and 2x with the full bridge running. Full detail in notes/35)
+
+## Session 35 (2026-08-18 afternoon): black-left-eye FIXED, 2x eye resolution
+
+- **notes/23 bug root cause** (live-traced, old frustum hypothesis wrong): on the brain screen
+  the engine records "the screen" RT while the real backbuffer is bound, restores it mid-pass-1
+  and draws everything there; EYE1 keeps its cleared black. Reproduced the user's in-headset
+  black left eye from last night. Fix: during eye passes redirect backbuffer RT binds, backbuffer
+  StretchRect reads, and real-DS binds to the active eye's private surfaces. Eye parity verified
+  by pixel measurement and by the user; gameplay regression-checked.
+- **2x eye resolution** (default with submit; PSYVR_RENDER_SCALE overrides): 1280x960/eye
+  verified submitting here; 1600x1200/eye expected on the gaming PC. Readback ~1.4ms/eye.
+- Full detail in `notes/35-black-left-eye-root-cause-fixed-and-2x-eye-resolution.md`.
+
+## Session 34 (2026-08-18 morning): shutdown-zombie fix, quit events, HEAD TRACKING
+
+- **Head tracking (6DOF)**: `renderPoses[0]` from the existing `WaitGetPoses` call now drives a
+  dense per-frame `Y_track = P^-1*T*P` premultiplied onto every register-6 upload before the
+  per-eye patch (combined `WVP*Y_track*Y_eye`). Reference = first valid pose's position+yaw
+  (horizon stays level). Math validated numerically (6 checks,
+  `tools/proxy-d3d9/validate_headtrack.py`) BEFORE building; live sway test via new
+  `PSYVR_FAKE_POSE=1` confirmed visually by the user ("whoa did you just get head tracking
+  working?!"); null-driver static-pose regression clean (T stays identity, no NaNs).
+  `PSYVR_DISABLE_TRACKING=1` opts out.
+- **Zombie fix (notes/33 §4)**: `DllMain` DETACH now does NOTHING when `lpvReserved != NULL`
+  (process terminating - every other thread already dead; any teardown wait deadlocks under
+  loader lock, per the documented DllMain contract). Did not repro locally (clean exits even
+  with vrserver force-killed mid-game) but the fix removes the exact code path the gaming-PC
+  log showed hanging.
+- **VREvent_Quit handled**: polled per-frame (IVRSystem slot 30); on quit-class events,
+  acknowledge (slot 47) + immediate full bridge teardown at a safe moment; game continues in
+  monitor mode. Live-verified end-to-end with a real SteamVR exit. HMD identity
+  (trackingSystem/model) now logged at init (slot 28).
+- Release repo NOT touched; a v0.1.1-alpha with all three changes is the obvious next release,
+  pending user go-ahead. Full detail in
+  `notes/34-shutdown-zombie-fix-quit-events-and-head-tracking.md`.
+
+## Prior status header (session 13/32, 2026-08-17, kept as background)
+
+(session 13: the hardcoded STEREO_HALF_IPD=3.25 constant and the
 estimated focus-distance shear term are now driven by REAL OpenVR-queried data whenever it's
 available (IVRSystem::GetFloatTrackedDeviceProperty/GetEyeToHeadTransform/GetProjectionRaw),
 falling back transparently to the pre-existing hardcoded behavior when it isn't (e.g. no
