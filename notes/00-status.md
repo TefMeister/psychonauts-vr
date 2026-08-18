@@ -1,6 +1,24 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-18 afternoon #2 (session 36: audited ALL 455 of the game's vertex
+Last updated: 2026-08-18 afternoon #3 (session 37: PSYVR_FOV_SCALE knob implemented and
+numerically verified — the compositor maps eye textures onto the headset's ~80°+ frustum, so
+the game's ~52° fovy reads as zoomed-in; the knob scales rawFov in place at the BPM hook and
+the log now prints a suggested value from the real HMD tangents. PSYVR_RENDER_SCALE=3 validated
+live (1920x1440/eye, readback 3.7ms/eye on the dev GTX 1660). Shipping as v0.1.4-alpha.
+Tonight's headset test is the next event. Full detail in notes/37)
+
+## Session 37 (2026-08-18 afternoon #3): FOV knob + 3x validation
+
+- `PSYVR_FOV_SCALE` (0.5..2.5, default 1.0 = exact no-op): three x87 instructions patch rawFov
+  on the stack at Hook_BuildProjectionMatrix entry; observer cache, game projection, culling,
+  and stereo correction all follow automatically. Verified at 1.3 against analytic prediction.
+- `VRBridge_QueryRealGeometry` logs `suggested PSYVR_FOV_SCALE` computed from real HMD tangents.
+- 3x render scale validated with live bridge; combined regression at defaults healthy.
+- Full detail in `notes/37-fov-scale-knob-and-3x-scale-validation.md`.
+
+## Prior header (session 36)
+
+(Last updated: 2026-08-18 afternoon #2 (session 36: audited ALL 455 of the game's vertex
 shaders — every 3D shader (including all 403 skinned/bone-palette ones) transforms through the
 already-corrected c6 matrix, REFUTING the long-standing "skinned geometry uncorrected"
 limitation; the 10 remaining shaders are pure screen-space UI, which DID bypass correction (HUD
