@@ -1,6 +1,6 @@
 # Proxy `d3d9.dll` — usage
 
-**v0.1.1-alpha.** This is the mod's core component: a `d3d9.dll` that loads in place of the
+**v0.1.2-alpha.** This is the mod's core component: a `d3d9.dll` that loads in place of the
 system one (standard Windows DLL search order, the same mechanism dxwrapper and most D3D9 mods
 use). It does three things now:
 
@@ -81,14 +81,16 @@ real headset** — that is exactly what this release exists to test.
   real HMD, the bridge sustains the headset's native refresh (72Hz measured) with large
   headroom at the current render resolution. See
   [modding-notes/33 §3](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
-- **VR-bridge eye buffers render at the game's own resolution** (e.g. 800×600), far below the
-  headset's recommended per-eye size (2496×2688 queried on a Quest 3) — expect a soft,
-  upscaled image. Native-resolution VR rendering is a separate, not-yet-attempted undertaking.
+- **VR-bridge eye buffers now render at 2× the game's resolution by default** (e.g. 1600×1200
+  from an 800×600 game setting; `PSYVR_RENDER_SCALE=1`..`4` to override) — still below the
+  headset's recommended per-eye size (2496×2688 on a Quest 3), but a large sharpness step over
+  v0.1.1's native-resolution upscale. Higher scales cost VRAM/readback time; 3 may be viable.
 - **Only one shader-constant register is corrected.** Skinned/animated geometry (bone matrices)
   doesn't yet get per-eye/tracking correction — head rotation may make this more visible than
   static stereo did.
-- **Main pause/menu UI screen: left eye reported completely black** (title screen and gameplay
-  are fine). Diagnosed as far as passive evidence allows, not yet fixed.
+- **Fixed in v0.1.2**: the long-standing "left eye completely black" bug on the brain
+  title/menu screen (root cause: the engine re-binds the real backbuffer mid-eye-pass on that
+  screen; fixed by redirecting screen binds/reads to the active eye during eye passes).
 - **Fixed in this release**: v0.1.0's exit hang (unkillable zombie process when closing the
   game with the VR bridge active) and the unhandled SteamVR-quit sequence.
 
@@ -115,6 +117,8 @@ real headset** — that is exactly what this release exists to test.
    - `PSYVR_DISABLE_TRACKING=1` — fixed view (v0.1.0 behavior).
    - `PSYVR_FAKE_POSE=1` — synthesized swaying pose for monitor-only testing without moving a
      headset.
+   - `PSYVR_RENDER_SCALE=1..4` — eye render-resolution multiplier (default 2 with the VR path).
+   - **F11** in-game re-centers head tracking (re-captures the reference position/yaw).
 5. The log's `VRBridge_Init: HMD identity:` line records which headset OpenVR reported, and
    `HeadTrack:` lines show the live tracking state.
 
