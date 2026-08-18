@@ -1,6 +1,39 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-17 (session 13: the hardcoded STEREO_HALF_IPD=3.25 constant and the
+Last updated: 2026-08-18 (session 34: HEAD TRACKING implemented and visually confirmed
+(fake-pose sway test, user-watched); notes/33's shutdown-hang zombie root-caused (DllMain
+contract violation - blocking teardown at process-termination DETACH) and fixed; VREvent_Quit
+now handled and live-verified (user exited SteamVR mid-game, bridge tore down cleanly in 250ms,
+game kept running flat); HMD identity now logged at init. User debrief on the first physical
+headset test: stereo looked CORRECT and comfortable - Quest 3 via Virtual Desktop latest. All
+pending real-headset verification on the gaming PC. Full detail in notes/34)
+
+## Session 34 (2026-08-18): shutdown-zombie fix, quit events, HEAD TRACKING
+
+- **Head tracking (6DOF)**: `renderPoses[0]` from the existing `WaitGetPoses` call now drives a
+  dense per-frame `Y_track = P^-1*T*P` premultiplied onto every register-6 upload before the
+  per-eye patch (combined `WVP*Y_track*Y_eye`). Reference = first valid pose's position+yaw
+  (horizon stays level). Math validated numerically (6 checks,
+  `tools/proxy-d3d9/validate_headtrack.py`) BEFORE building; live sway test via new
+  `PSYVR_FAKE_POSE=1` confirmed visually by the user ("whoa did you just get head tracking
+  working?!"); null-driver static-pose regression clean (T stays identity, no NaNs).
+  `PSYVR_DISABLE_TRACKING=1` opts out.
+- **Zombie fix (notes/33 §4)**: `DllMain` DETACH now does NOTHING when `lpvReserved != NULL`
+  (process terminating - every other thread already dead; any teardown wait deadlocks under
+  loader lock, per the documented DllMain contract). Did not repro locally (clean exits even
+  with vrserver force-killed mid-game) but the fix removes the exact code path the gaming-PC
+  log showed hanging.
+- **VREvent_Quit handled**: polled per-frame (IVRSystem slot 30); on quit-class events,
+  acknowledge (slot 47) + immediate full bridge teardown at a safe moment; game continues in
+  monitor mode. Live-verified end-to-end with a real SteamVR exit. HMD identity
+  (trackingSystem/model) now logged at init (slot 28).
+- Release repo NOT touched; a v0.1.1-alpha with all three changes is the obvious next release,
+  pending user go-ahead. Full detail in
+  `notes/34-shutdown-zombie-fix-quit-events-and-head-tracking.md`.
+
+## Prior status header (session 13/32, 2026-08-17, kept as background)
+
+(session 13: the hardcoded STEREO_HALF_IPD=3.25 constant and the
 estimated focus-distance shear term are now driven by REAL OpenVR-queried data whenever it's
 available (IVRSystem::GetFloatTrackedDeviceProperty/GetEyeToHeadTransform/GetProjectionRaw),
 falling back transparently to the pre-existing hardcoded behavior when it isn't (e.g. no
