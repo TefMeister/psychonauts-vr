@@ -433,6 +433,14 @@ static IDirect3DSurface9 *g_pEye1DepthStencil = NULL;
 static IDirect3DSurface9 *g_pEye2DepthStencil = NULL;
 static UINT g_bbWidth = 0;
 static UINT g_bbHeight = 0;
+/* notes/35: eye render targets can now be LARGER than the backbuffer (the VR submit path was
+ * shipping the game's 800x600/640x480 upscaled to a headset wanting ~2496x2688/eye - notes/33
+ * Sec5). g_eyeScale multiplies the backbuffer dims (same aspect - the projection math is
+ * untouched); the monitor composite StretchRects back DOWN to the backbuffer halves and the VR
+ * buffers are sized to the eye surfaces. Scale=1 keeps every path byte-identical to before. */
+static UINT g_eyeScale = 1;   /* PSYVR_RENDER_SCALE (1-4); defaults to 2 when PSYVR_ENABLE_SUBMIT=1, else 1 */
+static UINT g_eyeWidth = 0;   /* actual eye render-target dims = bb dims * g_eyeScale */
+static UINT g_eyeHeight = 0;
 static BOOL g_stereoReady = FALSE; /* device + both offscreen color+depth surfaces created OK */
 
 /* ======================================================================
@@ -578,6 +586,14 @@ static BOOL g_vrSkipPumpEye = FALSE;
  * never moves). */
 static BOOL g_trackingDisabled = FALSE;
 static BOOL g_fakePose = FALSE;
+static BOOL g_dumpEyes = FALSE; /* PSYVR_DUMP_EYES=1: periodic BMP dumps of eye1/eye2/backbuffer
+                                   (diagnostic for the notes/23 black-left-eye bug - notes/35) */
+/* notes/35: PSYVR_TRACE_FRAME=1 - every ~5s, log ONE full frame's exact sequence of
+ * SetRenderTarget/Clear/draw batches with the stereo phase attached, to see where the
+ * black-left-eye screen's content actually goes. Armed at BeforeEye1, disarmed at composite. */
+static BOOL g_traceFrames = FALSE;
+static volatile LONG g_traceActive = 0;
+static volatile LONG g_traceDrawCount = 0;
 /* Head-tracking per-frame state - the matrices themselves live with the tracking module further
  * down (they need the projection-cache globals); these two flags are up here because
  * VRBridge_Shutdown (defined earlier) clears them. */
@@ -690,6 +706,24 @@ static void VRBridge_ReadEnableFlag(void)
         LogLine("VRBridge: tracking flags - g_trackingDisabled=%d g_fakePose=%d",
                 g_trackingDisabled ? 1 : 0, g_fakePose ? 1 : 0);
     }
+
+    len = GetEnvironmentVariableA("PSYVR_DUMP_EYES", buf, sizeof(buf));
+    g_dumpEyes = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_dumpEyes) LogLine("VRBridge: PSYVR_DUMP_EYES=1 - eye/backbuffer BMP dumps every ~5s to %%TEMP%%");
+    len = GetEnvironmentVariableA("PSYVR_TRACE_FRAME", buf, sizeof(buf));
+    g_traceFrames = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_traceFrames) LogLine("VRBridge: PSYVR_TRACE_FRAME=1 - one-frame RT/Clear/draw traces every ~5s");
+
+    /* notes/35: eye render scale. Default 2x when the VR path is on (the headset wants far more
+     * than the game's native resolution), 1x otherwise (monitor-only users keep byte-identical
+     * behavior). PSYVR_RENDER_SCALE=1..4 overrides either way. */
+    g_eyeScale = g_vrSubmitEnabled ? 2 : 1;
+    len = GetEnvironmentVariableA("PSYVR_RENDER_SCALE", buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf) && buf[0] >= '1' && buf[0] <= '4') {
+        g_eyeScale = (UINT)(buf[0] - '0');
+    }
+    LogLine("VRBridge: eye render scale = %ux (PSYVR_RENDER_SCALE%s)", g_eyeScale,
+            (len > 0) ? " set" : " defaulted");
     if (g_vrSkipWaitPoses || g_vrSkipPumpEye) {
         LogLine("VRBridge: diagnostic bypass flags - g_vrSkipWaitPoses=%d g_vrSkipPumpEye=%d",
                 g_vrSkipWaitPoses ? 1 : 0, g_vrSkipPumpEye ? 1 : 0);
@@ -811,9 +845,8 @@ static void VRBridge_QueryRealGeometry(void)
         uint32_t rw = 0, rh = 0;
         g_pVRGetRecommendedRTSize(g_pVRSystem, &rw, &rh);
         LogLine("VRBridge_QueryRealGeometry: GetRecommendedRenderTargetSize = %u x %u per eye "
-                "(current VR-submit eye buffers are %ux%u, matching the game's own backbuffer - "
-                "see notes/32 Sec4 for why this session did not change that)",
-                rw, rh, g_bbWidth, g_bbHeight);
+                "(current VR-submit eye buffers are %ux%u = backbuffer %ux%u at %ux render scale - notes/35)",
+                rw, rh, g_eyeWidth, g_eyeHeight, g_bbWidth, g_bbHeight, g_eyeScale);
     }
 
     g_vrGeomValid = TRUE;
@@ -1454,6 +1487,18 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
     if (g_trackingDisabled) return;
     if (!g_projXScaleValid || g_projYScale == 0.0f) return;
 
+    /* notes/35: F11 recenters - drops the reference so the next valid pose re-captures it
+     * (position + yaw, same as startup). Edge-detected; costs one GetAsyncKeyState per frame. */
+    {
+        static SHORT s_prevF11 = 0;
+        SHORT f11 = GetAsyncKeyState(VK_F11);
+        if ((f11 & 0x8000) && !(s_prevF11 & 0x8000) && g_trackRefValid) {
+            g_trackRefValid = FALSE;
+            LogLine("HeadTrack: F11 pressed - recentering (reference re-captures on next valid pose)");
+        }
+        s_prevF11 = f11;
+    }
+
     if (g_fakePose) {
         /* Synthesized gentle sway (~±25° yaw, ~±8° pitch, ±6cm lateral) - makes the tracking
          * path visible on a monitor even though the null driver's real pose never moves. */
@@ -1805,9 +1850,27 @@ static volatile LONG g_eye2Presented = 0;
 static volatile LONG g_svscfCountEye1 = 0;
 static volatile LONG g_svscfCountEye2 = 0;
 
+void TraceFlushDrawsFwd(void); /* notes/35: defined with the trace hooks below */
+
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
 {
+    /* notes/35: one-full-cycle frame trace - armed here, disarmed at the NEXT BeforeEye1 so the
+     * capture includes everything after the composite too (post-present UI drawing etc.). */
+    if (g_traceFrames) {
+        static DWORD s_lastTrace = 0;
+        DWORD tnow = GetTickCount();
+        if (g_traceActive) {
+            TraceFlushDrawsFwd();
+            LogLine("TRACE: ==== frame trace END (next BeforeEye1 reached) ====");
+            g_traceActive = 0;
+        } else if (s_lastTrace == 0 || (DWORD)(tnow - s_lastTrace) >= 5000) {
+            LogLine("TRACE: ==== frame trace START (BeforeEye1) ====");
+            g_traceActive = 1;
+            s_lastTrace = tnow;
+        }
+    }
+
     g_stereoPhase = STEREO_PHASE_EYE1;
     g_eye2Presented = 0;
     SetEyeAndTarget(-1.0f, g_pEye1Surf, g_pEye1DepthStencil);
@@ -1816,6 +1879,7 @@ void __cdecl CandB_BeforeEye1_asm(void)
 void __cdecl CandB_BeforeEye2_asm(void) asm("CandB_BeforeEye2_asm");
 void __cdecl CandB_BeforeEye2_asm(void)
 {
+    if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- BeforeEye2 --"); }
     g_stereoPhase = STEREO_PHASE_EYE2;
     SetEyeAndTarget(+1.0f, g_pEye2Surf, g_pEye2DepthStencil);
 }
@@ -1823,6 +1887,7 @@ void __cdecl CandB_BeforeEye2_asm(void)
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
 void __cdecl CandB_AfterBoth_asm(void)
 {
+    if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }
     g_stereoPhase = STEREO_PHASE_IDLE;
     if (!g_stereoReady || !g_pDevice || !g_pRealBackBuffer) return;
 
@@ -2013,11 +2078,30 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
     g_bbWidth = pp->BackBufferWidth;
     g_bbHeight = pp->BackBufferHeight;
 
+    /* notes/35: eye surfaces at scale x backbuffer (same aspect - projection untouched). If the
+     * scaled allocations fail (VRAM/32-bit address space), fall back to 1x rather than losing
+     * stereo entirely. */
+    g_eyeWidth = g_bbWidth * g_eyeScale;
+    g_eyeHeight = g_bbHeight * g_eyeScale;
+
     hrBB = pDevice->lpVtbl->GetBackBuffer(pDevice, 0, 0, D3DBACKBUFFER_TYPE_MONO, &g_pRealBackBuffer);
-    hrE1 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_bbWidth, g_bbHeight, D3DFMT_A8R8G8B8,
+    hrE1 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_eyeWidth, g_eyeHeight, D3DFMT_A8R8G8B8,
                                                 D3DMULTISAMPLE_NONE, 0, FALSE, &g_pEye1Surf, NULL);
-    hrE2 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_bbWidth, g_bbHeight, D3DFMT_A8R8G8B8,
+    hrE2 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_eyeWidth, g_eyeHeight, D3DFMT_A8R8G8B8,
                                                 D3DMULTISAMPLE_NONE, 0, FALSE, &g_pEye2Surf, NULL);
+    if ((FAILED(hrE1) || FAILED(hrE2)) && g_eyeScale > 1) {
+        LogLine("SetupStereoSurfaces: %ux-scaled eye surfaces failed (hrE1=0x%08lX hrE2=0x%08lX) - falling back to 1x",
+                g_eyeScale, (unsigned long)hrE1, (unsigned long)hrE2);
+        if (g_pEye1Surf) { g_pEye1Surf->lpVtbl->Release(g_pEye1Surf); g_pEye1Surf = NULL; }
+        if (g_pEye2Surf) { g_pEye2Surf->lpVtbl->Release(g_pEye2Surf); g_pEye2Surf = NULL; }
+        g_eyeScale = 1;
+        g_eyeWidth = g_bbWidth;
+        g_eyeHeight = g_bbHeight;
+        hrE1 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_eyeWidth, g_eyeHeight, D3DFMT_A8R8G8B8,
+                                                    D3DMULTISAMPLE_NONE, 0, FALSE, &g_pEye1Surf, NULL);
+        hrE2 = pDevice->lpVtbl->CreateRenderTarget(pDevice, g_eyeWidth, g_eyeHeight, D3DFMT_A8R8G8B8,
+                                                    D3DMULTISAMPLE_NONE, 0, FALSE, &g_pEye2Surf, NULL);
+    }
 
     /* notes/22: capture the device's original auto depth-stencil surface (so it can be
      * restored after both eye passes) and give each eye its OWN private depth-stencil
@@ -2028,21 +2112,21 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
      * usage and is safe here since every eye pass unconditionally Clears its own depth
      * surface before drawing. */
     hrDS = pDevice->lpVtbl->GetDepthStencilSurface(pDevice, &g_pRealDepthStencil);
-    hrDS1 = pDevice->lpVtbl->CreateDepthStencilSurface(pDevice, g_bbWidth, g_bbHeight,
+    hrDS1 = pDevice->lpVtbl->CreateDepthStencilSurface(pDevice, g_eyeWidth, g_eyeHeight,
                                                         pp->AutoDepthStencilFormat,
                                                         D3DMULTISAMPLE_NONE, 0, TRUE,
                                                         &g_pEye1DepthStencil, NULL);
-    hrDS2 = pDevice->lpVtbl->CreateDepthStencilSurface(pDevice, g_bbWidth, g_bbHeight,
+    hrDS2 = pDevice->lpVtbl->CreateDepthStencilSurface(pDevice, g_eyeWidth, g_eyeHeight,
                                                         pp->AutoDepthStencilFormat,
                                                         D3DMULTISAMPLE_NONE, 0, TRUE,
                                                         &g_pEye2DepthStencil, NULL);
 
-    LogLine("SetupStereoSurfaces: GetBackBuffer hr=0x%08lX ptr=0x%p | Eye1 hr=0x%08lX ptr=0x%p | Eye2 hr=0x%08lX ptr=0x%p (%ux%u) | "
+    LogLine("SetupStereoSurfaces: GetBackBuffer hr=0x%08lX ptr=0x%p | Eye1 hr=0x%08lX ptr=0x%p | Eye2 hr=0x%08lX ptr=0x%p (%ux%u, scale=%ux, bb=%ux%u) | "
             "GetDS hr=0x%08lX ptr=0x%p | Eye1DS hr=0x%08lX ptr=0x%p | Eye2DS hr=0x%08lX ptr=0x%p",
             (unsigned long)hrBB, (void *)g_pRealBackBuffer,
             (unsigned long)hrE1, (void *)g_pEye1Surf,
             (unsigned long)hrE2, (void *)g_pEye2Surf,
-            g_bbWidth, g_bbHeight,
+            g_eyeWidth, g_eyeHeight, g_eyeScale, g_bbWidth, g_bbHeight,
             (unsigned long)hrDS, (void *)g_pRealDepthStencil,
             (unsigned long)hrDS1, (void *)g_pEye1DepthStencil,
             (unsigned long)hrDS2, (void *)g_pEye2DepthStencil);
@@ -2059,7 +2143,7 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
      * the VR bridge's own eye buffers can be sized to match g_bbWidth/g_bbHeight exactly - runs on
      * both initial CreateDevice AND every Reset (this same function handles both, unchanged). */
     if (g_stereoReady) {
-        VRBridge_OnStereoSurfacesReady(pDevice, g_bbWidth, g_bbHeight);
+        VRBridge_OnStereoSurfacesReady(pDevice, g_eyeWidth, g_eyeHeight);
     }
 }
 
@@ -2274,6 +2358,57 @@ static void InstallSetVSConstFHook(IDirect3DDevice9 *pDevice)
  * to the real Present, and resets the per-frame camera cache flag so the
  * next frame's first BuildViewMatrix hit re-caches a fresh clean base.
  */
+
+/* notes/35 diagnostic: write one render-target surface as a 32bpp BMP into %TEMP%. Uses a
+ * transient sysmem surface + GetRenderTargetData (same mechanism the VR readback path already
+ * proved cheap) and plain fwrite. Top-down BMP via negative biHeight - no row flipping. */
+static void DumpSurfaceBMP(IDirect3DSurface9 *surf, UINT w, UINT h, const char *name)
+{
+    IDirect3DSurface9 *sys = NULL;
+    D3DLOCKED_RECT lr;
+    char path[MAX_PATH];
+    DWORD tlen;
+    HRESULT hr;
+
+    if (!g_pDevice || !surf || w == 0 || h == 0) return;
+    tlen = GetTempPathA(sizeof(path), path);
+    if (tlen == 0 || tlen > sizeof(path) - 32) return;
+    strcat(path, name);
+
+    hr = g_pDevice->lpVtbl->CreateOffscreenPlainSurface(g_pDevice, w, h, D3DFMT_A8R8G8B8,
+                                                          D3DPOOL_SYSTEMMEM, &sys, NULL);
+    if (FAILED(hr)) { LogLine("DumpSurfaceBMP: scratch create failed hr=0x%08lX", (unsigned long)hr); return; }
+    hr = g_pDevice->lpVtbl->GetRenderTargetData(g_pDevice, surf, sys);
+    if (SUCCEEDED(hr) && SUCCEEDED(sys->lpVtbl->LockRect(sys, &lr, NULL, D3DLOCK_READONLY))) {
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            UINT row;
+            BITMAPFILEHEADER bfh;
+            BITMAPINFOHEADER bih;
+            memset(&bfh, 0, sizeof(bfh)); memset(&bih, 0, sizeof(bih));
+            bfh.bfType = 0x4D42; /* 'BM' */
+            bfh.bfOffBits = sizeof(bfh) + sizeof(bih);
+            bfh.bfSize = bfh.bfOffBits + w * h * 4;
+            bih.biSize = sizeof(bih);
+            bih.biWidth = (LONG)w;
+            bih.biHeight = -(LONG)h; /* top-down */
+            bih.biPlanes = 1;
+            bih.biBitCount = 32;
+            bih.biCompression = BI_RGB;
+            fwrite(&bfh, sizeof(bfh), 1, f);
+            fwrite(&bih, sizeof(bih), 1, f);
+            for (row = 0; row < h; row++)
+                fwrite((BYTE *)lr.pBits + row * lr.Pitch, w * 4, 1, f);
+            fclose(f);
+            LogLine("DumpSurfaceBMP: wrote %s (%ux%u)", path, w, h);
+        }
+        sys->lpVtbl->UnlockRect(sys);
+    } else {
+        LogLine("DumpSurfaceBMP: GetRenderTargetData/Lock failed hr=0x%08lX", (unsigned long)hr);
+    }
+    sys->lpVtbl->Release(sys);
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Present(
     IDirect3DDevice9 *This,
     CONST RECT *pSourceRect,
@@ -2284,6 +2419,13 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     LONG frame = InterlockedIncrement(&g_frameCounter);
     DWORD now = GetTickCount();
     BOOL doLog = (g_lastPresentLogTick == 0 || (DWORD)(now - g_lastPresentLogTick) >= 1000);
+
+    if (g_traceActive) {
+        TraceFlushDrawsFwd();
+        LogLine("TRACE: Present() hit phase=%ld eye2Presented=%ld%s", g_stereoPhase, g_eye2Presented,
+                (g_stereoPhase == STEREO_PHASE_EYE1) ? "  -> SUPPRESSED (eye1 internal)" :
+                (g_stereoPhase == STEREO_PHASE_EYE2 && g_eye2Presented) ? "  -> SUPPRESSED (extra eye2)" : "");
+    }
 
     /* CandB's own nested call tree calls Present internally (discovered
      * this session - see the comment above CandB_BeforeEye1_asm). While
@@ -2312,12 +2454,25 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
          * halves of the real backbuffer before letting this one real
          * hardware Present go through. */
         g_eye2Presented = 1;
+
+        /* notes/35 diagnostic (PSYVR_DUMP_EYES=1): dump both eye surfaces at the exact moment
+         * the composite reads them - ground truth for the notes/23 black-left-eye bug (is eye1's
+         * SURFACE black, or does the content get lost later?). ~5s throttle. */
+        if (g_dumpEyes) {
+            static DWORD s_lastDump = 0;
+            DWORD dnow = GetTickCount();
+            if (s_lastDump == 0 || (DWORD)(dnow - s_lastDump) >= 5000) {
+                DumpSurfaceBMP(g_pEye1Surf, g_eyeWidth, g_eyeHeight, "psyvr_eye1.bmp");
+                DumpSurfaceBMP(g_pEye2Surf, g_eyeWidth, g_eyeHeight, "psyvr_eye2.bmp");
+                s_lastDump = dnow;
+            }
+        }
         RECT srcFull;
         RECT dstLeft;
         RECT dstRight;
         HRESULT hrL, hrR;
 
-        srcFull.left = 0; srcFull.top = 0; srcFull.right = (LONG)g_bbWidth; srcFull.bottom = (LONG)g_bbHeight;
+        srcFull.left = 0; srcFull.top = 0; srcFull.right = (LONG)g_eyeWidth; srcFull.bottom = (LONG)g_eyeHeight;
         dstLeft.left = 0; dstLeft.top = 0; dstLeft.right = (LONG)(g_bbWidth / 2); dstLeft.bottom = (LONG)g_bbHeight;
         dstRight.left = (LONG)(g_bbWidth / 2); dstRight.top = 0; dstRight.right = (LONG)g_bbWidth; dstRight.bottom = (LONG)g_bbHeight;
 
@@ -2458,6 +2613,253 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(
     return hr;
 }
 
+/* notes/35: with eye render targets bigger than the backbuffer, any viewport the GAME sets in
+ * backbuffer pixel units during an eye pass would confine rendering to the top-left corner of
+ * the scaled target. D3D9 auto-sets a full-RT viewport on every SetRenderTarget (covering the
+ * common case), but this hook covers explicit game viewports (letterboxing, partial-screen
+ * effects): while an eye pass is in flight and scale > 1, scale X/Y/Width/Height up to match.
+ * Outside eye phases (real backbuffer bound) viewports pass through untouched. */
+typedef HRESULT (STDMETHODCALLTYPE *SetViewport_t)(IDirect3DDevice9 *This, CONST D3DVIEWPORT9 *pViewport);
+static SetViewport_t g_pRealSetViewport = NULL;
+
+static HRESULT STDMETHODCALLTYPE Hook_SetViewport(IDirect3DDevice9 *This, CONST D3DVIEWPORT9 *pViewport)
+{
+    if (g_stereoPhase != STEREO_PHASE_IDLE && g_eyeScale > 1 && pViewport != NULL) {
+        D3DVIEWPORT9 vp = *pViewport;
+        vp.X *= g_eyeScale;
+        vp.Y *= g_eyeScale;
+        vp.Width *= g_eyeScale;
+        vp.Height *= g_eyeScale;
+        {
+            static DWORD s_lastLog = 0;
+            DWORD now = GetTickCount();
+            if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
+                LogLine("SetViewport (eye phase %ld): game vp %lux%lu@(%lu,%lu) -> scaled %lux%lu@(%lu,%lu)",
+                        g_stereoPhase,
+                        (unsigned long)pViewport->Width, (unsigned long)pViewport->Height,
+                        (unsigned long)pViewport->X, (unsigned long)pViewport->Y,
+                        (unsigned long)vp.Width, (unsigned long)vp.Height,
+                        (unsigned long)vp.X, (unsigned long)vp.Y);
+                s_lastLog = now;
+            }
+        }
+        return g_pRealSetViewport(This, &vp);
+    }
+    return g_pRealSetViewport(This, pViewport);
+}
+
+/* ---- notes/35: one-frame RT/Clear/draw trace (PSYVR_TRACE_FRAME=1) -------------------------- */
+typedef HRESULT (STDMETHODCALLTYPE *SetRenderTarget_t)(IDirect3DDevice9 *This, DWORD idx, IDirect3DSurface9 *pRT);
+typedef HRESULT (STDMETHODCALLTYPE *Clear_t)(IDirect3DDevice9 *This, DWORD Count, CONST D3DRECT *pRects,
+                                             DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil);
+typedef HRESULT (STDMETHODCALLTYPE *DrawPrimitive_t)(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT s, UINT c);
+typedef HRESULT (STDMETHODCALLTYPE *DrawIndexedPrimitive_t)(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
+                                                            INT b, UINT mi, UINT nv, UINT si, UINT pc);
+typedef HRESULT (STDMETHODCALLTYPE *DrawPrimitiveUP_t)(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT c,
+                                                       CONST void *d, UINT stride);
+typedef HRESULT (STDMETHODCALLTYPE *DrawIndexedPrimitiveUP_t)(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
+                                                              UINT mi, UINT nv, UINT pc, CONST void *id,
+                                                              D3DFORMAT ifmt, CONST void *vd, UINT stride);
+static SetRenderTarget_t g_pRealSetRenderTarget = NULL;
+static Clear_t g_pRealClear = NULL;
+static DrawPrimitive_t g_pRealDrawPrimitive = NULL;
+static DrawIndexedPrimitive_t g_pRealDrawIndexedPrimitive = NULL;
+static DrawPrimitiveUP_t g_pRealDrawPrimitiveUP = NULL;
+static DrawIndexedPrimitiveUP_t g_pRealDrawIndexedPrimitiveUP = NULL;
+
+typedef HRESULT (STDMETHODCALLTYPE *StretchRect_t)(IDirect3DDevice9 *This, IDirect3DSurface9 *pSrc,
+                                                   CONST RECT *pSrcRect, IDirect3DSurface9 *pDst,
+                                                   CONST RECT *pDstRect, D3DTEXTUREFILTERTYPE Filter);
+static StretchRect_t g_pRealStretchRect = NULL;
+
+static const char *TraceSurfName(IDirect3DSurface9 *s)
+{
+    if (s == NULL) return "NULL";
+    if (s == g_pEye1Surf) return "EYE1";
+    if (s == g_pEye2Surf) return "EYE2";
+    if (s == g_pRealBackBuffer) return "BACKBUF";
+    if (s == g_pEye1DepthStencil) return "EYE1DS";
+    if (s == g_pEye2DepthStencil) return "EYE2DS";
+    if (s == g_pRealDepthStencil) return "REALDS";
+    return "other";
+}
+
+static void TraceFlushDraws(void)
+{
+    LONG n = InterlockedExchange(&g_traceDrawCount, 0);
+    if (n > 0) LogLine("TRACE:   ... %ld draw calls (phase=%ld)", n, g_stereoPhase);
+}
+void TraceFlushDrawsFwd(void) { TraceFlushDraws(); } /* for the CandB callbacks defined earlier */
+
+static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9 *This, DWORD idx, IDirect3DSurface9 *pRT)
+{
+    /* notes/35: THE notes/23 black-left-eye fix. The engine records "the screen" RT pointer once
+     * per frame while the REAL backbuffer is still bound (post-present phase), restores that
+     * recorded pointer mid-pass after its render-to-texture work, then re-records after its own
+     * (suppressed) internal Present - so during eye 1's pass its "restore the screen" bind targets
+     * the REAL BACKBUFFER and the whole menu scene (73+ draws, traced live) lands there instead of
+     * in EYE1, which stays at its cleared black. Eye 2's pass re-recorded after BeforeEye2 and
+     * correctly restores EYE2. Fix: while an eye pass is in flight, binding the real backbuffer
+     * MEANS binding that eye's target - redirect it. Inert for render paths (gameplay) that never
+     * bind the backbuffer mid-pass, and for idle phase (AfterBoth's own legitimate restore). */
+    if (idx == 0 && pRT == g_pRealBackBuffer && g_stereoReady) {
+        IDirect3DSurface9 *redir = NULL;
+        if (g_stereoPhase == STEREO_PHASE_EYE1) redir = g_pEye1Surf;
+        else if (g_stereoPhase == STEREO_PHASE_EYE2) redir = g_pEye2Surf;
+        if (redir) {
+            static DWORD s_lastLog = 0;
+            DWORD rnow = GetTickCount();
+            if (s_lastLog == 0 || (DWORD)(rnow - s_lastLog) >= 2000) {
+                LogLine("SetRenderTarget redirect: game bound BACKBUF during eye phase %ld -> %s (notes/23 fix)",
+                        g_stereoPhase, (g_stereoPhase == STEREO_PHASE_EYE1) ? "EYE1" : "EYE2");
+                s_lastLog = rnow;
+            }
+            if (g_traceActive) {
+                TraceFlushDraws();
+                LogLine("TRACE: SetRenderTarget(%lu, %p=BACKBUF) phase=%ld  -> REDIRECTED to %s",
+                        (unsigned long)idx, (void *)pRT, g_stereoPhase, TraceSurfName(redir));
+            }
+            return g_pRealSetRenderTarget(This, idx, redir);
+        }
+    }
+    if (g_traceActive) {
+        TraceFlushDraws();
+        LogLine("TRACE: SetRenderTarget(%lu, %p=%s) phase=%ld", (unsigned long)idx, (void *)pRT,
+                TraceSurfName(pRT), g_stereoPhase);
+    }
+    return g_pRealSetRenderTarget(This, idx, pRT);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_Clear(IDirect3DDevice9 *This, DWORD Count, CONST D3DRECT *pRects,
+                                            DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
+{
+    if (g_traceActive) {
+        IDirect3DSurface9 *cur = NULL;
+        This->lpVtbl->GetRenderTarget(This, 0, &cur);
+        TraceFlushDraws();
+        LogLine("TRACE: Clear(flags=0x%lX color=0x%08lX) on RT=%s phase=%ld",
+                (unsigned long)Flags, (unsigned long)Color, TraceSurfName(cur), g_stereoPhase);
+        if (cur) cur->lpVtbl->Release(cur);
+    }
+    return g_pRealClear(This, Count, pRects, Flags, Color, Z, Stencil);
+}
+
+typedef HRESULT (STDMETHODCALLTYPE *SetDepthStencilSurface_t)(IDirect3DDevice9 *This, IDirect3DSurface9 *pS);
+typedef HRESULT (STDMETHODCALLTYPE *GetRenderTarget_t)(IDirect3DDevice9 *This, DWORD idx, IDirect3DSurface9 **ppRT);
+static SetDepthStencilSurface_t g_pRealSetDepthStencilSurface = NULL;
+static GetRenderTarget_t g_pRealGetRenderTarget = NULL;
+
+static HRESULT STDMETHODCALLTYPE Hook_SetDepthStencilSurface(IDirect3DDevice9 *This, IDirect3DSurface9 *pS)
+{
+    /* notes/35 (black-left-eye fix, part 3): same principle as the RT redirect - during an eye
+     * pass, binding the REAL depth-stencil means binding that eye's private one. A mid-pass
+     * restore of the real DS breaks depth testing for everything drawn after it (each eye's
+     * geometry was depth-laid into its own private DS - notes/22). */
+    if (pS == g_pRealDepthStencil && g_stereoReady && pS != NULL) {
+        IDirect3DSurface9 *redir = NULL;
+        if (g_stereoPhase == STEREO_PHASE_EYE1) redir = g_pEye1DepthStencil;
+        else if (g_stereoPhase == STEREO_PHASE_EYE2) redir = g_pEye2DepthStencil;
+        if (redir) {
+            if (g_traceActive) {
+                TraceFlushDraws();
+                LogLine("TRACE: SetDepthStencilSurface(REALDS) phase=%ld  -> REDIRECTED to %s",
+                        g_stereoPhase, TraceSurfName(redir));
+            }
+            return g_pRealSetDepthStencilSurface(This, redir);
+        }
+    }
+    if (g_traceActive) {
+        TraceFlushDraws();
+        LogLine("TRACE: SetDepthStencilSurface(%p=%s) phase=%ld", (void *)pS, TraceSurfName(pS), g_stereoPhase);
+    }
+    return g_pRealSetDepthStencilSurface(This, pS);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_GetRenderTarget(IDirect3DDevice9 *This, DWORD idx, IDirect3DSurface9 **ppRT)
+{
+    HRESULT hr = g_pRealGetRenderTarget(This, idx, ppRT);
+    if (g_traceActive && SUCCEEDED(hr) && ppRT) {
+        TraceFlushDraws();
+        LogLine("TRACE: GetRenderTarget(%lu) -> %p=%s phase=%ld", (unsigned long)idx, (void *)*ppRT,
+                TraceSurfName(*ppRT), g_stereoPhase);
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_StretchRect(IDirect3DDevice9 *This, IDirect3DSurface9 *pSrc,
+                                                  CONST RECT *pSrcRect, IDirect3DSurface9 *pDst,
+                                                  CONST RECT *pDstRect, D3DTEXTUREFILTERTYPE Filter)
+{
+    /* notes/35 (black-left-eye fix, part 2): the engine's post-process chain reads "the screen"
+     * back via StretchRect. During an eye pass the screen IS the eye surface - redirect a
+     * backbuffer SOURCE the same way Hook_SetRenderTarget redirects a backbuffer bind. Source
+     * rects are scaled to the eye surface's dims (they differ when g_eyeScale > 1). */
+    if (pSrc == g_pRealBackBuffer && g_stereoReady &&
+        (g_stereoPhase == STEREO_PHASE_EYE1 || g_stereoPhase == STEREO_PHASE_EYE2)) {
+        IDirect3DSurface9 *eyeSrc = (g_stereoPhase == STEREO_PHASE_EYE1) ? g_pEye1Surf : g_pEye2Surf;
+        RECT sc;
+        CONST RECT *pUse = pSrcRect;
+        if (pSrcRect && g_eyeScale > 1) {
+            sc.left = pSrcRect->left * (LONG)g_eyeScale;
+            sc.top = pSrcRect->top * (LONG)g_eyeScale;
+            sc.right = pSrcRect->right * (LONG)g_eyeScale;
+            sc.bottom = pSrcRect->bottom * (LONG)g_eyeScale;
+            pUse = &sc;
+        }
+        if (g_traceActive) {
+            TraceFlushDraws();
+            LogLine("TRACE: StretchRect(src=BACKBUF -> dst=%s) phase=%ld  -> src REDIRECTED to %s",
+                    TraceSurfName(pDst), g_stereoPhase, TraceSurfName(eyeSrc));
+        }
+        {
+            static DWORD s_lastLog = 0;
+            DWORD rnow = GetTickCount();
+            if (s_lastLog == 0 || (DWORD)(rnow - s_lastLog) >= 2000) {
+                LogLine("StretchRect redirect: game read BACKBUF during eye phase %ld -> reading %s instead (notes/23 fix)",
+                        g_stereoPhase, (g_stereoPhase == STEREO_PHASE_EYE1) ? "EYE1" : "EYE2");
+                s_lastLog = rnow;
+            }
+        }
+        return g_pRealStretchRect(This, eyeSrc, pUse, pDst, pDstRect, Filter);
+    }
+    if (g_traceActive) {
+        TraceFlushDraws();
+        LogLine("TRACE: StretchRect(src=%s -> dst=%s) phase=%ld", TraceSurfName(pSrc), TraceSurfName(pDst), g_stereoPhase);
+    }
+    return g_pRealStretchRect(This, pSrc, pSrcRect, pDst, pDstRect, Filter);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT s, UINT c)
+{
+    if (g_traceActive) InterlockedIncrement(&g_traceDrawCount);
+    return g_pRealDrawPrimitive(This, t, s, c);
+}
+static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
+                                                           INT b, UINT mi, UINT nv, UINT si, UINT pc)
+{
+    if (g_traceActive) InterlockedIncrement(&g_traceDrawCount);
+    return g_pRealDrawIndexedPrimitive(This, t, b, mi, nv, si, pc);
+}
+static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT c,
+                                                      CONST void *d, UINT stride)
+{
+    if (g_traceActive) {
+        TraceFlushDraws();
+        LogLine("TRACE: DrawPrimitiveUP(count=%u) phase=%ld  <- pretransformed/UP path", c, g_stereoPhase);
+    }
+    return g_pRealDrawPrimitiveUP(This, t, c, d, stride);
+}
+static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
+                                                             UINT mi, UINT nv, UINT pc, CONST void *id,
+                                                             D3DFORMAT ifmt, CONST void *vd, UINT stride)
+{
+    if (g_traceActive) {
+        TraceFlushDraws();
+        LogLine("TRACE: DrawIndexedPrimitiveUP(prims=%u) phase=%ld  <- pretransformed/UP path", pc, g_stereoPhase);
+    }
+    return g_pRealDrawIndexedPrimitiveUP(This, t, mi, nv, pc, id, ifmt, vd, stride);
+}
+
 /* Patch IDirect3DDevice9::Present (vtbl slot 17) and ::Reset (vtbl slot 16)
  * to point at our hooks. The vtable pointed to by This->lpVtbl is a single
  * shared, normally read-only structure (typically in the real d3d9.dll's
@@ -2484,12 +2886,37 @@ static void InstallPresentHook(IDirect3DDevice9 *pDevice)
     vtbl->Present = Hook_Present;
     g_pRealReset = vtbl->Reset;
     vtbl->Reset = Hook_Reset;
+    g_pRealSetViewport = vtbl->SetViewport;
+    vtbl->SetViewport = Hook_SetViewport; /* notes/35: eye-scale viewport correction, same vtable */
+    /* notes/35: SetRenderTarget and StretchRect are ALWAYS hooked - they carry the notes/23
+     * black-left-eye fix (backbuffer bind/read redirect during eye passes), not just tracing. */
+    g_pRealSetRenderTarget = vtbl->SetRenderTarget;
+    vtbl->SetRenderTarget = Hook_SetRenderTarget;
+    g_pRealStretchRect = vtbl->StretchRect;
+    vtbl->StretchRect = Hook_StretchRect;
+    g_pRealSetDepthStencilSurface = vtbl->SetDepthStencilSurface;
+    vtbl->SetDepthStencilSurface = Hook_SetDepthStencilSurface;
+    g_pRealGetRenderTarget = vtbl->GetRenderTarget;
+    vtbl->GetRenderTarget = Hook_GetRenderTarget;
+    if (g_traceFrames || g_dumpEyes) { /* remaining trace hooks: diagnostics only */
+        g_pRealClear = vtbl->Clear;
+        vtbl->Clear = Hook_Clear;
+        g_pRealDrawPrimitive = vtbl->DrawPrimitive;
+        vtbl->DrawPrimitive = Hook_DrawPrimitive;
+        g_pRealDrawIndexedPrimitive = vtbl->DrawIndexedPrimitive;
+        vtbl->DrawIndexedPrimitive = Hook_DrawIndexedPrimitive;
+        g_pRealDrawPrimitiveUP = vtbl->DrawPrimitiveUP;
+        vtbl->DrawPrimitiveUP = Hook_DrawPrimitiveUP;
+        g_pRealDrawIndexedPrimitiveUP = vtbl->DrawIndexedPrimitiveUP;
+        vtbl->DrawIndexedPrimitiveUP = Hook_DrawIndexedPrimitiveUP;
+        LogLine("Trace hooks installed (SetRenderTarget/Clear/Draw*)");
+    }
 
     VirtualProtect(vtbl, sizeof(*vtbl), oldProtect, &oldProtect);
 
     g_deviceHooked = TRUE;
-    LogLine("Hooked IDirect3DDevice9::Present (vtable slot 17), original=0x%p; ::Reset (vtable slot 16), original=0x%p",
-            (void *)g_pRealPresent, (void *)g_pRealReset);
+    LogLine("Hooked IDirect3DDevice9::Present (vtable slot 17), original=0x%p; ::Reset (vtable slot 16), original=0x%p; ::SetViewport (slot 47), original=0x%p",
+            (void *)g_pRealPresent, (void *)g_pRealReset, (void *)g_pRealSetViewport);
 }
 
 /* ---- CreateDevice hook (IDirect3D9 vtable slot 16) ---------------------- */
