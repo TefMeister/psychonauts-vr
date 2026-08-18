@@ -1,6 +1,6 @@
 # Proxy `d3d9.dll` — usage
 
-**v0.1.3-alpha.** This is the mod's core component: a `d3d9.dll` that loads in place of the
+**v0.1.4-alpha.** This is the mod's core component: a `d3d9.dll` that loads in place of the
 system one (standard Windows DLL search order, the same mechanism dxwrapper and most D3D9 mods
 use). It does three things now:
 
@@ -123,6 +123,12 @@ real headset** — that is exactly what this release exists to test.
      headset.
    - `PSYVR_RENDER_SCALE=1..4` — eye render-resolution multiplier (default 2 with the VR path).
    - `PSYVR_UI_DEPTH=<world units>` — virtual depth for HUD/menu UI (default 200 ≈ 2m; 0 = off).
+   - `PSYVR_FOV_SCALE=0.5..2.5` — multiplies the game's rendered field of view (default 1.0 =
+     untouched). The compositor maps the image onto the headset's much wider frustum, so the
+     game's native FOV can read as zoomed-in — the proxy log prints a
+     `suggested PSYVR_FOV_SCALE` computed from your headset's real geometry; try that value if
+     the world feels magnified. A wider FOV spreads pixels thinner — consider pairing with
+     `PSYVR_RENDER_SCALE=3`.
    - **F11** in-game re-centers head tracking (re-captures the reference position/yaw).
 5. The log's `VRBridge_Init: HMD identity:` line records which headset OpenVR reported, and
    `HeadTrack:` lines show the live tracking state.
