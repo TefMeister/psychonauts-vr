@@ -1,6 +1,24 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-18 afternoon #3 (session 37: PSYVR_FOV_SCALE knob implemented and
+Last updated: 2026-08-18 late afternoon (session 38: the notes/15-18 INPUT BLOCKER IS SOLVED —
+plain SendInput with scan codes + genuinely-foreground game window advances the title screen
+and navigates the menu, verified twice via eye-dump diffs. Autonomous gameplay testing is now
+possible (menu-item selection deliberately deferred pending user guidance on save slots).
+Also: v0.1.4-alpha released with the PSYVR_FOV_SCALE knob + launcher bat asset; notes/37
+housekeeping cleared. Tonight's headset test should use v0.1.4. Full detail in notes/38)
+
+## Session 38 (2026-08-18 late afternoon): input blocker solved, v0.1.4 shipped
+
+- SendInput(SCANCODE) + SetForegroundWindow (verified, abort-on-fail) + hands-off protocol =
+  working synthetic input. SPACE advanced title->menu; RIGHT walked Raz across the brain.
+  Old debugger-based buffer forgery (notes/15-18) bypassed the real input stack - that was the
+  whole problem. Helper: tools/input/send_key.ps1.
+- v0.1.4-alpha: PSYVR_FOV_SCALE knob + suggested-value logging + Launch-Psychonauts-VR.bat.
+- Full detail in `notes/38-input-blocker-solved-sendinput.md`.
+
+## Prior header (session 37)
+
+(Last updated: 2026-08-18 afternoon #3 (session 37: PSYVR_FOV_SCALE knob implemented and
 numerically verified — the compositor maps eye textures onto the headset's ~80°+ frustum, so
 the game's ~52° fovy reads as zoomed-in; the knob scales rawFov in place at the BPM hook and
 the log now prints a suggested value from the real HMD tangents. PSYVR_RENDER_SCALE=3 validated
