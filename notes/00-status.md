@@ -1,6 +1,22 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-18 late afternoon (session 38: the notes/15-18 INPUT BLOCKER IS SOLVED —
+Last updated: 2026-08-18 late afternoon #2 (session 39: AUTONOMOUS GAMEPLAY ENTRY VERIFIED
+end-to-end — synthetic input drove the game from cold title screen through the menu's blue
+CONTINUE door into real Whispering Rock gameplay (world-space camera coords + HUD visible in
+the eye dump), zero human keypresses. Door trigger = jump while on/over the card, via
+micro-step+jump loop. Script: tools/input/enter_gameplay.ps1. The full test loop is now
+scriptable. Tonight's headset test (v0.1.4-alpha) is the next event. Details in notes/39)
+
+## Session 39 (2026-08-18): autonomous gameplay entry verified
+
+- Route: SPACE at title -> UP x3, LEFT x1 -> blue CONTINUE card (middle of three) ->
+  micro-steps with a jump after each -> save loads -> gameplay. Verified via BVM camera
+  coords jumping to the notes/22 world-space region + eye-dump showing Raz + HUD in-level.
+- Full detail in `notes/39-autonomous-gameplay-entry-verified.md`.
+
+## Prior header (session 38)
+
+(Last updated: 2026-08-18 late afternoon (session 38: the notes/15-18 INPUT BLOCKER IS SOLVED —
 plain SendInput with scan codes + genuinely-foreground game window advances the title screen
 and navigates the menu, verified twice via eye-dump diffs. Autonomous gameplay testing is now
 possible (menu-item selection deliberately deferred pending user guidance on save slots).
