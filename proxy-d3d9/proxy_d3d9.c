@@ -594,6 +594,41 @@ static BOOL g_dumpEyes = FALSE; /* PSYVR_DUMP_EYES=1: periodic BMP dumps of eye1
 static BOOL g_traceFrames = FALSE;
 static volatile LONG g_traceActive = 0;
 static volatile LONG g_traceDrawCount = 0;
+
+/* notes/36: PSYVR_REG_HISTO=1 - accumulate a histogram of SetVertexShaderConstantF
+ * (StartRegister -> upload count, last/max Vector4fCount) during eye phases, flushed to the log
+ * every ~5s. Recon for the skinned-geometry (bone matrix) constant range - the one register
+ * family the stereo/tracking correction doesn't cover yet. */
+static BOOL g_regHisto = FALSE;
+static volatile LONG g_regHistoCount[256];
+static BYTE g_regHistoVecMax[256];
+/* notes/36: per-draw register-combination tracking. Bits set in SVSCF for interesting registers,
+ * consumed at each draw call: combo[mask]++ tells us which register sets arrive together per
+ * draw (e.g. "r96 bones WITHOUT a fresh r6" = skinned draws rely on an earlier r6 upload, or
+ * don't use r6 at all - the shader bytecode dumps settle which). */
+#define REGBIT_R6   0x01
+#define REGBIT_R10  0x02
+#define REGBIT_R13  0x04
+#define REGBIT_R16  0x08
+#define REGBIT_R64  0x10
+#define REGBIT_R96  0x20
+static volatile LONG g_regComboMask = 0;
+static volatile LONG g_regComboCount[64];
+static volatile LONG g_vsDumpIndex = 0; /* CreateVertexShader bytecode dump counter */
+
+/* notes/36: UI depth. Bytecode analysis of ALL 455 of the game's vertex shaders found exactly two
+ * position paths: 445 shaders (all rigid + all 403 skinned/bone-palette ones) transform through
+ * the corrected c6 matrix - already stereo/tracking-correct - and 10 pure screen-space UI shaders
+ * (oPos = input + c50, never reading c6..c9) which bypass the correction entirely, so the HUD
+ * renders with ZERO parallax and would sit at infinity in the headset. Fix: identify those
+ * shaders at CreateVertexShader time (signature: no const read in c6..c9), track when one is
+ * bound, and shift its per-draw c50.x upload per eye to place the UI at a comfortable virtual
+ * depth: shift = -d * xScale / PSYVR_UI_DEPTH (world units, default 200 ~= 2m; 0 disables). */
+static float g_uiDepthWorld = 200.0f;
+#define UI_SHADER_MAX 64
+static void *g_uiShaders[UI_SHADER_MAX];
+static volatile LONG g_uiShaderCount = 0;
+static volatile LONG g_curShaderIsUI = 0;
 /* Head-tracking per-frame state - the matrices themselves live with the tracking module further
  * down (they need the projection-cache globals); these two flags are up here because
  * VRBridge_Shutdown (defined earlier) clears them. */
@@ -713,6 +748,20 @@ static void VRBridge_ReadEnableFlag(void)
     len = GetEnvironmentVariableA("PSYVR_TRACE_FRAME", buf, sizeof(buf));
     g_traceFrames = (len > 0 && len < sizeof(buf) && buf[0] == '1');
     if (g_traceFrames) LogLine("VRBridge: PSYVR_TRACE_FRAME=1 - one-frame RT/Clear/draw traces every ~5s");
+    len = GetEnvironmentVariableA("PSYVR_REG_HISTO", buf, sizeof(buf));
+    g_regHisto = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_regHisto) LogLine("VRBridge: PSYVR_REG_HISTO=1 - vertex-shader-constant register histogram every ~5s");
+
+    {
+        char dbuf[16];
+        len = GetEnvironmentVariableA("PSYVR_UI_DEPTH", dbuf, sizeof(dbuf));
+        if (len > 0 && len < sizeof(dbuf)) {
+            float v = 0.0f;
+            if (sscanf(dbuf, "%f", &v) == 1 && v >= 0.0f && v < 100000.0f)
+                g_uiDepthWorld = v;
+        }
+        LogLine("VRBridge: UI depth = %.0f world units (PSYVR_UI_DEPTH; 0 = UI stays at infinity)", g_uiDepthWorld);
+    }
 
     /* notes/35: eye render scale. Default 2x when the VR path is on (the headset wants far more
      * than the game's native resolution), 1x otherwise (monitor-only users keep byte-identical
@@ -1851,6 +1900,7 @@ static volatile LONG g_svscfCountEye1 = 0;
 static volatile LONG g_svscfCountEye2 = 0;
 
 void TraceFlushDrawsFwd(void); /* notes/35: defined with the trace hooks below */
+void UIShift_ReconcileFwd(void); /* notes/36: defined with the UI-depth machinery below */
 
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
@@ -1874,6 +1924,7 @@ void __cdecl CandB_BeforeEye1_asm(void)
     g_stereoPhase = STEREO_PHASE_EYE1;
     g_eye2Presented = 0;
     SetEyeAndTarget(-1.0f, g_pEye1Surf, g_pEye1DepthStencil);
+    UIShift_ReconcileFwd(); /* notes/36: phase changed - re-aim the UI depth shift */
 }
 
 void __cdecl CandB_BeforeEye2_asm(void) asm("CandB_BeforeEye2_asm");
@@ -1882,6 +1933,7 @@ void __cdecl CandB_BeforeEye2_asm(void)
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- BeforeEye2 --"); }
     g_stereoPhase = STEREO_PHASE_EYE2;
     SetEyeAndTarget(+1.0f, g_pEye2Surf, g_pEye2DepthStencil);
+    UIShift_ReconcileFwd(); /* notes/36 */
 }
 
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
@@ -1889,6 +1941,7 @@ void __cdecl CandB_AfterBoth_asm(void)
 {
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }
     g_stereoPhase = STEREO_PHASE_IDLE;
+    UIShift_ReconcileFwd(); /* notes/36: phase idle - removes any applied UI shift */
     if (!g_stereoReady || !g_pDevice || !g_pRealBackBuffer) return;
 
     /* notes/28: both eyes' private render targets (g_pEye1Surf/g_pEye2Surf) are now fully
@@ -2222,12 +2275,61 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
  * map to upload[2][r]/upload[3][r] - flat indices 8+r/12+r. */
 #define STEREO_WVP_REGISTER 6
 
+/* notes/36 UI depth: the wanted per-eye shift for the CURRENT phase, in clip units - a point at
+ * PSYVR_UI_DEPTH world units projects with exactly this offset (shift = -d*xScale/D, the same d
+ * the stereo correction uses). Zero when disabled, no UI shader bound, or outside eye phases. */
+static float UIShift_Wanted(void)
+{
+    float d;
+    int eyeIdx;
+    if (!g_curShaderIsUI || g_uiDepthWorld <= 0.0f || !g_projXScaleValid) return 0.0f;
+    if (g_stereoPhase == STEREO_PHASE_EYE1) eyeIdx = 0;
+    else if (g_stereoPhase == STEREO_PHASE_EYE2) eyeIdx = 1;
+    else return 0.0f;
+    d = g_vrGeomValid ? g_realHalfIPD[eyeIdx] : STEREO_HALF_IPD * (eyeIdx == 0 ? -1.0f : 1.0f);
+    return (-d) * g_projXScale / g_uiDepthWorld;
+}
+
+static float g_uiShiftApplied = 0.0f; /* delta currently baked into the device's c50.x */
+
 static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
     IDirect3DDevice9 *This,
     UINT StartRegister,
     CONST float *pConstantData,
     UINT Vector4fCount)
 {
+    /* notes/36 recon: per-register upload histogram during eye phases (see g_regHisto). */
+    if (g_regHisto && g_stereoPhase != STEREO_PHASE_IDLE && StartRegister < 256) {
+        InterlockedIncrement(&g_regHistoCount[StartRegister]);
+        if (Vector4fCount > g_regHistoVecMax[StartRegister] && Vector4fCount < 256)
+            g_regHistoVecMax[StartRegister] = (BYTE)Vector4fCount;
+        switch (StartRegister) {
+        case 6:  InterlockedOr(&g_regComboMask, REGBIT_R6); break;
+        case 10: InterlockedOr(&g_regComboMask, REGBIT_R10); break;
+        case 13: InterlockedOr(&g_regComboMask, REGBIT_R13); break;
+        case 16: InterlockedOr(&g_regComboMask, REGBIT_R16); break;
+        case 64: InterlockedOr(&g_regComboMask, REGBIT_R64); break;
+        case 96: InterlockedOr(&g_regComboMask, REGBIT_R96); break;
+        default: break;
+        }
+    }
+
+    /* notes/36 UI depth: a game upload of c50 replaces any shift we baked in - re-apply it on
+     * the way through when a UI shader is bound during an eye phase (see UIShift_Wanted). */
+    if (StartRegister == 50 && Vector4fCount >= 1 && pConstantData != NULL) {
+        float want = UIShift_Wanted();
+        g_uiShiftApplied = want;
+        if (want != 0.0f) {
+            float first[4];
+            memcpy(first, pConstantData, sizeof(first));
+            first[0] += want;
+            if (Vector4fCount == 1)
+                return g_pRealSetVSConstF(This, 50, first, 1);
+            g_pRealSetVSConstF(This, 50, first, 1);
+            return g_pRealSetVSConstF(This, 51, pConstantData + 4, Vector4fCount - 1);
+        }
+    }
+
     if (g_stereoPhase != STEREO_PHASE_IDLE &&
         StartRegister == STEREO_WVP_REGISTER && Vector4fCount == 4 &&
         pConstantData != NULL && g_projXScaleValid) {
@@ -2465,6 +2567,38 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
                 DumpSurfaceBMP(g_pEye1Surf, g_eyeWidth, g_eyeHeight, "psyvr_eye1.bmp");
                 DumpSurfaceBMP(g_pEye2Surf, g_eyeWidth, g_eyeHeight, "psyvr_eye2.bmp");
                 s_lastDump = dnow;
+            }
+        }
+
+        /* notes/36: flush the vertex-shader-constant register histogram (~5s cadence). One line
+         * per window: reg:count(xMaxVecs) for every register touched during eye phases. */
+        if (g_regHisto) {
+            static DWORD s_lastHisto = 0;
+            DWORD hnow = GetTickCount();
+            if (s_lastHisto == 0 || (DWORD)(hnow - s_lastHisto) >= 5000) {
+                char line[900];
+                int pos = 0, reg;
+                for (reg = 0; reg < 256 && pos < (int)sizeof(line) - 32; reg++) {
+                    LONG c = InterlockedExchange(&g_regHistoCount[reg], 0);
+                    if (c > 0) {
+                        pos += snprintf(line + pos, sizeof(line) - pos, " r%d:%ldx%u", reg, c,
+                                        (unsigned)g_regHistoVecMax[reg]);
+                        g_regHistoVecMax[reg] = 0;
+                    }
+                }
+                if (pos > 0) LogLine("REGHISTO (eye-phase uploads this window):%s", line);
+                pos = 0;
+                for (reg = 0; reg < 64 && pos < (int)sizeof(line) - 48; reg++) {
+                    LONG c = InterlockedExchange(&g_regComboCount[reg], 0);
+                    if (c > 0) {
+                        pos += snprintf(line + pos, sizeof(line) - pos, " [%s%s%s%s%s%s]:%ld",
+                                        (reg & REGBIT_R6) ? "r6 " : "", (reg & REGBIT_R10) ? "r10 " : "",
+                                        (reg & REGBIT_R13) ? "r13 " : "", (reg & REGBIT_R16) ? "r16 " : "",
+                                        (reg & REGBIT_R64) ? "r64 " : "", (reg & REGBIT_R96) ? "r96 " : "", c);
+                    }
+                }
+                if (pos > 0) LogLine("REGCOMBO (per-draw register sets):%s", line);
+                s_lastHisto = hnow;
             }
         }
         RECT srcFull;
@@ -2829,15 +2963,127 @@ static HRESULT STDMETHODCALLTYPE Hook_StretchRect(IDirect3DDevice9 *This, IDirec
     return g_pRealStretchRect(This, pSrc, pSrcRect, pDst, pDstRect, Filter);
 }
 
+/* notes/36: consume the since-last-draw register mask at every draw during eye phases. */
+static void RegComboOnDraw(void)
+{
+    LONG mask;
+    if (!g_regHisto || g_stereoPhase == STEREO_PHASE_IDLE) return;
+    mask = InterlockedExchange(&g_regComboMask, 0);
+    InterlockedIncrement(&g_regComboCount[mask & 63]);
+}
+
+/* notes/36: TRUE if the bytecode never reads constants c6..c9 as a source - the UI-shader
+ * signature (all 10 screen-space shaders match, all 445 c6-transform shaders don't). vs_2_0
+ * opcode tokens carry their operand count in bits 24..27; vs_1_1 (none shipped) returns FALSE. */
+static BOOL VSBytecodeIsUIShader(CONST DWORD *pFunc)
+{
+    UINT i = 1;
+    if ((pFunc[0] & 0xFFFF0000u) != 0xFFFE0000u) return FALSE;
+    if ((pFunc[0] & 0xFFFFu) < 0x0200u) return FALSE;
+    while (i < 16384) {
+        DWORD t = pFunc[i];
+        UINT op, nops, k;
+        if (t == 0x0000FFFFu) break;
+        if ((t & 0xFFFF) == 0xFFFE) { i += 1 + ((t >> 16) & 0x7FFF); continue; }
+        op = t & 0xFFFF;
+        nops = (t >> 24) & 0xF;
+        if (op != 81 && op != 48 && op != 47 && op != 31) { /* skip def/defi/defb/dcl */
+            for (k = 2; k <= nops && (i + k) < 16384; k++) { /* k=1 is the dest */
+                DWORD o = pFunc[i + k];
+                DWORD rt = ((o >> 28) & 0x7) | ((o >> 8) & 0x18);
+                DWORD r = o & 0x7FF;
+                if (rt == 2 && r >= 6 && r <= 9) return FALSE;
+            }
+        }
+        i += 1 + nops;
+    }
+    return TRUE;
+}
+
+/* notes/36: dump every vertex shader's bytecode once (regHisto mode) - ground truth for which
+ * constant registers each shader's transform math actually reads. Bytecode ends at 0x0000FFFF. */
+typedef HRESULT (STDMETHODCALLTYPE *CreateVertexShader_t)(IDirect3DDevice9 *This, CONST DWORD *pFunction,
+                                                          IDirect3DVertexShader9 **ppShader);
+static CreateVertexShader_t g_pRealCreateVertexShader = NULL;
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateVertexShader(IDirect3DDevice9 *This, CONST DWORD *pFunction,
+                                                         IDirect3DVertexShader9 **ppShader)
+{
+    HRESULT hr = g_pRealCreateVertexShader(This, pFunction, ppShader);
+    if (SUCCEEDED(hr) && pFunction && ppShader && *ppShader && VSBytecodeIsUIShader(pFunction)) {
+        LONG idx = InterlockedIncrement(&g_uiShaderCount) - 1;
+        if (idx < UI_SHADER_MAX) {
+            g_uiShaders[idx] = (void *)*ppShader;
+            LogLine("CreateVertexShader: UI-signature shader #%ld registered (%p) for per-eye depth shift", idx, (void *)*ppShader);
+        } else {
+            InterlockedDecrement(&g_uiShaderCount);
+        }
+    }
+    if (SUCCEEDED(hr) && pFunction && g_regHisto) {
+        UINT n = 0;
+        while (pFunction[n] != 0x0000FFFFu && n < 16384) n++;
+        if (n < 16384) {
+            LONG idx = InterlockedIncrement(&g_vsDumpIndex);
+            char path[MAX_PATH];
+            DWORD tlen = GetTempPathA(sizeof(path), path);
+            n++;
+            if (tlen != 0 && tlen < sizeof(path) - 48) {
+                char name[48];
+                FILE *f;
+                snprintf(name, sizeof(name), "psyvr_vs_%02ld.bin", idx);
+                strcat(path, name);
+                f = fopen(path, "wb");
+                if (f) { fwrite(pFunction, 4, n, f); fclose(f); }
+                LogLine("CreateVertexShader #%ld: version=0x%08lX len=%u dwords -> %s",
+                        idx, (unsigned long)pFunction[0], n, name);
+            }
+        }
+    }
+    return hr;
+}
+
+/* Reconciles the device's c50.x with the wanted shift. Called on shader binds and phase
+ * transitions; uses the REAL SetVertexShaderConstantF to avoid recursing into our own hook. */
+static void UIShift_Reconcile(IDirect3DDevice9 *dev)
+{
+    float want = UIShift_Wanted();
+    if (want != g_uiShiftApplied && dev && g_pRealSetVSConstF) {
+        float v[4];
+        if (SUCCEEDED(dev->lpVtbl->GetVertexShaderConstantF(dev, 50, v, 1))) {
+            v[0] += want - g_uiShiftApplied;
+            g_pRealSetVSConstF(dev, 50, v, 1);
+            g_uiShiftApplied = want;
+        }
+    }
+}
+void UIShift_ReconcileFwd(void) { if (g_pDevice) UIShift_Reconcile(g_pDevice); } /* for the CandB callbacks */
+
+typedef HRESULT (STDMETHODCALLTYPE *SetVertexShader_t)(IDirect3DDevice9 *This, IDirect3DVertexShader9 *pShader);
+static SetVertexShader_t g_pRealSetVertexShader = NULL;
+
+static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(IDirect3DDevice9 *This, IDirect3DVertexShader9 *pShader)
+{
+    LONG i, n = g_uiShaderCount, isUI = 0;
+    if (n > UI_SHADER_MAX) n = UI_SHADER_MAX;
+    for (i = 0; i < n; i++) {
+        if (g_uiShaders[i] == (void *)pShader) { isUI = 1; break; }
+    }
+    g_curShaderIsUI = isUI;
+    UIShift_Reconcile(This);
+    return g_pRealSetVertexShader(This, pShader);
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT s, UINT c)
 {
     if (g_traceActive) InterlockedIncrement(&g_traceDrawCount);
+    RegComboOnDraw();
     return g_pRealDrawPrimitive(This, t, s, c);
 }
 static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
                                                            INT b, UINT mi, UINT nv, UINT si, UINT pc)
 {
     if (g_traceActive) InterlockedIncrement(&g_traceDrawCount);
+    RegComboOnDraw();
     return g_pRealDrawIndexedPrimitive(This, t, b, mi, nv, si, pc);
 }
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT c,
@@ -2847,6 +3093,7 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9 *This, D3
         TraceFlushDraws();
         LogLine("TRACE: DrawPrimitiveUP(count=%u) phase=%ld  <- pretransformed/UP path", c, g_stereoPhase);
     }
+    RegComboOnDraw();
     return g_pRealDrawPrimitiveUP(This, t, c, d, stride);
 }
 static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
@@ -2857,6 +3104,7 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9 *T
         TraceFlushDraws();
         LogLine("TRACE: DrawIndexedPrimitiveUP(prims=%u) phase=%ld  <- pretransformed/UP path", pc, g_stereoPhase);
     }
+    RegComboOnDraw();
     return g_pRealDrawIndexedPrimitiveUP(This, t, mi, nv, pc, id, ifmt, vd, stride);
 }
 
@@ -2898,7 +3146,14 @@ static void InstallPresentHook(IDirect3DDevice9 *pDevice)
     vtbl->SetDepthStencilSurface = Hook_SetDepthStencilSurface;
     g_pRealGetRenderTarget = vtbl->GetRenderTarget;
     vtbl->GetRenderTarget = Hook_GetRenderTarget;
-    if (g_traceFrames || g_dumpEyes) { /* remaining trace hooks: diagnostics only */
+    /* notes/36: CreateVertexShader/SetVertexShader are ALWAYS hooked - they carry the UI-depth
+     * feature (UI-shader identification + bind tracking); the bytecode dump inside remains gated
+     * behind PSYVR_REG_HISTO. */
+    g_pRealCreateVertexShader = vtbl->CreateVertexShader;
+    vtbl->CreateVertexShader = Hook_CreateVertexShader;
+    g_pRealSetVertexShader = vtbl->SetVertexShader;
+    vtbl->SetVertexShader = Hook_SetVertexShader;
+    if (g_traceFrames || g_dumpEyes || g_regHisto) { /* remaining trace hooks: diagnostics only */
         g_pRealClear = vtbl->Clear;
         vtbl->Clear = Hook_Clear;
         g_pRealDrawPrimitive = vtbl->DrawPrimitive;
