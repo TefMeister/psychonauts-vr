@@ -1,14 +1,25 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-18 (session 34: HEAD TRACKING implemented and visually confirmed
-(fake-pose sway test, user-watched); notes/33's shutdown-hang zombie root-caused (DllMain
-contract violation - blocking teardown at process-termination DETACH) and fixed; VREvent_Quit
-now handled and live-verified (user exited SteamVR mid-game, bridge tore down cleanly in 250ms,
-game kept running flat); HMD identity now logged at init. User debrief on the first physical
-headset test: stereo looked CORRECT and comfortable - Quest 3 via Virtual Desktop latest. All
-pending real-headset verification on the gaming PC. Full detail in notes/34)
+Last updated: 2026-08-18 afternoon (session 35: the notes/23 BLACK-LEFT-EYE BUG is root-caused
+and FIXED, user-verified — the engine re-binds the real backbuffer mid-eye-pass on the
+brain/title screen; fixed with three eye-phase redirects (RT bind, StretchRect read, DS bind).
+Also: VR eye buffers now render at 2x game resolution by default (PSYVR_RENDER_SCALE 1-4),
+F11 recenters head tracking, and new PSYVR_DUMP_EYES / PSYVR_TRACE_FRAME diagnostics. All
+verified live at 1x and 2x with the full bridge running. Full detail in notes/35)
 
-## Session 34 (2026-08-18): shutdown-zombie fix, quit events, HEAD TRACKING
+## Session 35 (2026-08-18 afternoon): black-left-eye FIXED, 2x eye resolution
+
+- **notes/23 bug root cause** (live-traced, old frustum hypothesis wrong): on the brain screen
+  the engine records "the screen" RT while the real backbuffer is bound, restores it mid-pass-1
+  and draws everything there; EYE1 keeps its cleared black. Reproduced the user's in-headset
+  black left eye from last night. Fix: during eye passes redirect backbuffer RT binds, backbuffer
+  StretchRect reads, and real-DS binds to the active eye's private surfaces. Eye parity verified
+  by pixel measurement and by the user; gameplay regression-checked.
+- **2x eye resolution** (default with submit; PSYVR_RENDER_SCALE overrides): 1280x960/eye
+  verified submitting here; 1600x1200/eye expected on the gaming PC. Readback ~1.4ms/eye.
+- Full detail in `notes/35-black-left-eye-root-cause-fixed-and-2x-eye-resolution.md`.
+
+## Session 34 (2026-08-18 morning): shutdown-zombie fix, quit events, HEAD TRACKING
 
 - **Head tracking (6DOF)**: `renderPoses[0]` from the existing `WaitGetPoses` call now drives a
   dense per-frame `Y_track = P^-1*T*P` premultiplied onto every register-6 upload before the
