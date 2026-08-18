@@ -490,6 +490,18 @@ typedef void (__thiscall *VRBridge_GetEyeToHeadTransform_t)(void *pThis, HmdMatr
 typedef float (__thiscall *VRBridge_GetFloatTrackedDeviceProperty_t)(void *pThis,
     TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError);
 
+/* notes/33 follow-ups: same vtable-slot dispatch discipline as above. Slots verified against the
+ * vendored openvr_capi.h VR_IVRSystem_FnTable field order (the same counting already proven right
+ * for slots 0/2/5/23 above): 28=GetStringTrackedDeviceProperty, 30=PollNextEvent,
+ * 47=AcknowledgeQuit_Exiting. PollNextEvent's bool return is a single AL byte in the MSVC x86
+ * ABI - declared as unsigned char rather than trusting a cross-compiler bool. */
+typedef uint32_t (__thiscall *VRBridge_GetStringTrackedDeviceProperty_t)(void *pThis,
+    TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, char *pchValue,
+    uint32_t unBufferSize, ETrackedPropertyError *pError);
+typedef unsigned char (__thiscall *VRBridge_PollNextEvent_t)(void *pThis,
+    struct VREvent_t *pEvent, uint32_t uncbVREvent);
+typedef void (__thiscall *VRBridge_AcknowledgeQuit_t)(void *pThis);
+
 /* World-unit <-> real-world-meters conversion factor. Cross-validated across two prior sessions,
  * not a new guess: notes/15's independent zNear/zFar-plausibility estimate ("1 world unit ~= 1cm")
  * and notes/18's finding that the shipped STEREO_HALF_IPD=3.25 constant maps to ~6.5cm real-world
@@ -559,6 +571,19 @@ static VRBridgeTimingStat g_statWaitGetPoses;
 static BOOL g_vrSkipWaitPoses = FALSE;
 static BOOL g_vrSkipPumpEye = FALSE;
 
+/* Head tracking (notes/34): on by default whenever the VR bridge is live and WaitGetPoses returns
+ * a valid HMD pose. PSYVR_DISABLE_TRACKING=1 turns it off (view stays fixed like notes/33's first
+ * headset test). PSYVR_FAKE_POSE=1 replaces the real pose with a synthesized slow head sway so the
+ * whole tracking path can be verified visually on a monitor with the null driver (whose real pose
+ * never moves). */
+static BOOL g_trackingDisabled = FALSE;
+static BOOL g_fakePose = FALSE;
+/* Head-tracking per-frame state - the matrices themselves live with the tracking module further
+ * down (they need the projection-cache globals); these two flags are up here because
+ * VRBridge_Shutdown (defined earlier) clears them. */
+static BOOL g_trackRefValid = FALSE;
+static BOOL g_trackYValid = FALSE;
+
 /* Per-eye double-buffered two-hop pipeline state (notes/28, proven in
  * tools/vr-bridge/poc_dual_device_shared/dual_device_poc.c). "Device B" in that POC's terms is
  * always g_pDevice (the game's own plain device, already tracked); "Device A" is g_pVRDeviceA
@@ -614,6 +639,14 @@ static VRBridge_GetRecommendedRenderTargetSize_t g_pVRGetRecommendedRTSize = NUL
 static VRBridge_GetProjectionRaw_t g_pVRGetProjectionRaw = NULL;
 static VRBridge_GetEyeToHeadTransform_t g_pVRGetEyeToHeadTransform = NULL;
 static VRBridge_GetFloatTrackedDeviceProperty_t g_pVRGetFloatProp = NULL;
+static VRBridge_GetStringTrackedDeviceProperty_t g_pVRGetStringProp = NULL;
+static VRBridge_PollNextEvent_t g_pVRPollNextEvent = NULL;
+static VRBridge_AcknowledgeQuit_t g_pVRAcknowledgeQuit = NULL;
+
+/* notes/33 §4: latched TRUE when SteamVR sends a quit-class event. From that point the VR runtime
+ * is never touched again (vrserver is about to vanish; SteamVR kills scene apps that linger) and
+ * VRBridge_Init refuses to re-initialize for the rest of the process lifetime. */
+static BOOL g_vrQuitRequested = FALSE;
 
 static BOOL g_vrGeomValid = FALSE;
 static float g_realHalfIPD[2] = { 0.0f, 0.0f };  /* world units, SIGNED per eye (index 0=left/eye1,
@@ -649,6 +682,14 @@ static void VRBridge_ReadEnableFlag(void)
     g_vrSkipWaitPoses = (len > 0 && len < sizeof(buf) && buf[0] == '1');
     len = GetEnvironmentVariableA("PSYVR_SKIP_PUMPEYE", buf, sizeof(buf));
     g_vrSkipPumpEye = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    len = GetEnvironmentVariableA("PSYVR_DISABLE_TRACKING", buf, sizeof(buf));
+    g_trackingDisabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    len = GetEnvironmentVariableA("PSYVR_FAKE_POSE", buf, sizeof(buf));
+    g_fakePose = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_trackingDisabled || g_fakePose) {
+        LogLine("VRBridge: tracking flags - g_trackingDisabled=%d g_fakePose=%d",
+                g_trackingDisabled ? 1 : 0, g_fakePose ? 1 : 0);
+    }
     if (g_vrSkipWaitPoses || g_vrSkipPumpEye) {
         LogLine("VRBridge: diagnostic bypass flags - g_vrSkipWaitPoses=%d g_vrSkipPumpEye=%d",
                 g_vrSkipWaitPoses ? 1 : 0, g_vrSkipPumpEye ? 1 : 0);
@@ -797,6 +838,10 @@ static void VRBridge_Init(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
 
     g_vrBridgeInitAttempted = TRUE;
 
+    /* notes/33 §4: once SteamVR has asked us to quit, never re-connect (e.g. via a later Reset
+     * re-running SetupStereoSurfaces after the quit-time teardown cleared the attempted flag). */
+    if (g_vrQuitRequested) { LogLine("VRBridge_Init: refused - SteamVR quit was already requested this process"); return; }
+
     if (!g_hRealD3D9) { LogLine("VRBridge_Init: ERROR real d3d9.dll not loaded"); return; }
     g_pRealDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hRealD3D9, "Direct3DCreate9Ex");
     if (!g_pRealDirect3DCreate9Ex) { LogLine("VRBridge_Init: ERROR Direct3DCreate9Ex not exported by real d3d9.dll"); return; }
@@ -914,7 +959,20 @@ static void VRBridge_Init(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
             g_pVRGetProjectionRaw = (VRBridge_GetProjectionRaw_t)sysVtbl[2];
             g_pVRGetEyeToHeadTransform = (VRBridge_GetEyeToHeadTransform_t)sysVtbl[5];
             g_pVRGetFloatProp = (VRBridge_GetFloatTrackedDeviceProperty_t)sysVtbl[23];
+            g_pVRGetStringProp = (VRBridge_GetStringTrackedDeviceProperty_t)sysVtbl[28];
+            g_pVRPollNextEvent = (VRBridge_PollNextEvent_t)sysVtbl[30];
+            g_pVRAcknowledgeQuit = (VRBridge_AcknowledgeQuit_t)sysVtbl[47];
             LogLine("VRBridge_Init: IVRSystem ready (vtable=%p)", (void *)sysVtbl);
+            /* notes/33 §3 asked for HMD identity in the log (the headset model never appeared
+             * anywhere during the first physical test). Device index 0 is always the HMD. */
+            {
+                char idSys[128], idModel[128];
+                ETrackedPropertyError perr = ETrackedPropertyError_TrackedProp_Success;
+                idSys[0] = idModel[0] = '\0';
+                g_pVRGetStringProp(g_pVRSystem, 0, ETrackedDeviceProperty_Prop_TrackingSystemName_String, idSys, sizeof(idSys), &perr);
+                g_pVRGetStringProp(g_pVRSystem, 0, ETrackedDeviceProperty_Prop_ModelNumber_String, idModel, sizeof(idModel), &perr);
+                LogLine("VRBridge_Init: HMD identity: trackingSystem=\"%s\" model=\"%s\"", idSys, idModel);
+            }
             VRBridge_QueryRealGeometry();
         }
     }
@@ -1102,9 +1160,40 @@ static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeS
  * frame is fully done; the NEXT frame's CPU-side game logic starts immediately after, giving the
  * wait real work to overlap with) and keep VRBridge_PumpEyes() (which needs the actual rendered eye
  * surfaces) at its original call site in CandB_AfterBoth_asm. */
+/* notes/33 §4 second half: SteamVR sends VREvent_Quit when the user exits SteamVR while the game
+ * is running, then KILLS scene apps that neither acknowledge nor exit - and a vrserver that
+ * vanishes mid-session leaves the next WaitGetPoses blocked forever. Poll the event queue once per
+ * frame (cheap, non-blocking, runs on the same render thread as every other VR call in this file -
+ * no concurrency to reason about) and on any quit-class event: acknowledge, then tear the whole
+ * bridge down immediately - NOT under loader lock, all threads alive, vrserver still answering -
+ * so the game simply drops back to flat monitor-stereo rendering and a later game exit has nothing
+ * VR-related left to clean up. */
+static void VRBridge_Shutdown(void); /* defined below */
+static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34); /* defined below the projection-cache globals it needs */
+
+static void VRBridge_PollQuitEvents(void)
+{
+    struct VREvent_t ev;
+    if (!g_pVRPollNextEvent || !g_pVRSystem || g_vrQuitRequested) return;
+    while (g_pVRPollNextEvent(g_pVRSystem, &ev, (uint32_t)sizeof(ev))) {
+        if (ev.eventType == EVREventType_VREvent_Quit ||
+            ev.eventType == EVREventType_VREvent_ProcessQuit ||
+            ev.eventType == EVREventType_VREvent_DriverRequestedQuit) {
+            LogLine("VRBridge: SteamVR quit-class event %u received - acknowledging and shutting the VR bridge down now (game continues in monitor mode)", ev.eventType);
+            g_vrQuitRequested = TRUE;
+            if (g_pVRAcknowledgeQuit) g_pVRAcknowledgeQuit(g_pVRSystem);
+            VRBridge_Shutdown();
+            LogLine("VRBridge: quit-time teardown complete");
+            return;
+        }
+    }
+}
+
 static void VRBridge_PumpPoses(void)
 {
     if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
+    VRBridge_PollQuitEvents();
+    if (!g_vrBridgeReady) return; /* quit-time teardown may have just run */
     if (!g_pVRWaitGetPoses || g_vrSkipWaitPoses) return;
 
     {
@@ -1116,6 +1205,11 @@ static void VRBridge_PumpPoses(void)
         g_pVRWaitGetPoses(g_pVRCompositor, renderPoses, 64, gamePoses, 64);
         QueryPerformanceCounter(&tW1);
         VRBridge_RecordSpan(&g_statWaitGetPoses, tW1.QuadPart - tW0.QuadPart, "WaitGetPoses");
+
+        /* notes/34: the HMD pose (device index 0) was being discarded here every frame - feed it
+         * to the head-tracking path instead. Defined below the projection-cache globals it needs;
+         * same render thread as everything else in this file. */
+        VRBridge_UpdateHeadTracking(renderPoses[0].bPoseIsValid ? &renderPoses[0].mDeviceToAbsoluteTracking : NULL);
     }
 }
 
@@ -1157,7 +1251,15 @@ static void VRBridge_Shutdown(void)
     g_pVRGetProjectionRaw = NULL;
     g_pVRGetEyeToHeadTransform = NULL;
     g_pVRGetFloatProp = NULL;
+    g_pVRGetStringProp = NULL;
+    g_pVRPollNextEvent = NULL;
+    g_pVRAcknowledgeQuit = NULL;
     g_vrGeomValid = FALSE;
+
+    /* notes/34: head-tracking state dies with the bridge - the view snaps back to the game's own
+     * untracked camera (correct for both the quit-event teardown and a dynamic unload). */
+    g_trackYValid = FALSE;
+    g_trackRefValid = FALSE;
 
     g_vrBridgeReady = FALSE;
     g_vrBridgeInitAttempted = FALSE;
@@ -1293,6 +1395,144 @@ static BOOL g_projXScaleValid = FALSE;
 static float g_projZNear = 10.0f;   /* live-confirmed default (notes/06) */
 static float g_projZFar = 50000.0f; /* live-confirmed default (notes/06) */
 
+/* ======================================================================
+ * Head tracking (notes/34)
+ * ======================================================================
+ *
+ * Reuses the exact insertion point the per-eye stereo correction already proved live: the game
+ * uploads Transpose(M*P) to register 6 per draw (M = unknown World*View, P = known projection),
+ * and any rigid transform X inserted between M and P becomes a right-multiplication
+ * WVP_new = WVP * Y with Y = P^-1 * X * P (see the derivation above STEREO_WVP_REGISTER). The
+ * per-eye X (translate d, shear k) is special-cased to a cheap column-0 patch; head tracking
+ * needs a full rotation, so its Y is a dense 4x4 computed numerically ONCE per frame here and
+ * applied as one 4x4 multiply per register-6 upload (~80/frame - negligible).
+ *
+ * Spaces: OpenVR tracking space and the game's eye space are both right-handed x-right/y-up/
+ * -z-forward, so the axis mapping is identity and only the translation needs the established
+ * WORLD_UNITS_PER_METER scale. The view correction T is the INVERSE of the head's motion
+ * relative to a reference captured at first valid pose (position + yaw only - pitch/roll stay
+ * absolute so the game's horizon is level no matter how the head was tilted at init).
+ * Combined order per draw: WVP * Y_track * Y_eye (rotate the whole head first, then offset the
+ * eye within the rotated head frame - matching how real VR SDKs compose eye poses).
+ *
+ * All matrices below are row-vector convention (p' = p * M), flat row-major [r*4+c], matching
+ * the existing derivation; OpenVR's HmdMatrix34_t is column-vector, transposed on ingest. */
+
+static float g_projYScale = 0.0f;  /* cot(fovy/2) = xScale*aspect, cached in BPM_OnEntry */
+
+static float g_trackRefInv[16];    /* undoes the reference pose's position+yaw (tracking space, meters) */
+static float g_trackYt[16];        /* Transpose(P^-1 * T * P) for this frame - premultiplies the transposed upload */
+/* (g_trackRefValid/g_trackYValid are declared much earlier, next to the env flags - see there) */
+
+static void Mat4MulRow(float out[16], const float a[16], const float b[16]) /* out = a*b; out may alias a or b */
+{
+    float tmp[16];
+    int r, c, k;
+    for (r = 0; r < 4; r++)
+        for (c = 0; c < 4; c++) {
+            float s = 0.0f;
+            for (k = 0; k < 4; k++) s += a[r * 4 + k] * b[k * 4 + c];
+            tmp[r * 4 + c] = s;
+        }
+    memcpy(out, tmp, 16 * sizeof(float));
+}
+
+static void Mat4Identity(float m[16])
+{
+    int i;
+    for (i = 0; i < 16; i++) m[i] = 0.0f;
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
+{
+    float pose[16]; /* device -> tracking space, row-vector */
+    float T[16];    /* the view correction: inverse head motion, translation in world units */
+    float P[16], Pinv[16], Y[16];
+    int r, c;
+
+    if (g_trackingDisabled) return;
+    if (!g_projXScaleValid || g_projYScale == 0.0f) return;
+
+    if (g_fakePose) {
+        /* Synthesized gentle sway (~±25° yaw, ~±8° pitch, ±6cm lateral) - makes the tracking
+         * path visible on a monitor even though the null driver's real pose never moves. */
+        float t = (float)GetTickCount() * 0.001f;
+        float yaw = 0.44f * sinf(t * 0.5f), pitch = 0.14f * sinf(t * 0.33f);
+        float cy = cosf(yaw), sy = sinf(yaw), cp = cosf(pitch), sp = sinf(pitch);
+        float ry[16], rx[16];
+        Mat4Identity(ry); ry[0] = cy; ry[2] = -sy; ry[8] = sy; ry[10] = cy;      /* RotY, row-vector */
+        Mat4Identity(rx); rx[5] = cp; rx[6] = sp; rx[9] = -sp; rx[10] = cp;      /* RotX, row-vector */
+        Mat4MulRow(pose, rx, ry); /* pitch about local x, then yaw about tracking y */
+        pose[12] = 0.06f * sinf(t * 0.7f); pose[13] = 0.0f; pose[14] = 0.0f;
+    } else if (pose34) {
+        for (r = 0; r < 3; r++)
+            for (c = 0; c < 3; c++)
+                pose[c * 4 + r] = pose34->m[r][c]; /* transpose: column-vector 3x4 -> row-vector rotation */
+        pose[3] = pose[7] = pose[11] = 0.0f;
+        pose[12] = pose34->m[0][3]; pose[13] = pose34->m[1][3]; pose[14] = pose34->m[2][3];
+        pose[15] = 1.0f;
+    } else {
+        return; /* invalid pose this frame - keep last good correction rather than snapping back */
+    }
+
+    if (!g_trackRefValid) {
+        /* forward = -(row 2) of the row-vector rotation; yaw chosen so RotYRow(yaw) has the same
+         * horizontal forward. RefInv = Trans(-pos) * RotY(-yaw). */
+        float yaw = atan2f(pose[8], pose[10]);
+        float cyi = cosf(-yaw), syi = sinf(-yaw);
+        float trn[16], ryi[16];
+        Mat4Identity(trn); trn[12] = -pose[12]; trn[13] = -pose[13]; trn[14] = -pose[14];
+        Mat4Identity(ryi); ryi[0] = cyi; ryi[2] = -syi; ryi[8] = syi; ryi[10] = cyi;
+        Mat4MulRow(g_trackRefInv, trn, ryi);
+        g_trackRefValid = TRUE;
+        LogLine("HeadTrack: reference captured - pos=(%.3f,%.3f,%.3f)m yaw=%.1fdeg%s",
+                pose[12], pose[13], pose[14], yaw * 57.29578f, g_fakePose ? " (FAKE POSE MODE)" : "");
+    }
+
+    {
+        /* Motion = pose * RefInv (head motion relative to reference), then T = Motion^-1 with the
+         * translation converted to world units. Rigid inverse: R^T, t' = -t*R^T. */
+        float motion[16];
+        Mat4MulRow(motion, pose, g_trackRefInv);
+        for (r = 0; r < 3; r++)
+            for (c = 0; c < 3; c++)
+                T[r * 4 + c] = motion[c * 4 + r];
+        T[3] = T[7] = T[11] = 0.0f;
+        for (c = 0; c < 3; c++)
+            T[12 + c] = -(motion[12] * T[c] + motion[13] * T[4 + c] + motion[14] * T[8 + c])
+                        * WORLD_UNITS_PER_METER;
+        T[15] = 1.0f;
+    }
+
+    {
+        float xS = g_projXScale, yS = g_projYScale;
+        float A = g_projZFar / (g_projZNear - g_projZFar);
+        float B = g_projZNear * g_projZFar / (g_projZNear - g_projZFar);
+        int i;
+        for (i = 0; i < 16; i++) { P[i] = 0.0f; Pinv[i] = 0.0f; }
+        P[0] = xS; P[5] = yS; P[10] = A; P[11] = -1.0f; P[14] = B;
+        Pinv[0] = 1.0f / xS; Pinv[5] = 1.0f / yS; Pinv[11] = 1.0f / B; Pinv[14] = -1.0f; Pinv[15] = A / B;
+        Mat4MulRow(Y, Pinv, T);
+        Mat4MulRow(Y, Y, P);
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 4; c++)
+                g_trackYt[r * 4 + c] = Y[c * 4 + r];
+        g_trackYValid = TRUE;
+    }
+
+    {
+        static DWORD s_lastLog = 0;
+        DWORD now = GetTickCount();
+        if (s_lastLog == 0 || (DWORD)(now - s_lastLog) >= 2000) {
+            LogLine("HeadTrack: T fwd=(%.3f,%.3f,%.3f) t=(%.2f,%.2f,%.2f)wu src=%s",
+                    -T[8], -T[9], -T[10], T[12], T[13], T[14],
+                    g_fakePose ? "fake" : "openvr");
+            s_lastLog = now;
+        }
+    }
+}
+
 /* Trampoline entry points (allocated executable memory, filled in by
  * InstallInlineHooks). Calling through these runs the REAL, unmodified
  * original function body exactly as if the inline patch had never been
@@ -1403,6 +1643,7 @@ void __cdecl BPM_OnEntry_asm(float rawFov, float aspect, float zn, float zf)
     if (fovy <= 0.0f || fovy >= 3.14159265f) return; /* sanity guard */
 
     g_projXScale = 1.0f / (tanf(fovy * 0.5f) * aspect);
+    g_projYScale = g_projXScale * aspect; /* cot(fovy/2) - notes/34 head tracking needs the full P */
     g_projXScaleValid = TRUE;
 
     /* notes/24: zn/zf for the off-axis A/B terms - sanity-guarded the same
@@ -1947,14 +2188,26 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         Y20 = (-d) * xScale / B;
         Y30 = (-k - A * d / B) * xScale;
 
-        memcpy(patched, pConstantData, sizeof(patched));
+        /* notes/34 head tracking: premultiply the transposed upload by Y_track^T, i.e.
+         * WVP -> WVP*Y_track, BEFORE the per-eye patch below - the combined order
+         * WVP*Y_track*Y_eye rotates the head first, then offsets the eye inside the rotated
+         * head frame. Skipped entirely (src stays pConstantData) when no valid pose has
+         * arrived, preserving the exact pre-notes/34 behavior. */
+        const float *src = pConstantData;
+        float tracked[16];
+        if (g_trackYValid) {
+            Mat4MulRow(tracked, g_trackYt, pConstantData);
+            src = tracked;
+        }
+
+        memcpy(patched, src, sizeof(patched));
         /* notes/24: full off-axis column-0 patch - reduces exactly to
          * notes/18's single-entry translation patch when Y20==0 (k==0).
          * See the derivation comment above STEREO_WVP_REGISTER for the
          * flat-index mapping (WVP column 0 -> upload row 0, flat 0..3;
          * WVP[r][2]/[r][3] -> upload flat 8+r/12+r). */
         for (r = 0; r < 4; r++) {
-            patched[r] = pConstantData[r] + pConstantData[8 + r] * Y20 + pConstantData[12 + r] * Y30;
+            patched[r] = src[r] + src[8 + r] * Y20 + src[12 + r] * Y30;
         }
 
         /* notes/21: exact per-eye draw-call counters, see comment on
@@ -2365,7 +2618,6 @@ __declspec(dllexport) IDirect3D9 *WINAPI Direct3DCreate9(UINT SDKVersion)
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     (void)hinstDLL;
-    (void)lpvReserved;
 
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
@@ -2378,7 +2630,17 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         VRBridge_ReadEnableFlag(); /* notes/28: PSYVR_ENABLE_SUBMIT=1 opts in, default off */
         break;
     case DLL_PROCESS_DETACH:
-        LogLine("==== psychonautsvr proxy d3d9.dll: DLL_PROCESS_DETACH (pid=%lu) ====", GetCurrentProcessId());
+        LogLine("==== psychonautsvr proxy d3d9.dll: DLL_PROCESS_DETACH (pid=%lu, %s) ====",
+                GetCurrentProcessId(), lpvReserved ? "process terminating" : "dynamic unload");
+        /* notes/33 §4 zombie fix: lpvReserved != NULL means the process is terminating -
+         * ExitProcess has ALREADY killed every other thread (vrclient's IPC threads, D3D
+         * driver workers) before this runs. Any teardown that waits on them - and
+         * VR_ShutdownInternal/device Release both can - waits on corpses and hangs forever,
+         * leaving an unkillable 1-thread zombie. Per the documented DllMain contract, do
+         * nothing here and let the OS reclaim everything. Full teardown only runs on a
+         * dynamic FreeLibrary unload (lpvReserved == NULL), where other threads still live. */
+        if (lpvReserved != NULL)
+            break;
         VRBridge_Shutdown();
         if (g_hRealD3D9) {
             FreeLibrary(g_hRealD3D9);
