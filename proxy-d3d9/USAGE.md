@@ -1,6 +1,6 @@
 # Proxy `d3d9.dll` — usage
 
-**v0.1.2-alpha.** This is the mod's core component: a `d3d9.dll` that loads in place of the
+**v0.1.3-alpha.** This is the mod's core component: a `d3d9.dll` that loads in place of the
 system one (standard Windows DLL search order, the same mechanism dxwrapper and most D3D9 mods
 use). It does three things now:
 
@@ -85,9 +85,13 @@ real headset** — that is exactly what this release exists to test.
   from an 800×600 game setting; `PSYVR_RENDER_SCALE=1`..`4` to override) — still below the
   headset's recommended per-eye size (2496×2688 on a Quest 3), but a large sharpness step over
   v0.1.1's native-resolution upscale. Higher scales cost VRAM/readback time; 3 may be viable.
-- **Only one shader-constant register is corrected.** Skinned/animated geometry (bone matrices)
-  doesn't yet get per-eye/tracking correction — head rotation may make this more visible than
-  static stereo did.
+- ~~Skinned geometry uncorrected~~ **Refuted in v0.1.3 by a full audit of all 455 of the
+  game's vertex shaders**: every 3D shader — skinned included — transforms through the corrected
+  matrix register, so characters have been stereo- and tracking-correct all along.
+- **UI depth (new, experimental)**: the 10 screen-space UI shaders bypass the stereo correction,
+  which would pin HUD/menus at infinity in a headset — v0.1.3 places them at a virtual ~2m by
+  default. `PSYVR_UI_DEPTH=<world units>` tunes it (100 = 1m, 300 = 3m), `0` disables.
+  Verified on-monitor by pixel measurement; untested on real hardware.
 - **Fixed in v0.1.2**: the long-standing "left eye completely black" bug on the brain
   title/menu screen (root cause: the engine re-binds the real backbuffer mid-eye-pass on that
   screen; fixed by redirecting screen binds/reads to the active eye during eye passes).
@@ -118,6 +122,7 @@ real headset** — that is exactly what this release exists to test.
    - `PSYVR_FAKE_POSE=1` — synthesized swaying pose for monitor-only testing without moving a
      headset.
    - `PSYVR_RENDER_SCALE=1..4` — eye render-resolution multiplier (default 2 with the VR path).
+   - `PSYVR_UI_DEPTH=<world units>` — virtual depth for HUD/menu UI (default 200 ≈ 2m; 0 = off).
    - **F11** in-game re-centers head tracking (re-captures the reference position/yaw).
 5. The log's `VRBridge_Init: HMD identity:` line records which headset OpenVR reported, and
    `HeadTrack:` lines show the live tracking state.
