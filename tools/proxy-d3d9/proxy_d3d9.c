@@ -586,6 +586,20 @@ static BOOL g_vrSkipPumpEye = FALSE;
  * never moves). */
 static BOOL g_trackingDisabled = FALSE;
 static BOOL g_fakePose = FALSE;
+
+/* notes/37: PSYVR_FOV_SCALE - multiplies the game's rawFov argument IN PLACE on the stack at
+ * BuildProjectionMatrix entry (fovy is linear in rawFov, notes/07), widening/narrowing the
+ * rendered field of view. The compositor maps the submitted eye textures onto the HEADSET's
+ * frustum (~80-90deg vertical on a Quest 3) regardless of what FOV the game rendered - a
+ * narrower game FOV therefore shows up magnified/zoomed in the headset. Default 1.0 is an
+ * exact no-op (IEEE x*1.0 == x); VRBridge_QueryRealGeometry logs a suggested value computed
+ * from the real HMD tangents. Everything downstream (xScale cache, stereo shear, culling via
+ * this matrix) follows automatically because the scaled value is what the game itself consumes.
+ * Non-static with an explicit asm label so Hook_BuildProjectionMatrix's stub can fmuls it. */
+__attribute__((used)) float g_fovScaleAsm asm("g_fovScaleAsm") = 1.0f;
+static float g_projYScale = 0.0f;  /* cot(fovy/2) = xScale*aspect, cached in BPM_OnEntry;
+                                      declared here (early) for QueryRealGeometry's FOV log */
+
 static BOOL g_dumpEyes = FALSE; /* PSYVR_DUMP_EYES=1: periodic BMP dumps of eye1/eye2/backbuffer
                                    (diagnostic for the notes/23 black-left-eye bug - notes/35) */
 /* notes/35: PSYVR_TRACE_FRAME=1 - every ~5s, log ONE full frame's exact sequence of
@@ -761,6 +775,15 @@ static void VRBridge_ReadEnableFlag(void)
                 g_uiDepthWorld = v;
         }
         LogLine("VRBridge: UI depth = %.0f world units (PSYVR_UI_DEPTH; 0 = UI stays at infinity)", g_uiDepthWorld);
+
+        /* notes/37: FOV multiplier, clamped to a sane range. 1.0 = untouched. */
+        len = GetEnvironmentVariableA("PSYVR_FOV_SCALE", dbuf, sizeof(dbuf));
+        if (len > 0 && len < sizeof(dbuf)) {
+            float v = 0.0f;
+            if (sscanf(dbuf, "%f", &v) == 1 && v >= 0.5f && v <= 2.5f)
+                g_fovScaleAsm = v;
+        }
+        LogLine("VRBridge: FOV scale = %.2f (PSYVR_FOV_SCALE, 0.5..2.5; 1.0 = game default)", g_fovScaleAsm);
     }
 
     /* notes/35: eye render scale. Default 2x when the VR path is on (the headset wants far more
@@ -888,6 +911,19 @@ static void VRBridge_QueryRealGeometry(void)
                 "projRaw l=%.4f r=%.4f t=%.4f b=%.4f centerOffset=%.6f%s",
                 e, m.m[0][3], g_realHalfIPD[e], l, r, t, b, g_realShearK[e],
                 g_realShearValid[e] ? "" : " (symmetric - no real off-axis data, keeping focus-distance k fallback)");
+
+        /* notes/37: suggested PSYVR_FOV_SCALE from the real HMD tangents (eye 0 is enough - the
+         * vertical frustum is identical between eyes). Game fovy comes from the cached
+         * g_projYScale = cot(fovy/2). Only a suggestion in the log: the game's CPU-side gameplay
+         * logic wasn't audited for independent FOV assumptions, so this stays a manual knob. */
+        if (e == 0 && g_projYScale > 0.0f) {
+            float fovyGame = 2.0f * atanf(1.0f / g_projYScale);
+            float fovyHmd = atanf(fabsf(t)) + atanf(fabsf(b));
+            LogLine("VRBridge_QueryRealGeometry: HMD vertical FOV=%.1f deg, game fovy=%.1f deg -> "
+                    "suggested PSYVR_FOV_SCALE=%.2f (currently %.2f)",
+                    fovyHmd * 57.29578f, fovyGame * 57.29578f,
+                    (fovyGame > 0.01f) ? fovyHmd / fovyGame : 0.0f, g_fovScaleAsm);
+        }
     }
 
     if (g_pVRGetRecommendedRTSize) {
@@ -1500,7 +1536,8 @@ static float g_projZFar = 50000.0f; /* live-confirmed default (notes/06) */
  * All matrices below are row-vector convention (p' = p * M), flat row-major [r*4+c], matching
  * the existing derivation; OpenVR's HmdMatrix34_t is column-vector, transposed on ingest. */
 
-static float g_projYScale = 0.0f;  /* cot(fovy/2) = xScale*aspect, cached in BPM_OnEntry */
+/* (g_projYScale is declared much earlier, next to g_fovScaleAsm - VRBridge_QueryRealGeometry
+ * needs it for the notes/37 suggested-FOV-scale log) */
 
 static float g_trackRefInv[16];    /* undoes the reference pose's position+yaw (tracking space, meters) */
 static float g_trackYt[16];        /* Transpose(P^-1 * T * P) for this frame - premultiplies the transposed upload */
@@ -1641,6 +1678,7 @@ static void *CandB_Trampoline_asm asm("CandB_Trampoline_asm") = NULL;
  * strip it entirely - __attribute__((used)) forces it to be kept and
  * emitted with external linkage under its exact asm-label name. */
 __attribute__((used)) DWORD CandB_This_asm asm("CandB_This_asm") = 0;
+
 
 typedef void (__cdecl *BuildViewMatrixFn)(void *pOut, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp);
 static BuildViewMatrixFn g_realBuildViewMatrix = NULL;
@@ -2015,7 +2053,13 @@ __attribute__((naked)) void Hook_BuildViewMatrix(void)
 __attribute__((naked)) void Hook_BuildProjectionMatrix(void)
 {
     __asm__ __volatile__(
-        "movl 8(%esp), %eax\n\t"   /* rawFov */
+        /* notes/37: scale rawFov in place BEFORE anything reads it - the observer below and the
+         * real body then both see the same scaled value. x87 stack is empty at a cdecl call
+         * boundary; eax/ecx/edx are caller-saved and clobbered below anyway. */
+        "flds 8(%esp)\n\t"
+        "fmuls g_fovScaleAsm\n\t"
+        "fstps 8(%esp)\n\t"
+        "movl 8(%esp), %eax\n\t"   /* rawFov (post-scale) */
         "movl 12(%esp), %ecx\n\t"  /* Aspect */
         "movl 16(%esp), %edx\n\t"  /* zn */
         "pushl 20(%esp)\n\t"       /* zf (esp unchanged so far, offset still valid) */
