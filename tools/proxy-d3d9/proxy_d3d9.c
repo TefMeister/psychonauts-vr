@@ -603,6 +603,8 @@ static float g_fpHeight = 0.0f;    /* PSYVR_FP_HEIGHT world units (100 = 1m) */
 static float g_fpSmooth = 0.15f;   /* PSYVR_FP_SMOOTH 0.02..1: lower = smoother/more lag, 1 = off
                                       (declared here - the env parser below runs before the Vec3
                                       smoothing state defined near the camera-cache globals) */
+static BOOL g_fpProbe = FALSE;     /* PSYVR_FP_PROBE=1: log recovered Raz origin (declared here for
+                                      the same reason - env parser runs before the notes/49 globals) */
 
 /* notes/37: PSYVR_FOV_SCALE - multiplies the game's rawFov argument IN PLACE on the stack at
  * BuildProjectionMatrix entry (fovy is linear in rawFov, notes/07), widening/narrowing the
@@ -812,6 +814,9 @@ static void VRBridge_ReadEnableFlag(void)
             if (sscanf(fb, "%f", &v) == 1 && v >= 0.02f && v <= 1.0f) g_fpSmooth = v;
         }
     }
+    len = GetEnvironmentVariableA("PSYVR_FP_PROBE", buf, sizeof(buf));
+    g_fpProbe = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_fpProbe) LogLine("VRBridge: PSYVR_FP_PROBE=1 - logging recovered Raz world origin vs at/eye (notes/49)");
     if (g_firstPerson)
         LogLine("VRBridge: FIRST PERSON on (PSYVR_FIRST_PERSON) - forward=%.2f x eye->at, height=%.1fwu; Raz not hidden yet (notes/47)",
                 g_fpForward, g_fpHeight);
@@ -1586,6 +1591,26 @@ static BOOL g_fpSmoothInit = FALSE;
 static Vec3 Vec3Sub(Vec3 a, Vec3 b);       /* fwd decls - defined below VRBridge_UpdateHeadTracking */
 static Vec3 Vec3Cross(Vec3 a, Vec3 b);
 static Vec3 Vec3Normalize(Vec3 v);
+
+/* notes/49: render-level bone/entity extraction for head-locked first person. Raz's skeleton
+ * already flows through our SetVertexShaderConstantF hook: every 3D draw uploads Transpose(W*V*P)
+ * to register 6, and skinned (character) draws also upload a bone palette (r64..r191, notes/36).
+ * We recover the per-draw WORLD matrix (World = WVP * P^-1 * V^-1) and take its translation as the
+ * entity's world origin. The skinned draw whose origin is nearest the chase camera's look-at point
+ * is Raz (the camera always frames him). That origin moves smoothly with Raz (no chase-camera
+ * spring), so locking the FP eye to it removes the position bounce; head rotation still comes from
+ * the HMD. All inputs are already cached: WVP (the r6 upload), V (from the BVM eye/at/up cache), P
+ * (from the BPM xScale/yScale/zn/zf cache). g_pinvVinv = P^-1 * V^-1 is rebuilt once per frame. */
+static float g_pinvVinv[16];               /* P^-1 * V^-1 (view+proj undo), per frame */
+static BOOL  g_pinvVinvValid = FALSE;
+static float g_lastC6[16];                 /* most recent register-6 upload (WVP transposed, as received) */
+static BOOL  g_lastC6Valid = FALSE;
+static float g_razSumX = 0.0f, g_razSumY = 0.0f, g_razSumZ = 0.0f; /* centroid accumulator THIS frame */
+static int   g_razCount = 0;               /* # skinned origins near the lock this frame */
+static Vec3  g_razWorld = {0,0,0};         /* promoted + smoothed Raz body-centroid used by the FP camera */
+static BOOL  g_razValid = FALSE;
+static int   g_razMissFrames = 0;          /* consecutive frames with no candidate -> re-lock */
+/* (g_fpProbe scalar is declared much earlier with the other FP knobs - the env parser needs it) */
 /* notes/24: off-axis convergence/focal distance, recomputed each real frame
  * from the live eye->at distance - see the comment on
  * STEREO_FOCUS_DISTANCE_MIN/DEFAULT above for the reasoning. Starts at the
@@ -1872,38 +1897,84 @@ fp_and_build:
         Vec3 fwd = Vec3Normalize(Vec3Sub(g_baseAt, g_baseEye));
         Vec3 right = g_rightVec;
         Vec3 up = Vec3Normalize(Vec3Cross(right, fwd));
-        Vec3 d;
-        float useFocus;
 
-        /* notes/47: low-pass the eye position + focus distance to kill walk-bob / camera-spring
-         * bounce. Snap (no smoothing) on big jumps so teleports/cuts don't glide across the map. */
-        if (!g_fpSmoothInit) {
-            g_fpSmoothEye = g_baseEye; g_fpSmoothFocus = g_focusDistance; g_fpSmoothInit = TRUE;
-        } else {
-            Vec3 de = Vec3Sub(g_baseEye, g_fpSmoothEye);
-            float dist2 = de.x * de.x + de.y * de.y + de.z * de.z;
-            if (dist2 > 500.0f * 500.0f) {           /* teleport/level load/camera cut */
-                g_fpSmoothEye = g_baseEye; g_fpSmoothFocus = g_focusDistance;
-            } else {
+        /* notes/49: promote this frame's nearest-to-look-at skinned origin (= Raz) into the
+         * smoothed g_razWorld the camera locks to. "Found" = a skinned draw within 2x the eye->at
+         * distance of the look-at point; otherwise keep the last good position (cutscene/no Raz). */
+        if (g_razCount > 0) {
+            Vec3 cand;
+            cand.x = g_razSumX / g_razCount; cand.y = g_razSumY / g_razCount; cand.z = g_razSumZ / g_razCount;
+            g_razMissFrames = 0;
+            if (!g_razValid) { g_razWorld = cand; g_razValid = TRUE; }
+            else {
+                Vec3 de = Vec3Sub(cand, g_razWorld);
                 float a = g_fpSmooth;
-                g_fpSmoothEye.x += de.x * a; g_fpSmoothEye.y += de.y * a; g_fpSmoothEye.z += de.z * a;
-                g_fpSmoothFocus += (g_focusDistance - g_fpSmoothFocus) * a;
+                g_razWorld.x += de.x * a; g_razWorld.y += de.y * a; g_razWorld.z += de.z * a;
             }
+        } else if (g_razValid) {
+            /* notes/49: no skinned draw near last frame's Raz - either he's briefly occluded, or the
+             * scene changed (menu->gameplay, level load, camera cut) and the lock is stale. After a
+             * short grace period, drop the lock so next frame re-seeds from the look-at point.
+             * Without this the lock froze at a menu-space position and the eye flew 60k units off. */
+            if (++g_razMissFrames > 8) { g_razValid = FALSE; g_razMissFrames = 0; }
         }
-        useFocus = (g_fpSmoothFocus > 1.0f) ? g_fpSmoothFocus : g_focusDistance;
 
         Mat4Identity(X1);
-        /* forward onto Raz + vertical offset (view space, +Z = forward here) */
-        X1[14] = g_fpForward * useFocus;
-        X1[13] = -g_fpHeight;
-        /* move the effective eye from the bouncy g_baseEye to the smoothed position: a camera
-         * world-move by d = smoothEye - baseEye becomes view-space translation
-         * (-d.right, -d.up, +d.fwd) - same sign framework the forward/height terms above use. */
-        d = Vec3Sub(g_fpSmoothEye, g_baseEye);
-        X1[12] += -(d.x * right.x + d.y * right.y + d.z * right.z);
-        X1[13] += -(d.x * up.x + d.y * up.y + d.z * up.z);
-        X1[14] += (d.x * fwd.x + d.y * fwd.y + d.z * fwd.z);
+        if (g_razValid) {
+            /* Lock the eye to Raz's world origin + a vertical lift (his origin is at his feet/root)
+             * and an optional small forward nudge. Camera world-move d = targetEye - g_baseEye
+             * becomes the view-space translation (-d.right, -d.up, +d.fwd). */
+            Vec3 targetEye, d;
+            /* notes/49: lift along TRUE world up (+Y in this engine - the BuildViewMatrix up input
+             * came back as (0,0.888,-0.46), i.e. the camera up already tilted by the chase pitch,
+             * which sank the lift). Raz's centroid is his body center, so a fixed +Y offset puts the
+             * eye at head height and keeps it there whatever the camera does. */
+            Vec3 wUp; wUp.x = 0.0f; wUp.y = 1.0f; wUp.z = 0.0f;
+            float fnudge = g_fpForward * 20.0f;   /* wu along facing (F7/F8; ~2wu per press) */
+            targetEye.x = g_razWorld.x + g_fpHeight * wUp.x + fnudge * fwd.x;
+            targetEye.y = g_razWorld.y + g_fpHeight * wUp.y + fnudge * fwd.y;
+            targetEye.z = g_razWorld.z + g_fpHeight * wUp.z + fnudge * fwd.z;
+            d = Vec3Sub(targetEye, g_baseEye);
+            X1[12] = -(d.x * right.x + d.y * right.y + d.z * right.z);
+            X1[13] = -(d.x * up.x + d.y * up.y + d.z * up.z);
+            X1[14] = (d.x * fwd.x + d.y * fwd.y + d.z * fwd.z);
+        } else {
+            /* Fallback (no Raz found yet): the notes/47 forward-fraction with position smoothing. */
+            Vec3 d;
+            float useFocus;
+            if (!g_fpSmoothInit) {
+                g_fpSmoothEye = g_baseEye; g_fpSmoothFocus = g_focusDistance; g_fpSmoothInit = TRUE;
+            } else {
+                Vec3 de = Vec3Sub(g_baseEye, g_fpSmoothEye);
+                float dist2 = de.x * de.x + de.y * de.y + de.z * de.z;
+                if (dist2 > 500.0f * 500.0f) {
+                    g_fpSmoothEye = g_baseEye; g_fpSmoothFocus = g_focusDistance;
+                } else {
+                    float a = g_fpSmooth;
+                    g_fpSmoothEye.x += de.x * a; g_fpSmoothEye.y += de.y * a; g_fpSmoothEye.z += de.z * a;
+                    g_fpSmoothFocus += (g_focusDistance - g_fpSmoothFocus) * a;
+                }
+            }
+            useFocus = (g_fpSmoothFocus > 1.0f) ? g_fpSmoothFocus : g_focusDistance;
+            X1[14] = g_fpForward * useFocus;
+            X1[13] = -g_fpHeight;
+            d = Vec3Sub(g_fpSmoothEye, g_baseEye);
+            X1[12] += -(d.x * right.x + d.y * right.y + d.z * right.z);
+            X1[13] += -(d.x * up.x + d.y * up.y + d.z * up.z);
+            X1[14] += (d.x * fwd.x + d.y * fwd.y + d.z * fwd.z);
+        }
         Mat4MulRow(T, X1, T);
+
+        if (g_fpProbe) {
+            static DWORD s_lp = 0; DWORD now = GetTickCount();
+            if (s_lp == 0 || (DWORD)(now - s_lp) >= 1000) {
+                s_lp = now;
+                LogLine("FP PROBE: razValid=%d n=%d raz=(%.1f,%.1f,%.1f) at=(%.1f,%.1f,%.1f) eye=(%.1f,%.1f,%.1f) baseUp=(%.3f,%.3f,%.3f)",
+                        g_razValid ? 1 : 0, g_razCount, g_razWorld.x, g_razWorld.y, g_razWorld.z,
+                        g_baseAt.x, g_baseAt.y, g_baseAt.z, g_baseEye.x, g_baseEye.y, g_baseEye.z,
+                        g_baseUp.x, g_baseUp.y, g_baseUp.z);
+            }
+        }
     }
 
     {
@@ -2010,6 +2081,32 @@ void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
     }
 
     g_frameCamCached = TRUE;
+
+    /* notes/49: rebuild P^-1 * V^-1 for this frame (undoes view+proj so a per-draw WVP yields the
+     * draw's World matrix), and reset the per-frame Raz-origin search. Only when first person is on
+     * (skips the cost entirely otherwise). V^-1 (view->world) rows are the camera basis + eye;
+     * P^-1 mirrors the projection built in the head-tracking path. */
+    if (g_firstPerson && g_projXScaleValid && g_projYScale != 0.0f) {
+        Vec3 fwd = Vec3Normalize(Vec3Sub(g_baseAt, g_baseEye));
+        Vec3 xaxis = g_rightVec;                       /* = normalize(cross(fwd, up)) - notes/34 */
+        Vec3 zaxis; Vec3 yaxis;
+        float Vinv[16], Pinv[16];
+        float xS = g_projXScale, yS = g_projYScale;
+        float A = g_projZFar / (g_projZNear - g_projZFar);
+        float B = g_projZNear * g_projZFar / (g_projZNear - g_projZFar);
+        zaxis.x = -fwd.x; zaxis.y = -fwd.y; zaxis.z = -fwd.z;   /* normalize(eye-at) */
+        yaxis = Vec3Cross(zaxis, xaxis);
+        Vinv[0]=xaxis.x; Vinv[1]=xaxis.y; Vinv[2]=xaxis.z; Vinv[3]=0.0f;
+        Vinv[4]=yaxis.x; Vinv[5]=yaxis.y; Vinv[6]=yaxis.z; Vinv[7]=0.0f;
+        Vinv[8]=zaxis.x; Vinv[9]=zaxis.y; Vinv[10]=zaxis.z; Vinv[11]=0.0f;
+        Vinv[12]=g_baseEye.x; Vinv[13]=g_baseEye.y; Vinv[14]=g_baseEye.z; Vinv[15]=1.0f;
+        { int i; for (i=0;i<16;i++) Pinv[i]=0.0f; }
+        Pinv[0]=1.0f/xS; Pinv[5]=1.0f/yS; Pinv[11]=1.0f/B; Pinv[14]=-1.0f; Pinv[15]=A/B;
+        Mat4MulRow(g_pinvVinv, Pinv, Vinv);            /* World = WVP * (P^-1 * V^-1) */
+        g_pinvVinvValid = TRUE;
+        g_razSumX = g_razSumY = g_razSumZ = 0.0f;      /* start this frame's centroid accumulation */
+        g_razCount = 0;
+    }
 
     {
         static DWORD s_lastLog = 0;
@@ -2670,6 +2767,47 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         }
     }
 
+    /* notes/49: on a skinned (bone-palette) draw during an eye pass, recover this entity's world
+     * origin = translation of World = WVP * (P^-1 * V^-1). WVP's row 3 (the translation row) comes
+     * from the transposed upload as (u[3],u[7],u[11],u[15]); origin = (WVP_row3 * pinvVinv) / w.
+     * Keep the origin nearest the chase camera's look-at point - that entity is Raz. Cheap: one
+     * vec4*mat4 per skinned draw. */
+    if (g_firstPerson && g_pinvVinvValid && g_lastC6Valid &&
+        g_stereoPhase != STEREO_PHASE_IDLE &&
+        StartRegister >= 64 && StartRegister < 192 && Vector4fCount >= 6) {
+        float wr3[4], o[4];
+        int c, k;
+        wr3[0] = g_lastC6[3]; wr3[1] = g_lastC6[7]; wr3[2] = g_lastC6[11]; wr3[3] = g_lastC6[15];
+        for (c = 0; c < 4; c++) {
+            float s = 0.0f;
+            for (k = 0; k < 4; k++) s += wr3[k] * g_pinvVinv[k * 4 + c];
+            o[c] = s;
+        }
+        if (o[3] > 1e-6f || o[3] < -1e-6f) {
+            float ox = o[0] / o[3], oy = o[1] / o[3], oz = o[2] / o[3];
+            /* notes/49: reject recoveries sitting near the camera eye - those are screen-space /
+             * camera-attached draws, or skinned draws that reused a stale (non-Raz) register-6
+             * upload (many bone draws arrive without a fresh r6). Raz is the framed character, ~an
+             * eye->at distance in front of the camera, so his real origin is FAR from the eye. */
+            float ex = ox - g_baseEye.x, ey = oy - g_baseEye.y, ez = oz - g_baseEye.z;
+            float dEye2 = ex * ex + ey * ey + ez * ez;
+            float minEye = 0.35f * g_focusDistance;
+            if (dEye2 > minEye * minEye) {
+                /* notes/49: accumulate the CENTROID of skinned origins near the lock (all of Raz's
+                 * body-part draws), not the single nearest - averaging is stable and won't ratchet
+                 * down onto his planted feet as he walks (which sank the eye through the floor).
+                 * "Near the lock" = within maxR of last frame's Raz (once locked) or of the look-at
+                 * point (before the first lock). */
+                Vec3 ref = g_razValid ? g_razWorld : g_baseAt;
+                float maxR = g_razValid ? 300.0f : (2.0f * g_focusDistance);
+                float dx = ox - ref.x, dy = oy - ref.y, dz = oz - ref.z;
+                if (dx * dx + dy * dy + dz * dz < maxR * maxR) {
+                    g_razSumX += ox; g_razSumY += oy; g_razSumZ += oz; g_razCount++;
+                }
+            }
+        }
+    }
+
     /* notes/36 UI depth: a game upload of c50 replaces any shift we baked in - re-apply it on
      * the way through when a UI shader is bound during an eye phase (see UIShift_Wanted). */
     if (StartRegister == 50 && Vector4fCount >= 1 && pConstantData != NULL) {
@@ -2686,6 +2824,14 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
             g_pRealSetVSConstF(This, 50, first, 1);
             return g_pRealSetVSConstF(This, 51, pConstantData + 4, Vector4fCount - 1);
         }
+    }
+
+    /* notes/49: cache the RAW register-6 upload (WVP transposed, pre-patch) for first-person world
+     * recovery - the very next skinned draw's bone upload pairs with it. */
+    if (g_firstPerson && StartRegister == STEREO_WVP_REGISTER && Vector4fCount == 4 &&
+        pConstantData != NULL) {
+        memcpy(g_lastC6, pConstantData, 16 * sizeof(float));
+        g_lastC6Valid = TRUE;
     }
 
     if (g_stereoPhase != STEREO_PHASE_IDLE &&
