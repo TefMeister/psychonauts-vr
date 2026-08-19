@@ -614,6 +614,8 @@ static volatile LONG g_traceDrawCount = 0;
  * every ~5s. Recon for the skinned-geometry (bone matrix) constant range - the one register
  * family the stereo/tracking correction doesn't cover yet. */
 static BOOL g_regHisto = FALSE;
+static BOOL g_boneProbe = FALSE; /* notes/44: PSYVR_BONE_PROBE=1 - throttled logging of bone-palette
+                                    uploads (c64.., notes/36) - feasibility recon for hand IK / body rig */
 static volatile LONG g_regHistoCount[256];
 static BYTE g_regHistoVecMax[256];
 /* notes/36: per-draw register-combination tracking. Bits set in SVSCF for interesting registers,
@@ -784,6 +786,9 @@ static void VRBridge_ReadEnableFlag(void)
     if (g_traceFrames) LogLine("VRBridge: PSYVR_TRACE_FRAME=1 - one-frame RT/Clear/draw traces every ~5s");
     len = GetEnvironmentVariableA("PSYVR_REG_HISTO", buf, sizeof(buf));
     g_regHisto = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    len = GetEnvironmentVariableA("PSYVR_BONE_PROBE", buf, sizeof(buf));
+    g_boneProbe = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_boneProbe) LogLine("VRBridge: PSYVR_BONE_PROBE=1 - throttled bone-palette upload logging (notes/44 recon)");
     if (g_regHisto) LogLine("VRBridge: PSYVR_REG_HISTO=1 - vertex-shader-constant register histogram every ~5s");
 
     {
@@ -2507,6 +2512,25 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         case 64: InterlockedOr(&g_regComboMask, REGBIT_R64); break;
         case 96: InterlockedOr(&g_regComboMask, REGBIT_R96); break;
         default: break;
+        }
+    }
+
+    /* notes/44 recon: bone-palette uploads (c64.., per-bone-count shader permutations - see
+     * notes/36). Log the first two bone matrices of the largest upload once per second: enough
+     * to characterize rows-per-bone and watch translations animate, proving live skeleton data
+     * flows through this hook (foundation for render-level hand IK / body rig). */
+    if (g_boneProbe && StartRegister >= 64 && StartRegister < 192 && Vector4fCount >= 6 &&
+        pConstantData != NULL) {
+        static DWORD s_lastBoneLog = 0;
+        DWORD now = GetTickCount();
+        if (s_lastBoneLog == 0 || (DWORD)(now - s_lastBoneLog) >= 1000) {
+            const float *p = pConstantData;
+            s_lastBoneLog = now;
+            LogLine("BONEPROBE: c%u n=%u phase=%ld", StartRegister, Vector4fCount, g_stereoPhase);
+            LogLine("BONEPROBE:  r0=[% .3f % .3f % .3f % .3f] r1=[% .3f % .3f % .3f % .3f] r2=[% .3f % .3f % .3f % .3f]",
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
+            LogLine("BONEPROBE:  r3=[% .3f % .3f % .3f % .3f] r4=[% .3f % .3f % .3f % .3f] r5=[% .3f % .3f % .3f % .3f]",
+                    p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]);
         }
     }
 
