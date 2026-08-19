@@ -6,8 +6,8 @@ PSYVR_FOV_SCALE now only controls culling margin/lens coverage (Quest 3 full cov
 new launcher default). The notes/42 "HUD invisible" bug dissolves with it. The notes/42 UI
 viewport shrink was built first, failed live (the game's fullscreen fades/backdrops share the
 UI shader signature — "everything dark"), and is demoted to an experimental opt-in. The
-notes/40 missing suggested-FOV log line is root-caused and fixed. v0.1.7-alpha built and
-dev-verified, release pending user go-ahead + Quest 3 flight. Details in notes/43)
+notes/40 missing suggested-FOV log line is root-caused and fixed. v0.1.7-alpha RELEASED
+(user go-ahead, 2026-08-19 midday); Quest 3 flight is the next event. Details in notes/43)
 
 ## Session 43 (2026-08-19): submit bounds = real zoom fix; UI-shrink post-mortem
 
