@@ -1,9 +1,10 @@
 # Proxy `d3d9.dll` — usage
 
-**v0.1.6-alpha** *(launcher/config-only update: the DLL binaries are byte-identical to
-v0.1.4-alpha — v0.1.5 added ready-made launcher `.bat` files including a Meta Quest 3
-pre-tuned one; v0.1.6 corrects that launcher's FOV default after real-hardware testing
-found the HUD becomes invisible at FOV scale >~1.2 — see Known issues).*
+**v0.1.7-alpha** *(the zoomed-in picture is fixed at the root: the mod now submits each eye
+with tangent-matched texture bounds, so the compositor's angular mapping is exactly 1:1 on any
+headset with no per-headset tuning. `PSYVR_FOV_SCALE` changes meaning — see its entry below —
+and the v0.1.6 "HUD invisible at FOV scale >1.2" issue is gone with the mechanism that caused
+it. Also restores the suggested-FOV log line that v0.1.4's notes promised.)*
 This is the mod's core component: a `d3d9.dll` that loads in place of the
 system one (standard Windows DLL search order, the same mechanism dxwrapper and most D3D9 mods
 use). It does three things now:
@@ -77,13 +78,14 @@ real headset** — that is exactly what this release exists to test.
 
 ## Known issues / limitations
 
-- **HUD invisible at `PSYVR_FOV_SCALE` above ~1.2 (found 2026-08-19, real-hardware playtest).**
-  The game's screen-space HUD spans the full frame, so widening the 3D FOV pushes HUD
-  corners to the far periphery — at the Quest 3's geometric match value of 1.5 they land at
-  ≈±47°, beyond the lens's clear zone and each eye's nasal crop, making the HUD effectively
-  invisible. Planned fix: scale UI x/y by `1/PSYVR_FOV_SCALE` in the existing UI-shader
-  constant patch so the HUD keeps its native angular size (dev-archive notes/42). Until then
-  the Quest 3 launcher defaults to the 1.2 compromise (HUD visible, most zoom removed).
+- **Fixed in v0.1.7: HUD invisible at `PSYVR_FOV_SCALE` above ~1.2.** This was collateral
+  damage from the old full-texture submit stretching the frame onto the lens frustum; with
+  tangent-matched submit bounds the HUD sits at its natural lens-relative angles at any FOV
+  scale. At very high scales the outermost HUD corners can still clip a few degrees at the
+  lens edge (dev-archive notes/43 has the numbers).
+- **HUD elements render at their original angular size** — a per-element rescale exists as an
+  experimental opt-in (`PSYVR_UI_SCALE`, see below) but is off by default because the game
+  draws fullscreen fades/backdrops through the same shaders (dev-archive notes/43).
 - **Head tracking: now confirmed working on real hardware** (Quest 3 playtests 2026-08-18
   and 2026-08-19, dev-archive notes/40 and 42) — motion tracks correctly and comfortably.
   Two real limitations remain: the engine's frustum culling doesn't know about head rotation,
@@ -138,15 +140,22 @@ real headset** — that is exactly what this release exists to test.
      headset.
    - `PSYVR_RENDER_SCALE=1..4` — eye render-resolution multiplier (default 2 with the VR path).
    - `PSYVR_UI_DEPTH=<world units>` — virtual depth for HUD/menu UI (default 200 ≈ 2m; 0 = off).
-   - `PSYVR_FOV_SCALE=0.5..2.5` — multiplies the game's rendered field of view (default 1.0 =
-     untouched). The compositor maps the image onto the headset's much wider frustum, so the
-     game's native FOV can read as zoomed-in — raise this if the world feels magnified. Rule of
-     thumb: your headset's vertical FOV (from the `VRBridge_QueryRealGeometry` projRaw values in
-     the log) divided by the game's 52° — ≈1.5 on a Quest 3. **Known issue:** the
-     `suggested PSYVR_FOV_SCALE` log line promised by the v0.1.4 release notes is missing from
-     the shipped DLL (see dev-archive notes/40 for the manual derivation); a Quest 3 pre-tuned
-     launcher (`Launch-Psychonauts-VR-Quest3.bat`) ships with v0.1.5 as a stopgap. A wider FOV
-     spreads pixels thinner — consider pairing with `PSYVR_RENDER_SCALE=3`.
+   - `PSYVR_FOV_SCALE=0.5..2.5` — how much field of view the game renders (default 1.0 =
+     the game's native 52° vertical). Since v0.1.7 this no longer affects the zoom (the
+     submit-bounds crop keeps the angular mapping 1:1 regardless); it controls how much frame
+     exists *around* the headset's visible window. Below the full-coverage value the compositor
+     mildly stretches the uncovered axis and off-axis head turns hit unrendered black sooner;
+     at or above it the image is geometrically exact everywhere. The log prints both a
+     `suggested PSYVR_FOV_SCALE` line (restored in v0.1.7 — it was missing from v0.1.4-0.1.6)
+     and the exact `full lens coverage needs PSYVR_FOV_SCALE>=…` value for your headset
+     (≈1.8 on a Quest 3; that's the Quest 3 launcher's default). A wider FOV spreads pixels
+     thinner — consider pairing with `PSYVR_RENDER_SCALE=3`.
+   - `PSYVR_SUBMIT_BOUNDS=0` — disables the v0.1.7 tangent-matched submit crop and restores
+     the old full-texture submit (which zooms; debug/comparison only).
+   - `PSYVR_UI_SCALE=0.25..1.0` — EXPERIMENTAL: shrinks all screen-space UI draws about the
+     screen center via a per-draw viewport. Known to also shrink fullscreen fades and
+     pause/menu backdrops (they share the UI shader signature), which looks broken — off by
+     default, only useful for experiments until a per-draw classifier lands.
    - **F11** in-game re-centers head tracking (re-captures the reference position/yaw).
 5. The log's `VRBridge_Init: HMD identity:` line records which headset OpenVR reported, and
    `HeadTrack:` lines show the live tracking state.
@@ -162,6 +171,7 @@ dev-archive's `tools/proxy-d3d9/`.
 
 ## Next milestone
 
-Real-headset verification of head tracking — does the view follow the head correctly on all
-axes, does positional lean feel 1:1, and how does the readback-based 72Hz path feel under real
-head motion. After that: rendering at the headset's native per-eye resolution.
+Quest 3 flight of the v0.1.7 submit-bounds path (expect: zoom exactly gone, HUD visible at the
+launcher's FOV 1.8). Then the two known head-tracking limitations: feeding head yaw back into
+the game camera so frustum culling stops leaving an over-the-shoulder void, and center-eye
+LOD/billboard decisions to stop distant sprite flicker.
