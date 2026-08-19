@@ -639,10 +639,23 @@ static volatile LONG g_vsDumpIndex = 0; /* CreateVertexShader bytecode dump coun
  * bound, and shift its per-draw c50.x upload per eye to place the UI at a comfortable virtual
  * depth: shift = -d * xScale / PSYVR_UI_DEPTH (world units, default 200 ~= 2m; 0 disables). */
 static float g_uiDepthWorld = 200.0f;
+/* notes/42+43: UI viewport shrink - shrinks the viewport about its center while a UI-signature
+ * shader is bound during an eye phase (the UI shaders are purely additive, oPos = input + c50,
+ * so a constant can't rescale positions; the viewport transform rescales the whole draw
+ * regardless of shader internals). Live-tested 2026-08-19 and DEMOTED to an experimental
+ * opt-in: the game draws fullscreen overlays (fades, pause/menu backdrops) through the same
+ * shaders, and shrinking those crushes the whole presented scene into the frame center. OFF
+ * (1.0) unless PSYVR_UI_SCALE sets an absolute factor. The shipping fix for HUD visibility at
+ * FOV scale > 1 is the tangent-matched submit crop instead - see VRBridge_SubmitBounds. */
+static float g_uiVpScale = 1.0f;      /* per-draw viewport shrink for UI draws (1 = none) */
+static float g_hmdFovyRad = 0.0f;     /* real HMD vertical FOV (radians), stashed by QueryRealGeometry
+                                         for the deferred suggested-FOV log in BPM_OnEntry (notes/40 Issue 1) */
+static volatile LONG g_fovSuggestLogged = 0;
 #define UI_SHADER_MAX 64
 static void *g_uiShaders[UI_SHADER_MAX];
 static volatile LONG g_uiShaderCount = 0;
 static volatile LONG g_curShaderIsUI = 0;
+static volatile LONG g_curUIShaderIdx = -1; /* notes/43: which registered UI shader is bound (-1 = none) */
 /* Head-tracking per-frame state - the matrices themselves live with the tracking module further
  * down (they need the projection-cache globals); these two flags are up here because
  * VRBridge_Shutdown (defined earlier) clears them. */
@@ -719,6 +732,13 @@ static float g_realHalfIPD[2] = { 0.0f, 0.0f };  /* world units, SIGNED per eye 
                                                      separate sign multiply needed (unlike the old
                                                      STEREO_HALF_IPD*sign pattern), since a real
                                                      headset's eye offsets need not be symmetric. */
+static float g_realProjRaw[2][4];                /* notes/43: per-eye GetProjectionRaw l,r,t,b (raw
+                                                    tangents) for the submit-time texture bounds */
+static BOOL g_realProjRawValid = FALSE;
+static BOOL g_submitBoundsEnabled = TRUE;        /* notes/43: PSYVR_SUBMIT_BOUNDS=0 disables the
+                                                    tangent-matched submit crop (debug escape hatch) */
+static const VRTextureBounds_t *VRBridge_SubmitBounds(int e); /* notes/43: defined below the
+                                                    projection-cache globals it needs */
 static float g_realShearK[2] = { 0.0f, 0.0f };   /* dimensionless GetProjectionRaw (l+r)/2 tangent-
                                                      space frustum-center offset per eye - directly
                                                      usable as the off-axis shear coefficient `k`
@@ -784,6 +804,29 @@ static void VRBridge_ReadEnableFlag(void)
                 g_fovScaleAsm = v;
         }
         LogLine("VRBridge: FOV scale = %.2f (PSYVR_FOV_SCALE, 0.5..2.5; 1.0 = game default)", g_fovScaleAsm);
+
+        /* notes/43: EXPERIMENTAL per-draw UI viewport shrink, OFF by default (1.0). The notes/42
+         * auto-shrink idea failed live: the game's fullscreen overlays (fades, pause/menu
+         * backdrops, brightness passes) share the exact UI shader signature, so shrinking every
+         * UI draw crushed them into the frame center ("everything dark"). Left as an opt-in
+         * absolute factor until a per-draw fullscreen-vs-element classifier exists. */
+        len = GetEnvironmentVariableA("PSYVR_UI_SCALE", dbuf, sizeof(dbuf));
+        if (len > 0 && len < sizeof(dbuf)) {
+            float v = 0.0f;
+            if (sscanf(dbuf, "%f", &v) == 1 && v >= 0.25f && v <= 1.0f)
+                g_uiVpScale = v;
+        }
+        if (g_uiVpScale != 1.0f)
+            LogLine("VRBridge: EXPERIMENTAL UI viewport shrink = %.2f (PSYVR_UI_SCALE; known to break fullscreen overlays)", g_uiVpScale);
+
+        /* notes/43: tangent-matched submit crop, ON by default whenever real HMD geometry is
+         * available (see VRBridge_SubmitBounds). PSYVR_SUBMIT_BOUNDS=0 restores the old
+         * full-texture submit (compositor stretches the frame onto the lens frustum = zoom). */
+        len = GetEnvironmentVariableA("PSYVR_SUBMIT_BOUNDS", dbuf, sizeof(dbuf));
+        if (len > 0 && len < sizeof(dbuf) && dbuf[0] == '0')
+            g_submitBoundsEnabled = FALSE;
+        LogLine("VRBridge: submit bounds = %s (PSYVR_SUBMIT_BOUNDS; tangent-matched crop kills the FOV-scale zoom)",
+                g_submitBoundsEnabled ? "ON" : "OFF");
     }
 
     /* notes/35: eye render scale. Default 2x when the VR path is on (the headset wants far more
@@ -906,23 +949,31 @@ static void VRBridge_QueryRealGeometry(void)
          * works in). */
         g_realShearK[e] = (l + r) * 0.5f;
         g_realShearValid[e] = (fabsf(g_realShearK[e]) > 1e-4f);
+        /* notes/43: keep the raw tangents - the submit path crops the eye texture to exactly
+         * this frustum so the compositor's angular mapping is 1:1 regardless of PSYVR_FOV_SCALE. */
+        g_realProjRaw[e][0] = l; g_realProjRaw[e][1] = r;
+        g_realProjRaw[e][2] = t; g_realProjRaw[e][3] = b;
+        if (fabsf(l) + fabsf(r) > 0.01f && fabsf(t) + fabsf(b) > 0.01f) {
+            if (e == 1 && g_realProjRawValid) g_realProjRawValid = TRUE; /* both eyes sane */
+            if (e == 0) g_realProjRawValid = TRUE;                      /* provisional until eye 1 */
+        } else {
+            g_realProjRawValid = FALSE;
+        }
 
         LogLine("VRBridge_QueryRealGeometry: eye=%d eyeToHead.x=%.6fm (%.3f world units) "
                 "projRaw l=%.4f r=%.4f t=%.4f b=%.4f centerOffset=%.6f%s",
                 e, m.m[0][3], g_realHalfIPD[e], l, r, t, b, g_realShearK[e],
                 g_realShearValid[e] ? "" : " (symmetric - no real off-axis data, keeping focus-distance k fallback)");
 
-        /* notes/37: suggested PSYVR_FOV_SCALE from the real HMD tangents (eye 0 is enough - the
-         * vertical frustum is identical between eyes). Game fovy comes from the cached
-         * g_projYScale = cot(fovy/2). Only a suggestion in the log: the game's CPU-side gameplay
-         * logic wasn't audited for independent FOV assumptions, so this stays a manual knob. */
-        if (e == 0 && g_projYScale > 0.0f) {
-            float fovyGame = 2.0f * atanf(1.0f / g_projYScale);
-            float fovyHmd = atanf(fabsf(t)) + atanf(fabsf(b));
-            LogLine("VRBridge_QueryRealGeometry: HMD vertical FOV=%.1f deg, game fovy=%.1f deg -> "
-                    "suggested PSYVR_FOV_SCALE=%.2f (currently %.2f)",
-                    fovyHmd * 57.29578f, fovyGame * 57.29578f,
-                    (fovyGame > 0.01f) ? fovyHmd / fovyGame : 0.0f, g_fovScaleAsm);
+        /* notes/40 Issue 1: the v0.1.4 suggested-PSYVR_FOV_SCALE log lived here, guarded by
+         * g_projYScale > 0 - but this function runs at bridge init, BEFORE the game has ever
+         * built a projection matrix, so the guard was always false and the line never printed
+         * on real hardware. Stash the HMD vertical FOV instead; BPM_OnEntry logs the suggestion
+         * one-shot the first time it caches the game projection with this stash available. */
+        if (e == 0) {
+            g_hmdFovyRad = atanf(fabsf(t)) + atanf(fabsf(b));
+            LogLine("VRBridge_QueryRealGeometry: HMD vertical FOV=%.1f deg stashed - suggested "
+                    "PSYVR_FOV_SCALE prints at first BPM cache", g_hmdFovyRad * 57.29578f);
         }
     }
 
@@ -1237,7 +1288,11 @@ static void VRBridge_PumpEye(VRBridgeEyeState *eye, IDirect3DSurface9 *pGameEyeS
                 tex.handle = (void *)eye->tex11[aConsume];
                 tex.eType = ETextureType_TextureType_DirectX;
                 tex.eColorSpace = EColorSpace_ColorSpace_Auto;
-                subErr = g_pVRSubmit(g_pVRCompositor, eye->vrEye, &tex, NULL, EVRSubmitFlags_Submit_Default);
+                /* notes/43: tangent-matched crop - NULL (full texture, the old behavior) whenever
+                 * real geometry isn't available or PSYVR_SUBMIT_BOUNDS=0. */
+                subErr = g_pVRSubmit(g_pVRCompositor, eye->vrEye, &tex,
+                                     VRBridge_SubmitBounds((eye->vrEye == EVREye_Eye_Left) ? 0 : 1),
+                                     EVRSubmitFlags_Submit_Default);
                 if (subErr != EVRCompositorError_VRCompositorError_None) {
                     static DWORD s_lastErrLog = 0;
                     DWORD now = GetTickCount();
@@ -1513,6 +1568,80 @@ static BOOL g_projXScaleValid = FALSE;
 static float g_projZNear = 10.0f;   /* live-confirmed default (notes/06) */
 static float g_projZFar = 50000.0f; /* live-confirmed default (notes/06) */
 
+/* notes/43: tangent-matched submit crop (prototype above VRBridge_PumpEye's call site).
+ * The compositor maps the submitted texture's bounds rectangle linearly-in-tangent-space onto
+ * the headset's per-eye lens frustum. We historically submitted the FULL texture (NULL bounds),
+ * so whatever FOV the game rendered was stretched onto the lens frustum - the entire reason the
+ * picture looked zoomed-in and PSYVR_FOV_SCALE needed per-headset hand-tuning (notes/40). This
+ * computes, per eye, the sub-rectangle of our frame whose tangent extents equal the headset's
+ * real frustum (GetProjectionRaw), making the angular mapping exactly 1:1 at ANY FOV scale.
+ * PSYVR_FOV_SCALE then only controls how much rendered frame exists OUTSIDE the visible window
+ * (culling margin + HUD legroom) - not the zoom.
+ *   Frame tangent extents: x in [k - 1/xScale, k + 1/xScale] (k = the same per-eye shear the
+ *   WVP patch applies), y symmetric +/-1/yScale (no vertical shear yet - hence the vMin clamp
+ *   on headsets whose frustum reaches higher than it does low, like the Quest 3).
+ *   Texture orientation: u=0 = clip x=-1 (left), v=0 = clip y=+1 (top; D3D row 0).
+ * A clamped bound means that axis lacks coverage and the compositor mildly stretches it; the
+ * log suggests the PSYVR_FOV_SCALE that reaches full coverage. */
+static const VRTextureBounds_t *VRBridge_SubmitBounds(int e)
+{
+    static VRTextureBounds_t s_bounds[2];
+    static DWORD s_lastLog[2] = { 0, 0 };
+    float xHalf, yHalf, k, l, r, t, b, uMin, uMax, vMin, vMax;
+    BOOL clamped = FALSE;
+
+    if (!g_submitBoundsEnabled || !g_realProjRawValid || !g_projXScaleValid ||
+        g_projXScale <= 0.0f || g_projYScale <= 0.0f || e < 0 || e > 1)
+        return NULL;
+
+    xHalf = 1.0f / g_projXScale;
+    yHalf = 1.0f / g_projYScale;
+    k = g_realShearValid[e] ? g_realShearK[e]
+                            : (-g_realHalfIPD[e]) / ((g_focusDistance > 1.0f) ? g_focusDistance : 1.0f);
+    l = g_realProjRaw[e][0]; r = g_realProjRaw[e][1];
+    t = g_realProjRaw[e][2]; b = g_realProjRaw[e][3];
+
+    uMin = (l - (k - xHalf)) / (2.0f * xHalf);
+    uMax = (r - (k - xHalf)) / (2.0f * xHalf);
+    vMin = (yHalf - fabsf(t)) / (2.0f * yHalf); /* t is the UPWARD tangent, negative in OpenVR's convention */
+    vMax = (yHalf + b) / (2.0f * yHalf);        /* b = downward tangent, positive */
+
+    if (uMin < 0.0f) { uMin = 0.0f; clamped = TRUE; }
+    if (vMin < 0.0f) { vMin = 0.0f; clamped = TRUE; }
+    if (uMax > 1.0f) { uMax = 1.0f; clamped = TRUE; }
+    if (vMax > 1.0f) { vMax = 1.0f; clamped = TRUE; }
+    if (uMax - uMin < 0.05f || vMax - vMin < 0.05f)
+        return NULL; /* degenerate - something's off, full-texture submit is the safer fallback */
+
+    s_bounds[e].uMin = uMin; s_bounds[e].uMax = uMax;
+    s_bounds[e].vMin = vMin; s_bounds[e].vMax = vMax;
+
+    {
+        DWORD now = GetTickCount();
+        if (s_lastLog[e] == 0 || (DWORD)(now - s_lastLog[e]) >= 5000) {
+            /* full-coverage suggestion: the FOV scale at which no bound needs clamping.
+             * rawFov (and therefore fovy) is linear in the scale, so scale_needed =
+             * fovy_needed / fovy_base per axis; horizontal converts through the aspect. */
+            float fovyCur = 2.0f * atanf(yHalf);
+            float fovScale = (g_fovScaleAsm > 0.01f) ? g_fovScaleAsm : 1.0f;
+            float fovyBase = fovyCur / fovScale;
+            float aspect = xHalf / yHalf;
+            float needY = (fabsf(t) > b) ? fabsf(t) : b;
+            float needXl = fabsf(l - k), needXr = fabsf(r - k);
+            float needX = (needXl > needXr) ? needXl : needXr;
+            float scaleY = 2.0f * atanf(needY) / fovyBase;
+            float scaleX = 2.0f * atanf(needX / aspect) / fovyBase;
+            float suggested = (scaleX > scaleY) ? scaleX : scaleY;
+            LogLine("VRBridge: submit bounds eye=%d u=[%.3f,%.3f] v=[%.3f,%.3f]%s - angular mapping 1:1"
+                    " (full lens coverage needs PSYVR_FOV_SCALE>=%.2f, current %.2f)",
+                    e, uMin, uMax, vMin, vMax, clamped ? " (CLAMPED: frame smaller than lens frustum on an axis)" : "",
+                    suggested + 0.005f, fovScale);
+            s_lastLog[e] = now;
+        }
+    }
+    return &s_bounds[e];
+}
+
 /* ======================================================================
  * Head tracking (notes/34)
  * ======================================================================
@@ -1778,6 +1907,19 @@ void __cdecl BPM_OnEntry_asm(float rawFov, float aspect, float zn, float zf)
     g_projYScale = g_projXScale * aspect; /* cot(fovy/2) - notes/34 head tracking needs the full P */
     g_projXScaleValid = TRUE;
 
+    /* notes/40 Issue 1: deferred suggested-FOV log - QueryRealGeometry runs before any BPM
+     * cache exists, so it stashes the HMD tangent FOV and the first cache fires the log here.
+     * Suggested value is relative to the game DEFAULT fovy (current fovy divided back by the
+     * active scale), so it stays correct even when a scale is already applied this session. */
+    if (g_hmdFovyRad > 0.0f && !g_fovSuggestLogged &&
+        InterlockedExchange(&g_fovSuggestLogged, 1) == 0) {
+        float fovyBase = (g_fovScaleAsm > 0.01f) ? fovy / g_fovScaleAsm : fovy;
+        LogLine("BPM: HMD vertical FOV=%.1f deg, game default fovy=%.1f deg -> "
+                "suggested PSYVR_FOV_SCALE=%.2f (currently %.2f)",
+                g_hmdFovyRad * 57.29578f, fovyBase * 57.29578f,
+                (fovyBase > 0.01f) ? g_hmdFovyRad / fovyBase : 0.0f, g_fovScaleAsm);
+    }
+
     /* notes/24: zn/zf for the off-axis A/B terms - sanity-guarded the same
      * way as fovy above rather than trusting arbitrary stack contents. */
     if (zn > 0.0f && zf > zn) {
@@ -1939,6 +2081,7 @@ static volatile LONG g_svscfCountEye2 = 0;
 
 void TraceFlushDrawsFwd(void); /* notes/35: defined with the trace hooks below */
 void UIShift_ReconcileFwd(void); /* notes/36: defined with the UI-depth machinery below */
+void UIVp_PhaseChangedFwd(void); /* notes/42: defined with the UI-viewport machinery below */
 
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
@@ -1963,6 +2106,7 @@ void __cdecl CandB_BeforeEye1_asm(void)
     g_eye2Presented = 0;
     SetEyeAndTarget(-1.0f, g_pEye1Surf, g_pEye1DepthStencil);
     UIShift_ReconcileFwd(); /* notes/36: phase changed - re-aim the UI depth shift */
+    UIVp_PhaseChangedFwd(); /* notes/42: RT bind reset the viewport - re-shrink if UI still bound */
 }
 
 void __cdecl CandB_BeforeEye2_asm(void) asm("CandB_BeforeEye2_asm");
@@ -1972,6 +2116,7 @@ void __cdecl CandB_BeforeEye2_asm(void)
     g_stereoPhase = STEREO_PHASE_EYE2;
     SetEyeAndTarget(+1.0f, g_pEye2Surf, g_pEye2DepthStencil);
     UIShift_ReconcileFwd(); /* notes/36 */
+    UIVp_PhaseChangedFwd(); /* notes/42 */
 }
 
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
@@ -1980,6 +2125,7 @@ void __cdecl CandB_AfterBoth_asm(void)
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }
     g_stereoPhase = STEREO_PHASE_IDLE;
     UIShift_ReconcileFwd(); /* notes/36: phase idle - removes any applied UI shift */
+    UIVp_PhaseChangedFwd(); /* notes/42: phase idle - drop any applied UI viewport shrink */
     if (!g_stereoReady || !g_pDevice || !g_pRealBackBuffer) return;
 
     /* notes/28: both eyes' private render targets (g_pEye1Surf/g_pEye2Surf) are now fully
@@ -2331,10 +2477,16 @@ static float UIShift_Wanted(void)
     else if (g_stereoPhase == STEREO_PHASE_EYE2) eyeIdx = 1;
     else return 0.0f;
     d = g_vrGeomValid ? g_realHalfIPD[eyeIdx] : STEREO_HALF_IPD * (eyeIdx == 0 ? -1.0f : 1.0f);
-    return (-d) * g_projXScale / g_uiDepthWorld;
+    /* notes/42: the shift is applied in the UI shader's clip space, which the UI viewport
+     * shrink (UIVp_Reconcile) then maps onto only a g_uiVpScale fraction of the frame - divide
+     * by the shrink so the rendered parallax (and therefore the perceived UI depth) stays the
+     * same as at FOV scale 1. g_uiVpScale is 1 when no shrink is active. */
+    return (-d) * (g_projXScale / g_uiVpScale) / g_uiDepthWorld;
 }
 
 static float g_uiShiftApplied = 0.0f; /* delta currently baked into the device's c50.x */
+static float g_lastC50[2] = {0.0f, 0.0f}; /* notes/43: the game's own last c50.xy upload (pre-shift) -
+                                             per-draw UI element screen offset, diagnostic + classifier input */
 
 static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
     IDirect3DDevice9 *This,
@@ -2362,6 +2514,8 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
      * the way through when a UI shader is bound during an eye phase (see UIShift_Wanted). */
     if (StartRegister == 50 && Vector4fCount >= 1 && pConstantData != NULL) {
         float want = UIShift_Wanted();
+        g_lastC50[0] = pConstantData[0];
+        g_lastC50[1] = pConstantData[1];
         g_uiShiftApplied = want;
         if (want != 0.0f) {
             float first[4];
@@ -2800,6 +2954,53 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(
 typedef HRESULT (STDMETHODCALLTYPE *SetViewport_t)(IDirect3DDevice9 *This, CONST D3DVIEWPORT9 *pViewport);
 static SetViewport_t g_pRealSetViewport = NULL;
 
+/* ---- notes/42: UI viewport shrink (HUD invisible at FOV scale > 1) ------------------------- */
+/* While a UI-signature shader is bound during an eye phase, render through a center-shrunk
+ * viewport so the screen-space HUD keeps its native angular footprint instead of inheriting the
+ * FOV widening. g_uiVpSaved holds the viewport to restore when a non-UI shader binds again; a
+ * phase transition invalidates the applied state (the eye RT bind resets the viewport). */
+static BOOL g_uiVpApplied = FALSE;
+static D3DVIEWPORT9 g_uiVpSaved;
+
+static void UIVp_ShrinkFrom(D3DVIEWPORT9 *vp, float s)
+{
+    DWORD w = (DWORD)((float)vp->Width * s + 0.5f);
+    DWORD h = (DWORD)((float)vp->Height * s + 0.5f);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    vp->X += (vp->Width - w) / 2;
+    vp->Y += (vp->Height - h) / 2;
+    vp->Width = w;
+    vp->Height = h;
+}
+
+static BOOL UIVp_ShrinkWanted(void)
+{
+    return g_curShaderIsUI &&
+           (g_stereoPhase == STEREO_PHASE_EYE1 || g_stereoPhase == STEREO_PHASE_EYE2) &&
+           g_uiVpScale > 0.0f && g_uiVpScale < 0.9995f;
+}
+
+static void UIVp_Reconcile(IDirect3DDevice9 *dev)
+{
+    BOOL want = UIVp_ShrinkWanted();
+    if (want && !g_uiVpApplied) {
+        D3DVIEWPORT9 vp;
+        if (dev && g_pRealSetViewport &&
+            SUCCEEDED(dev->lpVtbl->GetViewport(dev, &vp))) {
+            g_uiVpSaved = vp;
+            UIVp_ShrinkFrom(&vp, g_uiVpScale);
+            g_pRealSetViewport(dev, &vp);
+            g_uiVpApplied = TRUE;
+        }
+    } else if (!want && g_uiVpApplied) {
+        if (dev && g_pRealSetViewport)
+            g_pRealSetViewport(dev, &g_uiVpSaved);
+        g_uiVpApplied = FALSE;
+    }
+}
+void UIVp_PhaseChangedFwd(void); /* defined after g_pDevice's declaration region, next to UIShift_ReconcileFwd */
+
 static HRESULT STDMETHODCALLTYPE Hook_SetViewport(IDirect3DDevice9 *This, CONST D3DVIEWPORT9 *pViewport)
 {
     if (g_stereoPhase != STEREO_PHASE_IDLE && g_eyeScale > 1 && pViewport != NULL) {
@@ -2821,6 +3022,18 @@ static HRESULT STDMETHODCALLTYPE Hook_SetViewport(IDirect3DDevice9 *This, CONST 
                 s_lastLog = now;
             }
         }
+        /* notes/42: a game viewport arriving while the UI shrink is active becomes the new
+         * restore base; keep the shrink applied on top of it. */
+        if (g_uiVpApplied) {
+            g_uiVpSaved = vp;
+            UIVp_ShrinkFrom(&vp, g_uiVpScale);
+        }
+        return g_pRealSetViewport(This, &vp);
+    }
+    if (g_uiVpApplied && pViewport != NULL) {
+        D3DVIEWPORT9 vp = *pViewport;
+        g_uiVpSaved = vp;
+        UIVp_ShrinkFrom(&vp, g_uiVpScale);
         return g_pRealSetViewport(This, &vp);
     }
     return g_pRealSetViewport(This, pViewport);
@@ -3102,6 +3315,15 @@ static void UIShift_Reconcile(IDirect3DDevice9 *dev)
 }
 void UIShift_ReconcileFwd(void) { if (g_pDevice) UIShift_Reconcile(g_pDevice); } /* for the CandB callbacks */
 
+/* notes/42: phase transition - the eye/backbuffer RT bind in SetEyeAndTarget already reset the
+ * device viewport to full-RT, so the applied flag is stale by definition: clear it (never
+ * restore g_uiVpSaved across a phase change) and re-shrink if a UI shader is still bound. */
+void UIVp_PhaseChangedFwd(void)
+{
+    g_uiVpApplied = FALSE;
+    if (g_pDevice) UIVp_Reconcile(g_pDevice);
+}
+
 typedef HRESULT (STDMETHODCALLTYPE *SetVertexShader_t)(IDirect3DDevice9 *This, IDirect3DVertexShader9 *pShader);
 static SetVertexShader_t g_pRealSetVertexShader = NULL;
 
@@ -3113,20 +3335,32 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(IDirect3DDevice9 *This, ID
         if (g_uiShaders[i] == (void *)pShader) { isUI = 1; break; }
     }
     g_curShaderIsUI = isUI;
+    g_curUIShaderIdx = isUI ? i : -1;
+    UIVp_Reconcile(This);   /* notes/42: shrink/restore the viewport for UI draws */
     UIShift_Reconcile(This);
     return g_pRealSetVertexShader(This, pShader);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT s, UINT c)
 {
-    if (g_traceActive) InterlockedIncrement(&g_traceDrawCount);
+    if (g_traceActive) {
+        InterlockedIncrement(&g_traceDrawCount);
+        if (g_curShaderIsUI)
+            LogLine("TRACE-UI: DrawPrimitive sh=%ld type=%d start=%u prims=%u phase=%ld c50=(%.4f,%.4f)",
+                    g_curUIShaderIdx, (int)t, s, c, g_stereoPhase, g_lastC50[0], g_lastC50[1]);
+    }
     RegComboOnDraw();
     return g_pRealDrawPrimitive(This, t, s, c);
 }
 static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
                                                            INT b, UINT mi, UINT nv, UINT si, UINT pc)
 {
-    if (g_traceActive) InterlockedIncrement(&g_traceDrawCount);
+    if (g_traceActive) {
+        InterlockedIncrement(&g_traceDrawCount);
+        if (g_curShaderIsUI)
+            LogLine("TRACE-UI: DrawIndexedPrimitive sh=%ld type=%d base=%d minIdx=%u nVerts=%u prims=%u phase=%ld c50=(%.4f,%.4f)",
+                    g_curUIShaderIdx, (int)t, b, mi, nv, pc, g_stereoPhase, g_lastC50[0], g_lastC50[1]);
+    }
     RegComboOnDraw();
     return g_pRealDrawIndexedPrimitive(This, t, b, mi, nv, si, pc);
 }
@@ -3136,6 +3370,14 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9 *This, D3
     if (g_traceActive) {
         TraceFlushDraws();
         LogLine("TRACE: DrawPrimitiveUP(count=%u) phase=%ld  <- pretransformed/UP path", c, g_stereoPhase);
+        if (g_curShaderIsUI && d != NULL && stride >= 8 && c >= 1) {
+            const float *v0 = (const float *)d;
+            const float *v2 = (const float *)((const BYTE *)d + 2 * stride);
+            LogLine("TRACE-UI: DPUP sh=%ld type=%d prims=%u stride=%u v0=[%.4f %.4f %.4f %.4f] v2=[%.4f %.4f %.4f %.4f] c50=(%.4f,%.4f)",
+                    g_curUIShaderIdx, (int)t, c, stride, v0[0], v0[1], (stride >= 12) ? v0[2] : 0.0f, (stride >= 16) ? v0[3] : 0.0f,
+                    v2[0], v2[1], (stride >= 12) ? v2[2] : 0.0f, (stride >= 16) ? v2[3] : 0.0f,
+                    g_lastC50[0], g_lastC50[1]);
+        }
     }
     RegComboOnDraw();
     return g_pRealDrawPrimitiveUP(This, t, c, d, stride);
@@ -3147,6 +3389,14 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9 *T
     if (g_traceActive) {
         TraceFlushDraws();
         LogLine("TRACE: DrawIndexedPrimitiveUP(prims=%u) phase=%ld  <- pretransformed/UP path", pc, g_stereoPhase);
+        if (g_curShaderIsUI && vd != NULL && stride >= 8 && nv >= 3) {
+            const float *v0 = (const float *)vd;
+            const float *v2 = (const float *)((const BYTE *)vd + 2 * stride);
+            LogLine("TRACE-UI: DIPUP sh=%ld type=%d nVerts=%u prims=%u stride=%u v0=[%.4f %.4f %.4f %.4f] v2=[%.4f %.4f %.4f %.4f] c50=(%.4f,%.4f)",
+                    g_curUIShaderIdx, (int)t, nv, pc, stride, v0[0], v0[1], (stride >= 12) ? v0[2] : 0.0f, (stride >= 16) ? v0[3] : 0.0f,
+                    v2[0], v2[1], (stride >= 12) ? v2[2] : 0.0f, (stride >= 16) ? v2[3] : 0.0f,
+                    g_lastC50[0], g_lastC50[1]);
+        }
     }
     RegComboOnDraw();
     return g_pRealDrawIndexedPrimitiveUP(This, t, mi, nv, pc, id, ifmt, vd, stride);
