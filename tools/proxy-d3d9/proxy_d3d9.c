@@ -587,6 +587,23 @@ static BOOL g_vrSkipPumpEye = FALSE;
 static BOOL g_trackingDisabled = FALSE;
 static BOOL g_fakePose = FALSE;
 
+/* notes/47: EXPERIMENTAL first-person prototype (PSYVR_FIRST_PERSON=1, default off). The game's
+ * chase camera looks from g_baseEye toward g_baseAt; the look-at point tracks Raz, at distance
+ * g_focusDistance forward. First person = slide the eye forward onto that point, then let head
+ * tracking rotate the view about it. Implemented as a view-space forward translation X1 composed
+ * into the SAME P^-1*X*P premultiply the head-tracking path already applies to register 6, so it
+ * inherits stereo, per-eye offset, and head rotation for free. Does NOT hide Raz's model yet
+ * (that needs per-draw entity identification - next step); this prototype is about proving the
+ * viewpoint. FP_FORWARD is the fraction of the eye->at distance to travel (1.0 = exactly onto the
+ * look-at point; <1 backs off so we sit behind Raz's head rather than inside it). FP_HEIGHT lifts
+ * the eye vertically in world units after the forward move. */
+static BOOL g_firstPerson = FALSE;
+static float g_fpForward = 0.90f;  /* PSYVR_FP_FORWARD 0..4 */
+static float g_fpHeight = 0.0f;    /* PSYVR_FP_HEIGHT world units (100 = 1m) */
+static float g_fpSmooth = 0.15f;   /* PSYVR_FP_SMOOTH 0.02..1: lower = smoother/more lag, 1 = off
+                                      (declared here - the env parser below runs before the Vec3
+                                      smoothing state defined near the camera-cache globals) */
+
 /* notes/37: PSYVR_FOV_SCALE - multiplies the game's rawFov argument IN PLACE on the stack at
  * BuildProjectionMatrix entry (fovy is linear in rawFov, notes/07), widening/narrowing the
  * rendered field of view. The compositor maps the submitted eye textures onto the HEADSET's
@@ -773,6 +790,31 @@ static void VRBridge_ReadEnableFlag(void)
     g_trackingDisabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
     len = GetEnvironmentVariableA("PSYVR_FAKE_POSE", buf, sizeof(buf));
     g_fakePose = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+
+    /* notes/47: first-person prototype. */
+    len = GetEnvironmentVariableA("PSYVR_FIRST_PERSON", buf, sizeof(buf));
+    g_firstPerson = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    {
+        char fb[16];
+        len = GetEnvironmentVariableA("PSYVR_FP_FORWARD", fb, sizeof(fb));
+        if (len > 0 && len < sizeof(fb)) {
+            float v = 0.0f;
+            if (sscanf(fb, "%f", &v) == 1 && v >= 0.0f && v <= 4.0f) g_fpForward = v;
+        }
+        len = GetEnvironmentVariableA("PSYVR_FP_HEIGHT", fb, sizeof(fb));
+        if (len > 0 && len < sizeof(fb)) {
+            float v = 0.0f;
+            if (sscanf(fb, "%f", &v) == 1 && v > -500.0f && v < 500.0f) g_fpHeight = v;
+        }
+        len = GetEnvironmentVariableA("PSYVR_FP_SMOOTH", fb, sizeof(fb));
+        if (len > 0 && len < sizeof(fb)) {
+            float v = 0.0f;
+            if (sscanf(fb, "%f", &v) == 1 && v >= 0.02f && v <= 1.0f) g_fpSmooth = v;
+        }
+    }
+    if (g_firstPerson)
+        LogLine("VRBridge: FIRST PERSON on (PSYVR_FIRST_PERSON) - forward=%.2f x eye->at, height=%.1fwu; Raz not hidden yet (notes/47)",
+                g_fpForward, g_fpHeight);
     if (g_trackingDisabled || g_fakePose) {
         LogLine("VRBridge: tracking flags - g_trackingDisabled=%d g_fakePose=%d",
                 g_trackingDisabled ? 1 : 0, g_fakePose ? 1 : 0);
@@ -1530,6 +1572,20 @@ typedef struct { float x, y, z; } Vec3;
 static BOOL g_frameCamCached = FALSE;
 static Vec3 g_baseEye, g_baseAt, g_baseUp, g_rightVec;
 static void *g_camPOutMatrix = NULL;
+
+/* notes/47: first-person camera-position smoothing. The chase camera bobs/springs as Raz walks,
+ * and our forward offset is a multiple of the springy eye->at distance, so both ride straight into
+ * the VR view as nauseating bounce. HEAD ROTATION stays crisp (it comes from the HMD, not this) -
+ * only the game-camera-driven POSITION is low-passed, which is locomotion, not head motion, so
+ * smoothing it is comfortable, not laggy-feeling. EMA of the eye position + focus distance, with a
+ * hard snap on big jumps (teleports/level loads/camera cuts) so it doesn't fly across the level. */
+static Vec3 g_fpSmoothEye = {0.0f, 0.0f, 0.0f};
+static float g_fpSmoothFocus = 0.0f;
+static BOOL g_fpSmoothInit = FALSE;
+/* (g_fpSmooth scalar is declared much earlier with the other FP knobs - the env parser needs it) */
+static Vec3 Vec3Sub(Vec3 a, Vec3 b);       /* fwd decls - defined below VRBridge_UpdateHeadTracking */
+static Vec3 Vec3Cross(Vec3 a, Vec3 b);
+static Vec3 Vec3Normalize(Vec3 v);
 /* notes/24: off-axis convergence/focal distance, recomputed each real frame
  * from the live eye->at distance - see the comment on
  * STEREO_FOCUS_DISTANCE_MIN/DEFAULT above for the reasoning. Starts at the
@@ -1704,8 +1760,40 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
     float P[16], Pinv[16], Y[16];
     int r, c;
 
-    if (g_trackingDisabled) return;
+    if (g_trackingDisabled && !g_firstPerson) return; /* notes/47: FP-only still needs this path */
     if (!g_projXScaleValid || g_projYScale == 0.0f) return;
+
+    /* notes/47: live first-person tuning (edge-detected) so the sweet spot can be found in one
+     * running session with no relaunch. F7/F8 = forward -/+ (0.05 step), F9/F10 = height -/+
+     * (10wu step). Logged so the final values can be baked into the launcher. */
+    if (g_firstPerson) {
+        static SHORT p5, p6, p7, p8, p9, p10;
+        SHORT k5 = GetAsyncKeyState(VK_F5), k6 = GetAsyncKeyState(VK_F6);
+        SHORT k7 = GetAsyncKeyState(VK_F7), k8 = GetAsyncKeyState(VK_F8);
+        SHORT k9 = GetAsyncKeyState(VK_F9), k10 = GetAsyncKeyState(VK_F10);
+        BOOL changed = FALSE;
+        if ((k5 & 0x8000) && !(p5 & 0x8000)) { g_fpSmooth -= 0.03f; changed = TRUE; }  /* smoother */
+        if ((k6 & 0x8000) && !(p6 & 0x8000)) { g_fpSmooth += 0.03f; changed = TRUE; }  /* snappier */
+        if ((k7 & 0x8000) && !(p7 & 0x8000)) { g_fpForward -= 0.10f; changed = TRUE; }
+        if ((k8 & 0x8000) && !(p8 & 0x8000)) { g_fpForward += 0.10f; changed = TRUE; }
+        if ((k9 & 0x8000) && !(p9 & 0x8000)) { g_fpHeight -= 10.0f; changed = TRUE; }
+        if ((k10 & 0x8000) && !(p10 & 0x8000)) { g_fpHeight += 10.0f; changed = TRUE; }
+        if (g_fpForward < 0.0f) g_fpForward = 0.0f;
+        if (g_fpForward > 4.0f) g_fpForward = 4.0f; /* notes/47: raised - `at` is short of Raz so >1 is needed */
+        if (g_fpSmooth < 0.02f) g_fpSmooth = 0.02f;
+        if (g_fpSmooth > 1.0f) g_fpSmooth = 1.0f;
+        if (changed)
+            LogLine("FP tune: forward=%.2f x eye->at (%.1fwu), height=%.1fwu, smooth=%.2f  [F5/F6 smooth, F7/F8 fwd, F9/F10 height]",
+                    g_fpForward, g_fpForward * g_focusDistance, g_fpHeight, g_fpSmooth);
+        p5 = k5; p6 = k6; p7 = k7; p8 = k8; p9 = k9; p10 = k10;
+    }
+
+    /* notes/47: first-person with head tracking OFF - use an identity head transform and jump
+     * straight to the forward-translation + Y build below. */
+    if (g_trackingDisabled) {
+        Mat4Identity(T);
+        goto fp_and_build;
+    }
 
     /* notes/35: F11 recenters - drops the reference so the next valid pose re-captures it
      * (position + yaw, same as startup). Edge-detected; costs one GetAsyncKeyState per frame. */
@@ -1768,6 +1856,54 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
             T[12 + c] = -(motion[12] * T[c] + motion[13] * T[4 + c] + motion[14] * T[8 + c])
                         * WORLD_UNITS_PER_METER;
         T[15] = 1.0f;
+    }
+
+fp_and_build:
+    /* notes/47: first-person - slide the eye forward onto Raz (the look-at point sits
+     * g_focusDistance ahead along view -Z, so the world shifts +Z by that much to bring it to
+     * the camera), then apply the head transform about that new origin. Row-vector: T := X1 * T
+     * so points are re-origined first, then head-rotated/leaned. Off by default (byte-identical). */
+    /* notes/47 FIX: do NOT gate on g_frameCamCached - Hook_Present resets it to FALSE BEFORE it
+     * calls VRBridge_PumpPoses (which runs us), so the guard was always false and FP never
+     * reached the render (user saw "keys did nothing visually"). g_focusDistance persists across
+     * frames (set each BVM, clamped, default otherwise), so it's valid with or without the flag. */
+    if (g_firstPerson) {
+        float X1[16];
+        Vec3 fwd = Vec3Normalize(Vec3Sub(g_baseAt, g_baseEye));
+        Vec3 right = g_rightVec;
+        Vec3 up = Vec3Normalize(Vec3Cross(right, fwd));
+        Vec3 d;
+        float useFocus;
+
+        /* notes/47: low-pass the eye position + focus distance to kill walk-bob / camera-spring
+         * bounce. Snap (no smoothing) on big jumps so teleports/cuts don't glide across the map. */
+        if (!g_fpSmoothInit) {
+            g_fpSmoothEye = g_baseEye; g_fpSmoothFocus = g_focusDistance; g_fpSmoothInit = TRUE;
+        } else {
+            Vec3 de = Vec3Sub(g_baseEye, g_fpSmoothEye);
+            float dist2 = de.x * de.x + de.y * de.y + de.z * de.z;
+            if (dist2 > 500.0f * 500.0f) {           /* teleport/level load/camera cut */
+                g_fpSmoothEye = g_baseEye; g_fpSmoothFocus = g_focusDistance;
+            } else {
+                float a = g_fpSmooth;
+                g_fpSmoothEye.x += de.x * a; g_fpSmoothEye.y += de.y * a; g_fpSmoothEye.z += de.z * a;
+                g_fpSmoothFocus += (g_focusDistance - g_fpSmoothFocus) * a;
+            }
+        }
+        useFocus = (g_fpSmoothFocus > 1.0f) ? g_fpSmoothFocus : g_focusDistance;
+
+        Mat4Identity(X1);
+        /* forward onto Raz + vertical offset (view space, +Z = forward here) */
+        X1[14] = g_fpForward * useFocus;
+        X1[13] = -g_fpHeight;
+        /* move the effective eye from the bouncy g_baseEye to the smoothed position: a camera
+         * world-move by d = smoothEye - baseEye becomes view-space translation
+         * (-d.right, -d.up, +d.fwd) - same sign framework the forward/height terms above use. */
+        d = Vec3Sub(g_fpSmoothEye, g_baseEye);
+        X1[12] += -(d.x * right.x + d.y * right.y + d.z * right.z);
+        X1[13] += -(d.x * up.x + d.y * up.y + d.z * up.z);
+        X1[14] += (d.x * fwd.x + d.y * fwd.y + d.z * fwd.z);
+        Mat4MulRow(T, X1, T);
     }
 
     {
