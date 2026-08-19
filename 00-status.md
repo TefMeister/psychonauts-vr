@@ -1,11 +1,48 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-18 late afternoon #2 (session 39: AUTONOMOUS GAMEPLAY ENTRY VERIFIED
+Last updated: 2026-08-19 midday (session 43: THE ZOOM IS FIXED FOR REAL — tangent-matched
+VRTextureBounds at Submit make the compositor's angular mapping exactly 1:1 at any FOV scale.
+PSYVR_FOV_SCALE now only controls culling margin/lens coverage (Quest 3 full coverage = 1.8,
+new launcher default). The notes/42 "HUD invisible" bug dissolves with it. The notes/42 UI
+viewport shrink was built first, failed live (the game's fullscreen fades/backdrops share the
+UI shader signature — "everything dark"), and is demoted to an experimental opt-in. The
+notes/40 missing suggested-FOV log line is root-caused and fixed. v0.1.7-alpha built and
+dev-verified, release pending user go-ahead + Quest 3 flight. Details in notes/43)
+
+## Session 43 (2026-08-19): submit bounds = real zoom fix; UI-shrink post-mortem
+
+- `VRBridge_SubmitBounds`: per-eye crop of the submitted texture to the headset's real
+  GetProjectionRaw frustum, in tangent space. 1:1 angular mapping at any FOV scale; bounds
+  clamp to the full texture when the frame is smaller than the lens (= exactly the old
+  behavior at FOV 1.0, so defaults are unchanged). `PSYVR_SUBMIT_BOUNDS=0` reverts.
+- FOV semantics change: scale = rendered margin around the visible window, not zoom.
+  Log suggests the full-coverage value (Quest 3: 1.77 -> launcher ships 1.8).
+- UI viewport shrink (notes/42 plan): fullscreen overlays share the UI shader signature, so
+  shrinking every UI draw crushed the presented scene ("everything dark", user-verified, then
+  user-verified fixed after demotion). Now opt-in via PSYVR_UI_SCALE; classifier work queued.
+- notes/40 Issue 1 fixed: suggested-FOV log deferred to first BPM cache (guard could never
+  pass at init time); live-verified on the null driver.
+- Full detail in `43-submit-bounds-zoom-fix-ui-shrink-postmortem.md`.
+
+## Sessions 40-42 (2026-08-18 evening, test PC): first head-tracked playtests
+
+- notes/40 (v0.1.4, Quest 3): head tracking works in real gameplay, clean exits, both eyes
+  solid. Found: FOV zoom (expected), over-the-shoulder culling void, LOD-billboard stereo
+  mismatch, missing suggested-FOV log line.
+- notes/41: v0.1.5-alpha config-only release (Quest 3 launcher, FOV 1.5 + 3x) from the test PC.
+- notes/42 (FOV 1.5 + 3x flight): zoom improved, ~72Hz holds at 2400x1800/eye on the RTX 5080
+  (~9ms readback vs 13.9ms budget), NEW: HUD invisible at FOV > ~1.2 (v0.1.6 backed launcher
+  off to 1.2). Culling void upgraded to a comfort issue ("staring into nothingness").
+- Full detail in notes 40/41/42.
+
+## Prior header (session 39)
+
+(Last updated: 2026-08-18 late afternoon #2 (session 39: AUTONOMOUS GAMEPLAY ENTRY VERIFIED
 end-to-end — synthetic input drove the game from cold title screen through the menu's blue
 CONTINUE door into real Whispering Rock gameplay (world-space camera coords + HUD visible in
 the eye dump), zero human keypresses. Door trigger = jump while on/over the card, via
 micro-step+jump loop. Script: tools/input/enter_gameplay.ps1. The full test loop is now
-scriptable. Tonight's headset test (v0.1.4-alpha) is the next event. Details in notes/39)
+scriptable. Tonight's headset test (v0.1.4-alpha) is the next event. Details in notes/39))
 
 ## Session 39 (2026-08-18): autonomous gameplay entry verified
 
