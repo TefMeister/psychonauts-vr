@@ -8,12 +8,13 @@
 
 **Status:** Phase 6 done (game confirmed in a real Quest 3 headset with head
 tracking — the North Star); working through Phase 7+ (first-person view
-polish), currently **paused by user choice** after several sessions of
-render-level FP debugging. **VR-readiness verdict:** proven — stereo + head
-tracking work in a real headset. First-person (camera anchored to the
-player character) is the open sub-project; session 52 (playbook §3.3
-shader disassembly) ruled out the register-6 convention as its cause, so
-the bug is narrowed but not yet found — see §6, §11, §12.
+polish). **VR-readiness verdict:** proven — stereo + head tracking work in
+a real headset. First-person (camera anchored to the player character) is
+the open sub-project; sessions 52-53 (playbook §3.3 shader disassembly +
+two isolated empirical composition tests) proved the entire render-level
+transform mechanism correct end-to-end — the FP bug is real but is NOT a
+transform-math problem. New leading suspect: Raz-lock reliability during
+real gameplay (untested) — see §6, §11, §12.
 
 ## 1. Identity
 
@@ -285,16 +286,29 @@ not yet exercised.
   the menu. Fixed with a runtime `F4` toggle so FP only ever engages when
   explicitly turned on in real gameplay, not by default.
 - **First-person world-position move producing zero visible eye
-  displacement** (session 51, **still unresolved as of session 52**): a
-  computed 212-world-unit forward translation, applied via the same
-  register-6 patch mechanism validated for stereo, produced no visible eye
-  movement — Raz stayed in front of the (supposedly relocated) camera.
-  Session 51's hypothesis was an unverified row/column-vector convention;
-  **session 52 disassembled the real shaders and CONFIRMED the convention
-  is correct** (see §6) — so that hypothesis is now a *ruled-out* dead end,
-  not an open risk. The actual cause is still unknown; narrowed to the
-  `X1 * T` composition order or the `Transpose(P⁻¹·T·P)` premultiply
-  pipeline in `VRBridge_UpdateHeadTracking`, not the register-6 read/write.
+  displacement** (session 51, **cause still unknown as of session 53, but
+  two more hypotheses ruled out with hard numbers**): a computed
+  212-world-unit forward translation produced no visible eye movement — Raz
+  stayed in front of the (supposedly relocated) camera. Session 51's
+  hypothesis was an unverified row/column-vector convention; **session 52
+  disassembled the real shaders and CONFIRMED the convention is correct**
+  (§6). Session 53 went further: **two isolated, fully-automated empirical
+  tests proved the entire composition pipeline propagates a translation
+  with EXACT correct magnitude** — a raw 500wu injection into `T` measured
+  back at ~500-540wu, and (more precisely) a 500wu forced `razWorld` offset
+  driving the FP-specific `X1` construction measured back at *exactly*
+  `500.0wu`, zero variance across 16 samples, using the SAME `T=Identity`
+  monitor-preview conditions the real FP tests actually ran under. **The
+  composition math is not the bug — it is proven correct end-to-end.**
+  New leading suspect: `g_razNearValid` (the nearest-to-eye Raz lock)
+  flickering during real-time gameplay — Raz's skinned draw isn't
+  guaranteed every frame, and losing the lock falls back to a completely
+  different, chase-cam-relative shift, which would produce exactly the
+  "camera fighting for a position" / "moves relative to terrain" symptom
+  the user described (dynamic instability, not a static wrong offset —
+  which is what a math error would look like). Not yet tested — needs a
+  real gameplay capture logging the lock's frame-by-frame hit rate, not
+  just the title-screen-only tests done so far. See notes/53.
 
 ## 12. Open risks toward the North Star
 
@@ -303,10 +317,16 @@ achieved and confirmed** on a Quest 3 — this section is about the current
 Phase 7+ sub-project (first-person) and beyond, not the core conversion:
 
 - ~~Register-6 convention unverified~~ — **CLOSED session 52**, confirmed
-  correct via shader disassembly (§6). The FP world-space-move bug is real
-  and still open, but is now known NOT to be a convention problem; next
-  step is instrumenting the actual patched register-6 GPU values at
-  increasing translation magnitudes, not further convention-checking.
+  correct via shader disassembly (§6).
+- ~~Composition order (X1*T / Transpose(P⁻¹·T·P)) unverified~~ — **CLOSED
+  session 53**, two isolated empirical tests measured EXACT correct
+  propagation of a known translation through the full pipeline including
+  the FP-specific X1 construction. The FP world-space-move bug is real and
+  still open, but the render-level transform mechanism itself is now fully
+  vindicated end-to-end (shader convention + composition math both
+  confirmed correct). New leading suspect: `g_razNearValid` lock
+  reliability during real gameplay (§11) — untested, needs a real
+  gameplay capture, not more transform-math verification.
 - **Lua in-process execution is unfinished** (multi-session lift, notes/50):
   `luaB_dostring` is an inlined compile-then-run, not a callable
   `lua_dobuffer(L, char*, len, name)` — needs `lua_pushstring` located (or
