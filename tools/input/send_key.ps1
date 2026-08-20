@@ -21,6 +21,7 @@ using System.Runtime.InteropServices;
 public class PsySendKey {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int dwProcessId);
     [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
     [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
@@ -35,12 +36,23 @@ public class PsySendKey {
 '@
 
 $p = Get-Process -Name $ProcessName -ErrorAction Stop
-if ([PsySendKey]::GetForegroundWindow() -ne $p.MainWindowHandle) {
+
+# notes/53: the foreground-lock grant is consumed by the NEXT SetForegroundWindow call, not durable
+# across multiple future sends - and the current environment has ANOTHER process (the tool-execution
+# harness's own console) actively contending for foreground, so a single attempt is unreliable even
+# with the grant. Retry a few times: re-grant + re-attempt + re-check, rather than failing on the
+# first miss (this is real intermittent contention, not a hard denial - three earlier one-shot fixes
+# this session each addressed a different wrong layer of the problem).
+$ok = $false
+for ($i = 0; $i -lt 5; $i++) {
+    if ([PsySendKey]::GetForegroundWindow() -eq $p.MainWindowHandle) { $ok = $true; break }
+    [PsySendKey]::AllowSetForegroundWindow($p.Id) | Out-Null
     [PsySendKey]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 300
 }
-if ([PsySendKey]::GetForegroundWindow() -ne $p.MainWindowHandle) {
-    throw "could not bring $ProcessName to foreground - aborting (key would land elsewhere)"
+if (-not $ok -and [PsySendKey]::GetForegroundWindow() -eq $p.MainWindowHandle) { $ok = $true }
+if (-not $ok) {
+    throw "could not bring $ProcessName to foreground after 5 attempts - aborting (key would land elsewhere)"
 }
 $ext = 0; if ($Extended) { $ext = 1 }
 [PsySendKey]::Key($Scan, $ext, $false) | Out-Null
