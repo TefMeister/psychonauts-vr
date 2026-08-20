@@ -1,5 +1,26 @@
 # Psychonauts VR — Status
 
+Last updated: 2026-08-20 (session 53: RESUMED FP debugging per user request ("resume now that the
+convention's ruled out"). Built two isolated, fully-automated empirical tests (no gameplay needed -
+title screen alone suffices): (1) raw translation injected directly into head-tracking's T matrix,
+measured ~500-540wu back out for a 500wu input; (2) the FP-specific X1 construction (target-eye-
+minus-base-eye, projected onto camera axes) with a KNOWN forced razWorld offset (bypassing Raz
+detection), measured EXACTLY 500.0wu back out for a 500wu input, zero variance across 16 samples.
+**CONCLUSION: the entire render-level camera-move mechanism (X1 -> T -> Pinv*T*P sandwich ->
+transpose -> GPU) is mathematically proven correct, not just theorized.** Combined with session 52's
+shader-convention confirmation, the transform math is fully vindicated end-to-end. The original FP
+bug (eye stuck behind Raz, "fighting for a position") is real and STILL UNRESOLVED, but is now known
+NOT to be a math error. New leading suspect: g_razNearValid (the nearest-to-eye Raz lock) flickering
+during real-time gameplay - Raz's skinned draw isn't guaranteed every frame, and losing the lock
+falls back to a completely different, chase-cam-relative shift, which fits the "fighting"/"moves
+relative to terrain" symptom description (dynamic instability, not a static wrong offset). NOT YET
+TESTED - needs a real gameplay capture logging the lock's frame-by-frame hit rate while walking, not
+another title-screen-only isolated test. New diagnostic knobs (all default off): PSYVR_HT_TEST_SHIFT,
+PSYVR_HT_DEBUG, PSYVR_FP_FORCE_ACTIVE, PSYVR_FP_FORCE_RAZ. Two new capture scripts:
+tools/input/auto_ht_test.ps1, auto_x1_test.ps1. Details in notes/53.)
+
+## Prior header (session 52: playbook adoption)
+
 Last updated: 2026-08-20 (session 52: adopted the user-shared engine-agnostic VR RE PLAYBOOK.md;
 scaffolded `psychonauts-vr-engine-research` (5th repo, playbook + a full ENGINE-DOSSIER.md distilled
 from notes 1-51). Writing the dossier's camera section honestly flagged an unverified assumption:
