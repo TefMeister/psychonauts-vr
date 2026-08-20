@@ -1,5 +1,53 @@
 # Psychonauts VR — Status
 
+Last updated: 2026-08-20 (session 52: adopted the user-shared engine-agnostic VR RE PLAYBOOK.md;
+scaffolded `psychonauts-vr-engine-research` (5th repo, playbook + a full ENGINE-DOSSIER.md distilled
+from notes 1-51). Writing the dossier's camera section honestly flagged an unverified assumption:
+the register-6 row/column-vector convention the whole render-level camera model rests on had never
+been checked against the compiled vertex shader (playbook §3.3's explicit rule) — and was the
+leading suspect for session 51's FP-translation mystery. Closed it with real evidence: built a
+PSYVR_SHADER_DUMP diagnostic (reusing the pre-existing PSYVR_REG_HISTO all-shader dump), a NEW
+fully-automated capture script (`tools/input/auto_shader_dump.ps1`, built on request - "can we
+automate this" - chains silence-audio/launch-offscreen/enter_gameplay/poll-log/kill/restore), then
+disassembled the captured shader OFFLINE via Python ctypes calling D3DX9_40.dll directly (zero live
+game needed for the analysis step). RESULT: the convention is CONFIRMED CORRECT (`m4x4 r4, r11, c6`
+= 4x dp4, translation term = c[6+i].w = exactly our code's [3,7,11,15] extraction), cross-checked
+against 239/455 shaders. So notes/51's FP-translation bug is NOT a convention problem — that
+hypothesis is now closed, narrowing the real cause to the X1*T composition / Transpose(P^-1*T*P)
+premultiply pipeline. FP goal remains PAUSED per user's session-51 decision; this session only
+resolved the one flagged risk. Details in notes/52.)
+
+## Prior header (session 51: FP goal paused)
+
+Last updated: 2026-08-20 (session 51: FP GOAL PAUSED after render-level first-person hit a ceiling.
+WINS THIS SESSION: (1) Shoulder-anchor ROOT CAUSE found + fixed + monitor-validated — Raz is the
+c96 (32-bone) entity NEAREST the camera eye (rigid ~11.6 wu chase-cam offset, rock-stable); other
+32-bone NPCs sit 100s of wu away. notes/49's filter was INVERTED (rejected near-eye = rejected Raz,
+then centroid-averaged NPCs = the jitter). Now locks to the single nearest-to-eye c96 origin; the
+`ANCHOR:` probe confirmed it's stable standing + smooth walking, eyeDist 11.6. (2) F4 runtime toggle
+(FP off until pressed) — stops FP engaging on title/menu/brain screens (they have decorative
+skinned chars our detector latched as phantom Raz); user-confirmed menus clean until F4. (3) notes/50
+static Lua map corrected notes/46 (0x6AEF20=lua_gettop, 0x6C1A40=string-arg getter; luaB_dostring is
+an INLINED compile+run, not a callable lua_dobuffer — arbitrary-string exec is a multi-session lift).
+(4) New diagnostics: PSYVR_BONE_DUMP (per-draw origins + 32 bone translations), ANCHOR/RAZAXIS probes;
+monitor FP-preview path (g_fpPreviewMode, drives FP with identity head when SteamVR absent).
+THE CEILING (why paused): render-level eye-MOVE does NOT reposition the rendered view. Proof: at max
+forward the applied view-space translation is t=(-0.8,-12,212)wu yet Raz stays in front (a real 212wu
+move = eye 200wu past him, gone). Only the head ROTATION half of g_trackYt takes — which is why FP has
+been "close but broken" every session incl. the remembered "2.2". Also: Raz's ORIENTATION is
+non-recoverable at render level (RAZAXIS: perspective-inverse scrambles direction vectors — recovered
+axes are rank-collapsed, X·Y≈0.9 not 0). User also noted: A/D TURN Raz (no strafe), and the FP eye
+locks BEHIND Raz + "moves relative to terrain" when walking (smoothing lag). DECISION: user chose to
+PAUSE FP. Recommended resume path = ENGINE-NATIVE via Lua (engine has FirstPersonCamera + SetCamera
+Position/Orientation + GetBoneWorldPosition, notes/44) — the engine places the camera at Raz's real
+head, sidestepping all render-level matrix pain; gated on finishing the Lua exec primitive (notes/50).
+Alt resume = debug WHY the 212wu translation doesn't move the rendered eye (transpose/convention bug
+suspected in the g_trackYt application, though the math checks out on paper). Game-dir launchers I
+made: Launch-FP-Monitor-Diag.bat, Launch-FP-Monitor-Preview.bat, Launch-FP-SteamVR-DeskTest.bat.
+Details in notes/50, notes/51.)
+
+## Prior header (session 43: submit bounds zoom fix)
+
 Last updated: 2026-08-19 midday (session 43: THE ZOOM IS FIXED FOR REAL — tangent-matched
 VRTextureBounds at Submit make the compositor's angular mapping exactly 1:1 at any FOV scale.
 PSYVR_FOV_SCALE now only controls culling margin/lens coverage (Quest 3 full coverage = 1.8,
