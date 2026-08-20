@@ -8,9 +8,12 @@
 
 **Status:** Phase 6 done (game confirmed in a real Quest 3 headset with head
 tracking — the North Star); working through Phase 7+ (first-person view
-polish). **VR-readiness verdict:** proven — stereo + head tracking work in a
-real headset. First-person (camera anchored to the player character) is the
-current open sub-project and is where most active risk now lives.
+polish), currently **paused by user choice** after several sessions of
+render-level FP debugging. **VR-readiness verdict:** proven — stereo + head
+tracking work in a real headset. First-person (camera anchored to the
+player character) is the open sub-project; session 52 (playbook §3.3
+shader disassembly) ruled out the register-6 convention as its cause, so
+the bug is narrowed but not yet found — see §6, §11, §12.
 
 ## 1. Identity
 
@@ -97,21 +100,24 @@ current open sub-project and is where most active risk now lives.
   Confirmed live via `x64dbg` at `Direct3DCreate9`/`CreateDevice`/`Present`
   call sites (notes/04) and validated over dozens of sessions by the stereo
   correction actually looking right on screen and in a real headset.
-- **⚠ Open risk flagged 2026-08-20 (session 51):** the row/column-vector and
-  transpose convention assumed for register 6 (upload treated as a
-  row-vector matrix, "translation row" read from upload floats
-  `[3,7,11,15]`) has **never been checked against the compiled vertex shader
-  bytecode via shader reflection/disassembly**, contrary to playbook §3.3's
-  explicit rule. It has only been validated *indirectly*, by the fact that
-  small linear perturbations (the stereo eye-shear, head-tracking rotation)
-  look correct on screen. A large first-person world-space eye translation
-  computed under this assumption produced **zero visible eye movement**
-  (notes/51) — the leading suspect is this convention being subtly wrong in
-  a way that only shows up for large/absolute moves, not small relative
-  ones. **Next real step for this game's engine model: disassemble a
-  representative vertex shader (`D3DXGetShaderConstantTable` +
-  `D3DXDisassembleShader` against a captured shader blob) to confirm exactly
-  how register 6 is consumed, per playbook §3.3.**
+- **✅ CONFIRMED 2026-08-20 (session 52) via real shader disassembly** (playbook
+  §3.3 — `D3DXDisassembleShader` called offline against captured bytecode,
+  no live game needed): the row-vector-on-the-left, rows-as-4-consecutive-
+  registers convention IS how the shaders actually consume register 6.
+  Representative instruction: `m4x4 r4, r11, c6` (D3D9 SM2 semantics = 4×
+  `dp4`, `dst.i = dot4(src, c[6+i])`); with position `w=1`, the pure
+  translation term for each output component is exactly `c[6+i].w` —
+  i.e. flat-array indices `[3,7,11,15]`, matching our code's extraction
+  exactly. Cross-checked against 239 of the 455 captured shaders (all share
+  the pattern). **This closes the risk flagged below in session 51 — the
+  convention was right all along.** Consequence: notes/51's mystery (a
+  computed 212wu forward FP translation producing zero visible eye
+  movement) is **not** a convention bug; the actual cause is still open,
+  narrowed to the `X1 * T` composition / `Transpose(P⁻¹·T·P)` premultiply
+  pipeline in `VRBridge_UpdateHeadTracking`, not the register-6 read/write
+  itself. See notes/52 for the full disassembly and method (a reusable,
+  fully-automated, fully-offline verification recipe worth reusing on any
+  future register/convention question for this engine).
 - Projection `P`: recovered from the game's own
   `D3DXMatrixPerspectiveFovRH`-style call site — `xScale`/`yScale`/`zn`/`zf`
   are cached once per frame (`BuildProjectionMatrix`, "BPM") from that
@@ -200,6 +206,15 @@ not yet exercised.
 
 ## 10. Autonomous harness recipe (this game)
 
+- **Full orchestration, CONFIRMED working end-to-end** (session 52):
+  `tools/input/auto_shader_dump.ps1` chains silence-intro-audio → launch
+  off-screen → `enter_gameplay.ps1` → poll the proxy log for a specific
+  marker line (defining "done") → kill the process → restore intro audio,
+  in a try/finally so cleanup runs even on error. Built on user request
+  ("can we automate this") instead of asking for a manual capture each
+  time — this pattern (launch, drive, poll-for-log-marker, cleanup) is
+  reusable for any future single-shot capture on this game, not just the
+  shader dump it was written for.
 - **Launch to a known scene**: `tools/input/enter_gameplay.ps1` drives a cold
   title screen → menu → the CONTINUE save slot via synthetic input (see
   next bullet), then verifies arrival by checking the recovered camera
@@ -270,17 +285,16 @@ not yet exercised.
   the menu. Fixed with a runtime `F4` toggle so FP only ever engages when
   explicitly turned on in real gameplay, not by default.
 - **First-person world-position move producing zero visible eye
-  displacement** (session 51, **currently unresolved, see §6's open risk**):
-  a computed 212-world-unit forward translation, applied via the same
+  displacement** (session 51, **still unresolved as of session 52**): a
+  computed 212-world-unit forward translation, applied via the same
   register-6 patch mechanism validated for stereo, produced no visible eye
   movement — Raz stayed in front of the (supposedly relocated) camera.
-  Leading hypothesis per playbook §3.3 discipline: the row/column-vector
-  convention this whole render-level camera model rests on has never been
-  checked against actual shader bytecode, and may only be "accidentally
-  right" for the small linear perturbations (stereo shear, head rotation)
-  validated so far, not for a large absolute translation. **Not yet
-  root-caused** — this is the actual next step, and it should start with
-  shader disassembly (§3.3), not another guess-and-tune cycle.
+  Session 51's hypothesis was an unverified row/column-vector convention;
+  **session 52 disassembled the real shaders and CONFIRMED the convention
+  is correct** (see §6) — so that hypothesis is now a *ruled-out* dead end,
+  not an open risk. The actual cause is still unknown; narrowed to the
+  `X1 * T` composition order or the `Transpose(P⁻¹·T·P)` premultiply
+  pipeline in `VRBridge_UpdateHeadTracking`, not the register-6 read/write.
 
 ## 12. Open risks toward the North Star
 
@@ -288,9 +302,11 @@ The North Star itself (stereo + head tracking in a real headset) is **already
 achieved and confirmed** on a Quest 3 — this section is about the current
 Phase 7+ sub-project (first-person) and beyond, not the core conversion:
 
-- **Register-6 convention unverified** (§6, §11) — blocks reliable
-  first-person world-space camera moves until resolved via shader
-  disassembly.
+- ~~Register-6 convention unverified~~ — **CLOSED session 52**, confirmed
+  correct via shader disassembly (§6). The FP world-space-move bug is real
+  and still open, but is now known NOT to be a convention problem; next
+  step is instrumenting the actual patched register-6 GPU values at
+  increasing translation magnitudes, not further convention-checking.
 - **Lua in-process execution is unfinished** (multi-session lift, notes/50):
   `luaB_dostring` is an inlined compile-then-run, not a callable
   `lua_dobuffer(L, char*, len, name)` — needs `lua_pushstring` located (or
