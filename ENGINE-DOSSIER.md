@@ -14,7 +14,12 @@ the open sub-project; sessions 52-53 (playbook §3.3 shader disassembly +
 two isolated empirical composition tests) proved the entire render-level
 transform mechanism correct end-to-end — the FP bug is real but is NOT a
 transform-math problem. New leading suspect: Raz-lock reliability during
-real gameplay (untested) — see §6, §11, §12.
+real gameplay — still UNTESTED as of session 54: a real foreground-focus
+automation bug was found and fixed (§10, durable fix), but the door-entry
+walk turned out to be a deterministic miss, not random drift, blocking the
+actual test. Resume point: fix gameplay entry (proper walk tuning or an
+in-engine level-jump), then run the already-built RAZLOCK capture. See
+§6, §10, §11, §12.
 
 ## 1. Identity
 
@@ -207,6 +212,19 @@ not yet exercised.
 
 ## 10. Autonomous harness recipe (this game)
 
+- **Foreground-focus grab, FIXED session 54 (durable infrastructure, applies to ALL future input
+  automation on this project):** `SendInput`-based automation (playbook §2.2's documented-fragile
+  approach, used here because it's proven reliable for THIS engine/window - see below) needs
+  `SetForegroundWindow` to succeed first. Single-attempt grabs failed repeatedly in this
+  environment: `AllowSetForegroundWindow`'s grant is consumed by the very next
+  `SetForegroundWindow` call, not durable across a whole key-send sequence, and another process
+  (the tool-execution harness's own console) actively contends for foreground. Fix in
+  `tools/input/send_key.ps1`: retry loop that re-grants `AllowSetForegroundWindow(pid)` fresh
+  immediately before every `SetForegroundWindow` attempt (up to 5x). Confirmed durable: two full
+  13-key `enter_gameplay.ps1` sequences completed with zero failures after the fix, vs. 3
+  consecutive failures (aborting after 1-3 keys) before it. A longer pre-input delay makes the
+  ORIGINAL bug WORSE, not better (lets a temporary post-launch allowance expire before first use) -
+  don't retry that "fix".
 - **Full orchestration, CONFIRMED working end-to-end** (session 52):
   `tools/input/auto_shader_dump.ps1` chains silence-intro-audio → launch
   off-screen → `enter_gameplay.ps1` → poll the proxy log for a specific
@@ -220,11 +238,15 @@ not yet exercised.
   title screen → menu → the CONTINUE save slot via synthetic input (see
   next bullet), then verifies arrival by checking the recovered camera
   position jumps into the world-space tens-of-thousands range (real level
-  coords vs. menu-space). **Known unreliable** (notes/43, notes/49): the
-  blind walk-to-the-door portion has drifted and missed on at least two
-  occasions; treat as "usually works", not deterministic yet. Per playbook
-  §2.1, the more robust fix would be finding an engine-level level/save-jump
-  Lua call instead of walking — not yet done.
+  coords vs. menu-space). **Known unreliable, WORSE than previously
+  characterized** (notes/43, notes/49, notes/54): session 54 found the miss
+  is not random drift — with the focus-grab bug fixed (so timing was finally
+  clean), 3 consecutive runs landed at the EXACT SAME wrong coordinates
+  every time. It's a deterministic miss, not "usually works" — simple
+  retries will never succeed without an actual parameter/approach change.
+  Per playbook §2.1, the robust fix is finding an engine-level level/save-
+  jump Lua call instead of walking — still not done; this is now the
+  higher-priority path given the walk is proven non-random.
 - **In-process input drive, CONFIRMED working (playbook §2.2's exact
   recommendation)**: plain `SendInput(KEYEVENTF_SCANCODE, ...)` (arrows need
   `KEYEVENTF_EXTENDEDKEY`) **with the game window made genuinely
