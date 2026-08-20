@@ -313,7 +313,6 @@ typedef HRESULT (STDMETHODCALLTYPE *SetVertexShaderConstantF_t)(
     UINT StartRegister,
     CONST float *pConstantData,
     UINT Vector4fCount);
-
 static HMODULE g_hRealD3D9 = NULL;
 static Direct3DCreate9_t g_pRealDirect3DCreate9 = NULL;
 static CreateDevice_t g_pRealCreateDevice = NULL;
@@ -635,6 +634,23 @@ static volatile LONG g_traceDrawCount = 0;
 static BOOL g_regHisto = FALSE;
 static BOOL g_boneProbe = FALSE; /* notes/44: PSYVR_BONE_PROBE=1 - throttled logging of bone-palette
                                     uploads (c64.., notes/36) - feasibility recon for hand IK / body rig */
+/* notes/52: playbook Phase 3.3 verification - correlate which PSYVR_REG_HISTO-dumped shader .bin
+ * is the skinned (c96) world shader, so it can be disassembled OFFLINE (no live capture needed
+ * beyond this one mapping). See Hook_CreateVertexShader/Hook_SetVertexShader (notes/36, further
+ * down this file) for the existing dump-every-shader-to-disk machinery this reuses. */
+#define VS_DUMP_MAP_MAX 512
+static IDirect3DVertexShader9 *g_vsDumpPtr[VS_DUMP_MAP_MAX];
+static int g_vsDumpMapIdx[VS_DUMP_MAP_MAX];
+static int g_vsDumpMapCount = 0;
+static IDirect3DVertexShader9 *g_currentVSPtr = NULL;
+static BOOL g_shaderDump = FALSE;       /* PSYVR_SHADER_DUMP=1 */
+static BOOL g_shaderDumpLogged = FALSE; /* latch - log at most once per run */
+
+static BOOL g_boneDump = FALSE;  /* notes/51: PSYVR_BONE_DUMP=1 - shoulder-anchor bone hunt. Once/sec
+                                    logs a burst of the next ~16 c96 draws (each recovered entity origin
+                                    + eye-dist, to see if Raz's draws cluster or scatter) plus all 32
+                                    bone model-space translations for the burst's first draw. Runs on the
+                                    monitor path (no poses/SteamVR needed). */
 static volatile LONG g_regHistoCount[256];
 static BYTE g_regHistoVecMax[256];
 /* notes/36: per-draw register-combination tracking. Bits set in SVSCF for interesting registers,
@@ -682,6 +698,12 @@ static volatile LONG g_curUIShaderIdx = -1; /* notes/43: which registered UI sha
  * VRBridge_Shutdown (defined earlier) clears them. */
 static BOOL g_trackRefValid = FALSE;
 static BOOL g_trackYValid = FALSE;
+/* notes/51: monitor-only first-person preview. When SteamVR is absent the pose pump is inert and
+ * first person never renders. Setting this forces VRBridge_UpdateHeadTracking down its identity-head
+ * path (like g_trackingDisabled) so the FP eye-move builds with a frozen head orientation and shows
+ * on the flat monitor - the anchor can then be seen/tuned without a headset. Driven from Hook_Present
+ * only when the VR bridge is NOT active, so the real VR path is untouched. */
+static BOOL g_fpPreviewMode = FALSE;
 
 /* Per-eye double-buffered two-hop pipeline state (notes/28, proven in
  * tools/vr-bridge/poc_dual_device_shared/dual_device_poc.c). "Device B" in that POC's terms is
@@ -833,9 +855,17 @@ static void VRBridge_ReadEnableFlag(void)
     if (g_traceFrames) LogLine("VRBridge: PSYVR_TRACE_FRAME=1 - one-frame RT/Clear/draw traces every ~5s");
     len = GetEnvironmentVariableA("PSYVR_REG_HISTO", buf, sizeof(buf));
     g_regHisto = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    len = GetEnvironmentVariableA("PSYVR_SHADER_DUMP", buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf) && buf[0] == '1') g_regHisto = TRUE; /* notes/52: needs the dump-to-disk machinery on */
     len = GetEnvironmentVariableA("PSYVR_BONE_PROBE", buf, sizeof(buf));
     g_boneProbe = (len > 0 && len < sizeof(buf) && buf[0] == '1');
     if (g_boneProbe) LogLine("VRBridge: PSYVR_BONE_PROBE=1 - throttled bone-palette upload logging (notes/44 recon)");
+    len = GetEnvironmentVariableA("PSYVR_BONE_DUMP", buf, sizeof(buf));
+    g_boneDump = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_boneDump) LogLine("VRBridge: PSYVR_BONE_DUMP=1 - shoulder-anchor bone hunt: per-draw origins + 32-bone translations (notes/51)");
+    len = GetEnvironmentVariableA("PSYVR_SHADER_DUMP", buf, sizeof(buf));
+    g_shaderDump = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_shaderDump) LogLine("VRBridge: PSYVR_SHADER_DUMP=1 - will identify which PSYVR_REG_HISTO .bin dump is the skinned (c96) world shader, for offline disassembly (notes/52, playbook Phase 3.3)");
     if (g_regHisto) LogLine("VRBridge: PSYVR_REG_HISTO=1 - vertex-shader-constant register histogram every ~5s");
 
     {
@@ -1607,9 +1637,30 @@ static float g_lastC6[16];                 /* most recent register-6 upload (WVP
 static BOOL  g_lastC6Valid = FALSE;
 static float g_razSumX = 0.0f, g_razSumY = 0.0f, g_razSumZ = 0.0f; /* centroid accumulator THIS frame */
 static int   g_razCount = 0;               /* # skinned origins near the lock this frame */
-static Vec3  g_razWorld = {0,0,0};         /* promoted + smoothed Raz body-centroid used by the FP camera */
+static Vec3  g_razWorld = {0,0,0};         /* promoted + smoothed Raz origin used by the FP camera */
 static BOOL  g_razValid = FALSE;
 static int   g_razMissFrames = 0;          /* consecutive frames with no candidate -> re-lock */
+/* notes/51: the bone-dump session proved Raz is the c96 entity whose recovered origin is NEAREST
+ * the camera eye (rigid chase-cam offset ~11.6wu), rock-stable, while other 32-bone NPCs sit far
+ * (100s of wu). The old notes/49 logic did the opposite - rejected near-eye origins (0.35*focus ~
+ * 67wu) as "camera-attached" (so it rejected Raz) and centroid-averaged whatever remained (mixing
+ * Raz with NPCs -> the jitter). Replaced with: track the SINGLE nearest-to-eye c96 origin this
+ * frame (that's Raz), no averaging. */
+static Vec3  g_razNearOrigin = {0,0,0};    /* nearest-to-eye c96 origin THIS frame (= Raz) */
+static float g_razNearDist2 = 0.0f;        /* its squared eye-distance (only meaningful if valid) */
+static BOOL  g_razNearValid = FALSE;       /* a candidate was found this frame */
+static float g_razNearC6[16];              /* notes/51: the winning (=Raz) draw's r6 upload (WVP^T), for full-World recovery */
+/* notes/51: Raz's full world orientation, recovered from his World = WVP*pinvVinv (not just the
+ * translation). Used to derive a STABLE first-person view from Raz's own facing instead of the
+ * swaying chase camera. World's upper-3x3 rows are the model X/Y/Z axes expressed in world space. */
+static float g_razAxisX[3] = {1,0,0};      /* model +X axis in world */
+static float g_razAxisY[3] = {0,1,0};      /* model +Y axis in world */
+static float g_razAxisZ[3] = {0,0,1};      /* model +Z axis in world */
+static BOOL  g_razBasisValid = FALSE;
+/* notes/51: F4 runtime toggle. FP engages only when TRUE, so it never molests the title/menu/brain
+ * screens (which have decorative skinned characters our nearest-to-eye detector would latch as a
+ * phantom "Raz"). Starts FALSE; the user presses F4 once in real gameplay. */
+static BOOL  g_fpActive = FALSE;
 /* (g_fpProbe scalar is declared much earlier with the other FP knobs - the env parser needs it) */
 /* notes/24: off-axis convergence/focal distance, recomputed each real frame
  * from the live eye->at distance - see the comment on
@@ -1792,6 +1843,15 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
      * running session with no relaunch. F7/F8 = forward -/+ (0.05 step), F9/F10 = height -/+
      * (10wu step). Logged so the final values can be baked into the launcher. */
     if (g_firstPerson) {
+        static SHORT p4;
+        SHORT k4 = GetAsyncKeyState(VK_F4);
+        if ((k4 & 0x8000) && !(p4 & 0x8000)) {   /* notes/51: F4 toggles FP on/off (starts off - press in gameplay) */
+            g_fpActive = !g_fpActive;
+            LogLine("FP: %s (F4) - engages only in gameplay to avoid menu/title phantom-Raz", g_fpActive ? "ON" : "OFF");
+        }
+        p4 = k4;
+    }
+    if (g_firstPerson) {
         static SHORT p5, p6, p7, p8, p9, p10;
         SHORT k5 = GetAsyncKeyState(VK_F5), k6 = GetAsyncKeyState(VK_F6);
         SHORT k7 = GetAsyncKeyState(VK_F7), k8 = GetAsyncKeyState(VK_F8);
@@ -1799,24 +1859,28 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
         BOOL changed = FALSE;
         if ((k5 & 0x8000) && !(p5 & 0x8000)) { g_fpSmooth -= 0.03f; changed = TRUE; }  /* smoother */
         if ((k6 & 0x8000) && !(p6 & 0x8000)) { g_fpSmooth += 0.03f; changed = TRUE; }  /* snappier */
-        if ((k7 & 0x8000) && !(p7 & 0x8000)) { g_fpForward -= 0.10f; changed = TRUE; }
-        if ((k8 & 0x8000) && !(p8 & 0x8000)) { g_fpForward += 0.10f; changed = TRUE; }
-        if ((k9 & 0x8000) && !(p9 & 0x8000)) { g_fpHeight -= 10.0f; changed = TRUE; }
-        if ((k10 & 0x8000) && !(p10 & 0x8000)) { g_fpHeight += 10.0f; changed = TRUE; }
-        if (g_fpForward < 0.0f) g_fpForward = 0.0f;
-        if (g_fpForward > 4.0f) g_fpForward = 4.0f; /* notes/47: raised - `at` is short of Raz so >1 is needed */
+        if ((k7 & 0x8000) && !(p7 & 0x8000)) { g_fpForward -= 0.25f; changed = TRUE; }
+        if ((k8 & 0x8000) && !(p8 & 0x8000)) { g_fpForward += 0.25f; changed = TRUE; }
+        if ((k9 & 0x8000) && !(p9 & 0x8000)) { g_fpHeight -= 5.0f; changed = TRUE; }
+        if ((k10 & 0x8000) && !(p10 & 0x8000)) { g_fpHeight += 5.0f; changed = TRUE; }
+        if (g_fpForward < -2.0f) g_fpForward = -2.0f;
+        if (g_fpForward > 10.0f) g_fpForward = 10.0f; /* notes/51: with the razWorld-locked anchor the eye
+                                                       * starts AT Raz's origin; a forward push reaches his head */
         if (g_fpSmooth < 0.02f) g_fpSmooth = 0.02f;
         if (g_fpSmooth > 1.0f) g_fpSmooth = 1.0f;
         if (changed)
-            LogLine("FP tune: forward=%.2f x eye->at (%.1fwu), height=%.1fwu, smooth=%.2f  [F5/F6 smooth, F7/F8 fwd, F9/F10 height]",
-                    g_fpForward, g_fpForward * g_focusDistance, g_fpHeight, g_fpSmooth);
+            /* notes/51: report the ACTUAL forward push in world units (the nudge is g_fpForward*20wu -
+             * the old log multiplied by focus (~192) and was ~10x wrong, which hid why the eye stalled
+             * behind Raz). */
+            LogLine("FP tune: forward=%.2f (%.1fwu), height=%.1fwu, smooth=%.2f  [F5/F6 smooth, F7/F8 fwd, F9/F10 height]",
+                    g_fpForward, g_fpForward * 20.0f, g_fpHeight, g_fpSmooth);
         p5 = k5; p6 = k6; p7 = k7; p8 = k8; p9 = k9; p10 = k10;
     }
 
     /* notes/47: first-person with head tracking OFF - use an identity head transform and jump
      * straight to the forward-translation + Y build below. */
-    if (g_trackingDisabled) {
-        Mat4Identity(T);
+    if (g_trackingDisabled || g_fpPreviewMode) {
+        Mat4Identity(T);   /* notes/51: monitor preview also uses a frozen (identity) head */
         goto fp_and_build;
     }
 
@@ -1892,31 +1956,73 @@ fp_and_build:
      * calls VRBridge_PumpPoses (which runs us), so the guard was always false and FP never
      * reached the render (user saw "keys did nothing visually"). g_focusDistance persists across
      * frames (set each BVM, clamped, default otherwise), so it's valid with or without the flag. */
-    if (g_firstPerson) {
+    if (g_firstPerson && g_fpActive) {
         float X1[16];
         Vec3 fwd = Vec3Normalize(Vec3Sub(g_baseAt, g_baseEye));
         Vec3 right = g_rightVec;
         Vec3 up = Vec3Normalize(Vec3Cross(right, fwd));
 
-        /* notes/49: promote this frame's nearest-to-look-at skinned origin (= Raz) into the
-         * smoothed g_razWorld the camera locks to. "Found" = a skinned draw within 2x the eye->at
-         * distance of the look-at point; otherwise keep the last good position (cutscene/no Raz). */
-        if (g_razCount > 0) {
-            Vec3 cand;
-            cand.x = g_razSumX / g_razCount; cand.y = g_razSumY / g_razCount; cand.z = g_razSumZ / g_razCount;
+        /* notes/51: promote this frame's nearest-to-eye c96 origin (= Raz, see the recovery block
+         * in Hook_SetVertexShaderConstantF) into the smoothed g_razWorld the camera locks to. A
+         * single stable origin, not a centroid - so no inter-entity averaging jitter. If no
+         * candidate this frame (Raz occluded / cutscene / scene change), hold the last lock for a
+         * short grace period, then drop it so the next frame re-seeds. */
+        if (g_razNearValid) {
+            Vec3 cand = g_razNearOrigin;
             g_razMissFrames = 0;
             if (!g_razValid) { g_razWorld = cand; g_razValid = TRUE; }
             else {
                 Vec3 de = Vec3Sub(cand, g_razWorld);
                 float a = g_fpSmooth;
-                g_razWorld.x += de.x * a; g_razWorld.y += de.y * a; g_razWorld.z += de.z * a;
+                /* snap (don't smooth) across big jumps - level load / camera cut - so the eye
+                 * doesn't translate wildly between the old and new anchor. */
+                if (de.x*de.x + de.y*de.y + de.z*de.z > 500.0f*500.0f) g_razWorld = cand;
+                else { g_razWorld.x += de.x * a; g_razWorld.y += de.y * a; g_razWorld.z += de.z * a; }
             }
         } else if (g_razValid) {
-            /* notes/49: no skinned draw near last frame's Raz - either he's briefly occluded, or the
-             * scene changed (menu->gameplay, level load, camera cut) and the lock is stale. After a
-             * short grace period, drop the lock so next frame re-seeds from the look-at point.
-             * Without this the lock froze at a menu-space position and the eye flew 60k units off. */
             if (++g_razMissFrames > 8) { g_razValid = FALSE; g_razMissFrames = 0; }
+        }
+
+        /* notes/51: recover Raz's FULL World matrix (World = WVP * pinvVinv) from the winning draw's
+         * r6 upload, to get his model orientation in world space. g_razNearC6 = Raz's WVP transposed,
+         * so WVP row i = column i of g_razNearC6 = (c6[i], c6[4+i], c6[8+i], c6[12+i]); World row i =
+         * (that WVP row) * pinvVinv. World's upper-3x3 rows are the model X/Y/Z axes in world - the
+         * basis a stable Raz-facing view will be built from (identifying which axis is forward/up is
+         * the point of the probe below). */
+        if (g_razNearValid) {
+            int i, cc, kk;
+            float world[16];
+            for (i = 0; i < 4; i++) {
+                float row[4];
+                row[0] = g_razNearC6[i]; row[1] = g_razNearC6[4 + i];
+                row[2] = g_razNearC6[8 + i]; row[3] = g_razNearC6[12 + i];
+                for (cc = 0; cc < 4; cc++) {
+                    float s = 0.0f;
+                    for (kk = 0; kk < 4; kk++) s += row[kk] * g_pinvVinv[kk * 4 + cc];
+                    world[i * 4 + cc] = s;
+                }
+            }
+            /* normalize each 3-axis (rows 0,1,2) - discard the homogeneous 4th component */
+            for (i = 0; i < 3; i++) {
+                float *dst = (i == 0) ? g_razAxisX : (i == 1) ? g_razAxisY : g_razAxisZ;
+                float x = world[i * 4 + 0], y = world[i * 4 + 1], z = world[i * 4 + 2];
+                float len = sqrtf(x * x + y * y + z * z);
+                if (len > 1e-6f) { dst[0] = x / len; dst[1] = y / len; dst[2] = z / len; }
+            }
+            g_razBasisValid = TRUE;
+
+            if (g_fpProbe) {
+                static DWORD s_ax = 0; DWORD now = GetTickCount();
+                if (s_ax == 0 || (DWORD)(now - s_ax) >= 1000) {
+                    s_ax = now;
+                    LogLine("RAZAXIS: X=(%.3f,%.3f,%.3f) Y=(%.3f,%.3f,%.3f) Z=(%.3f,%.3f,%.3f) baseUp=(%.3f,%.3f,%.3f) pos=(%.1f,%.1f,%.1f)",
+                            g_razAxisX[0], g_razAxisX[1], g_razAxisX[2],
+                            g_razAxisY[0], g_razAxisY[1], g_razAxisY[2],
+                            g_razAxisZ[0], g_razAxisZ[1], g_razAxisZ[2],
+                            g_baseUp.x, g_baseUp.y, g_baseUp.z,
+                            g_razWorld.x, g_razWorld.y, g_razWorld.z);
+                }
+            }
         }
 
         Mat4Identity(X1);
@@ -1929,7 +2035,12 @@ fp_and_build:
              * came back as (0,0.888,-0.46), i.e. the camera up already tilted by the chase pitch,
              * which sank the lift). Raz's centroid is his body center, so a fixed +Y offset puts the
              * eye at head height and keeps it there whatever the camera does. */
-            Vec3 wUp; wUp.x = 0.0f; wUp.y = 1.0f; wUp.z = 0.0f;
+            /* notes/51: lift along the CAMERA's up vector (per frame), NOT a hardcoded world axis.
+             * Psychonauts levels use different up-axes (the start area is +Z-up, later areas +Y-up
+             * - confirmed live from g_baseUp), so a fixed +Y lift moves the eye SIDEWAYS in +Z-up
+             * areas, dropping it to ground level beside Raz (looked 3rd-person + "pulled down").
+             * `up` here = normalize(cross(right, fwd)) computed above = the current camera up. */
+            Vec3 wUp = up;
             float fnudge = g_fpForward * 20.0f;   /* wu along facing (F7/F8; ~2wu per press) */
             targetEye.x = g_razWorld.x + g_fpHeight * wUp.x + fnudge * fwd.x;
             targetEye.y = g_razWorld.y + g_fpHeight * wUp.y + fnudge * fwd.y;
@@ -2106,6 +2217,7 @@ void __cdecl BVM_OnEntry_asm(void *pOutMatrix, Vec3 *pEye, Vec3 *pAt, Vec3 *pUp)
         g_pinvVinvValid = TRUE;
         g_razSumX = g_razSumY = g_razSumZ = 0.0f;      /* start this frame's centroid accumulation */
         g_razCount = 0;
+        g_razNearValid = FALSE;                        /* notes/51: reset this frame's nearest-to-eye Raz search */
     }
 
     {
@@ -2767,14 +2879,73 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         }
     }
 
-    /* notes/49: on a skinned (bone-palette) draw during an eye pass, recover this entity's world
+    /* notes/52: PSYVR_SHADER_DUMP=1 - playbook Phase 3.3 verification. On the first c96 (32-bone
+     * skinned) draw, identify which PSYVR_REG_HISTO-dumped psyvr_vs_NN.bin is the currently-bound
+     * vertex shader, so it can be disassembled OFFLINE (D3DXDisassembleShader, no live game needed)
+     * to read the REAL row/column-vector convention register 6 is consumed with - instead of the
+     * assumed convention the whole render-level camera model has rested on since notes/24. */
+    if (g_shaderDump && !g_shaderDumpLogged && StartRegister == 96 && Vector4fCount >= 96) {
+        int i, found = -1;
+        for (i = 0; i < g_vsDumpMapCount; i++) {
+            if (g_vsDumpPtr[i] == g_currentVSPtr) { found = g_vsDumpMapIdx[i]; break; }
+        }
+        if (found >= 0) {
+            g_shaderDumpLogged = TRUE;
+            LogLine("SHADERDUMP: skinned (c96) draw's bound vertex shader = dump idx %d -> psyvr_vs_%02d.bin (ptr=%p)",
+                    found, found, (void *)g_currentVSPtr);
+        }
+    }
+
+    /* notes/51: PSYVR_BONE_DUMP=1 - the shoulder-anchor bone hunt. Once/sec, dump a burst of the
+     * next ~16 c96 (32-bone) skinned draws: each draw's recovered entity World origin + eye
+     * distance, so we can SEE whether all of Raz's draws share ONE stable origin (=> the fix is
+     * "lock to a single origin + a bigger vertical offset for the shoulders", no per-bone
+     * extraction) or scatter (=> stale-c6 mispairing). For the burst's first draw, also dump all
+     * 32 bone model-space translations (row.w columns) - groundwork for hiding Raz's head mesh and
+     * later hand IK. Uses g_lastC6 (the c6 uploaded just before this bone palette) + g_pinvVinv,
+     * both valid on the monitor path (no poses / SteamVR needed). */
+    if (g_boneDump && StartRegister == 96 && Vector4fCount >= 96 && pConstantData != NULL &&
+        g_pinvVinvValid && g_lastC6Valid) {
+        static DWORD s_bdLast = 0; static int s_bdBurst = 0; static int s_bdFirst = 0;
+        DWORD now = GetTickCount();
+        if (s_bdBurst == 0 && (s_bdLast == 0 || (DWORD)(now - s_bdLast) >= 1000)) {
+            s_bdBurst = 16; s_bdFirst = 1; s_bdLast = now;
+            LogLine("BONEDUMP: === burst phase=%ld eye=(%.1f,%.1f,%.1f) at=(%.1f,%.1f,%.1f) focus=%.1f ===",
+                    g_stereoPhase, g_baseEye.x, g_baseEye.y, g_baseEye.z,
+                    g_baseAt.x, g_baseAt.y, g_baseAt.z, g_focusDistance);
+        }
+        if (s_bdBurst > 0) {
+            float wr3[4], o[4]; int c, k;
+            s_bdBurst--;
+            wr3[0] = g_lastC6[3]; wr3[1] = g_lastC6[7]; wr3[2] = g_lastC6[11]; wr3[3] = g_lastC6[15];
+            for (c = 0; c < 4; c++) { float s = 0.0f; for (k = 0; k < 4; k++) s += wr3[k] * g_pinvVinv[k * 4 + c]; o[c] = s; }
+            if (o[3] > 1e-6f || o[3] < -1e-6f) {
+                float ox = o[0] / o[3], oy = o[1] / o[3], oz = o[2] / o[3];
+                float ex = ox - g_baseEye.x, ey = oy - g_baseEye.y, ez = oz - g_baseEye.z;
+                LogLine("BONEDUMP:  origin=(%.1f,%.1f,%.1f) eyeDist=%.1f n=%u",
+                        ox, oy, oz, sqrtf(ex * ex + ey * ey + ez * ez), Vector4fCount);
+            }
+            if (s_bdFirst) {
+                int b;
+                s_bdFirst = 0;
+                for (b = 0; b < 32; b++) {
+                    const float *bp = pConstantData + b * 12;   /* bone b = 3 float4 rows */
+                    LogLine("BONEDUMP:   b%02d t=(%7.2f %7.2f %7.2f)", b, bp[3], bp[7], bp[11]);
+                }
+            }
+        }
+    }
+
+    /* notes/51: on a c96 (32-bone) skinned draw during an eye pass, recover this entity's world
      * origin = translation of World = WVP * (P^-1 * V^-1). WVP's row 3 (the translation row) comes
      * from the transposed upload as (u[3],u[7],u[11],u[15]); origin = (WVP_row3 * pinvVinv) / w.
-     * Keep the origin nearest the chase camera's look-at point - that entity is Raz. Cheap: one
-     * vec4*mat4 per skinned draw. */
-    if (g_firstPerson && g_pinvVinvValid && g_lastC6Valid &&
+     * The bone-dump session (notes/51) proved Raz is the c96 entity whose origin is NEAREST the
+     * camera eye (rigid chase-cam offset, ~11.6wu in this build), rock-stable, while other 32-bone
+     * NPCs sit 100s of wu away. So track the SINGLE nearest-to-eye origin this frame - no centroid
+     * (which mixed Raz with NPCs -> the jitter), no near-eye rejection (which rejected Raz). */
+    if (g_firstPerson && g_fpActive && g_pinvVinvValid && g_lastC6Valid &&
         g_stereoPhase != STEREO_PHASE_IDLE &&
-        StartRegister >= 64 && StartRegister < 192 && Vector4fCount >= 6) {
+        StartRegister == 96 && Vector4fCount >= 96) {
         float wr3[4], o[4];
         int c, k;
         wr3[0] = g_lastC6[3]; wr3[1] = g_lastC6[7]; wr3[2] = g_lastC6[11]; wr3[3] = g_lastC6[15];
@@ -2785,26 +2956,35 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         }
         if (o[3] > 1e-6f || o[3] < -1e-6f) {
             float ox = o[0] / o[3], oy = o[1] / o[3], oz = o[2] / o[3];
-            /* notes/49: reject recoveries sitting near the camera eye - those are screen-space /
-             * camera-attached draws, or skinned draws that reused a stale (non-Raz) register-6
-             * upload (many bone draws arrive without a fresh r6). Raz is the framed character, ~an
-             * eye->at distance in front of the camera, so his real origin is FAR from the eye. */
             float ex = ox - g_baseEye.x, ey = oy - g_baseEye.y, ez = oz - g_baseEye.z;
             float dEye2 = ex * ex + ey * ey + ez * ez;
-            float minEye = 0.35f * g_focusDistance;
-            if (dEye2 > minEye * minEye) {
-                /* notes/49: accumulate the CENTROID of skinned origins near the lock (all of Raz's
-                 * body-part draws), not the single nearest - averaging is stable and won't ratchet
-                 * down onto his planted feet as he walks (which sank the eye through the floor).
-                 * "Near the lock" = within maxR of last frame's Raz (once locked) or of the look-at
-                 * point (before the first lock). */
-                Vec3 ref = g_razValid ? g_razWorld : g_baseAt;
-                float maxR = g_razValid ? 300.0f : (2.0f * g_focusDistance);
-                float dx = ox - ref.x, dy = oy - ref.y, dz = oz - ref.z;
-                if (dx * dx + dy * dy + dz * dz < maxR * maxR) {
-                    g_razSumX += ox; g_razSumY += oy; g_razSumZ += oz; g_razCount++;
-                }
+            /* Cap so that when only distant NPCs are on-screen (Raz occluded/off-frame) we report
+             * "no candidate" and hold the last lock instead of snapping to an NPC. Raz (~11.6wu)
+             * sits far under this; NPCs (100s of wu) are excluded. Floored so tiny-focus frames
+             * (very close cameras) still admit Raz. */
+            float capDist = 0.75f * g_focusDistance;
+            if (capDist < 60.0f) capDist = 60.0f;
+            if (dEye2 < capDist * capDist && (!g_razNearValid || dEye2 < g_razNearDist2)) {
+                g_razNearOrigin.x = ox; g_razNearOrigin.y = oy; g_razNearOrigin.z = oz;
+                g_razNearDist2 = dEye2;
+                g_razNearValid = TRUE;
+                memcpy(g_razNearC6, g_lastC6, sizeof(g_razNearC6)); /* notes/51: keep Raz's WVP^T for full-World recovery */
             }
+        }
+    }
+
+    /* notes/51: monitor-verifiable anchor probe. The real FP PROBE runs inside the pose-gated
+     * head-track path (needs SteamVR), so log the chosen nearest-to-eye Raz origin here on the
+     * monitor path (once/sec) to confirm the anchor is stable standing + tracks Raz walking,
+     * before any headset pass. Throttled; converges to the frame's true nearest. */
+    if ((g_fpProbe || g_boneDump) && StartRegister == 96 && Vector4fCount >= 96 && g_razNearValid) {
+        static DWORD s_apLast = 0;
+        DWORD now = GetTickCount();
+        if (s_apLast == 0 || (DWORD)(now - s_apLast) >= 1000) {
+            s_apLast = now;
+            LogLine("ANCHOR: raz=(%.1f,%.1f,%.1f) eyeDist=%.1f eye=(%.1f,%.1f,%.1f)",
+                    g_razNearOrigin.x, g_razNearOrigin.y, g_razNearOrigin.z,
+                    sqrtf(g_razNearDist2), g_baseEye.x, g_baseEye.y, g_baseEye.z);
         }
     }
 
@@ -3183,6 +3363,17 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
          * so its ~25ms compositor wait can overlap with the game's own CPU-side simulation for that
          * next frame instead of sitting entirely after CandB has already finished rendering it. */
         VRBridge_PumpPoses();
+
+        /* notes/51: monitor-only first-person preview. VRBridge_PumpPoses is inert without SteamVR,
+         * so when the bridge is NOT active but first person is requested, drive the FP build here
+         * with a frozen (identity) head orientation. The register-6 patch then renders first person
+         * on the flat monitor (no headset), so the shoulder anchor can be seen + tuned. When the
+         * bridge IS active the pump above already ran the real head-tracked FP, so this is skipped. */
+        if (g_firstPerson && !(g_vrSubmitEnabled && g_vrBridgeReady)) {
+            g_fpPreviewMode = TRUE;
+            VRBridge_UpdateHeadTracking(NULL);
+            g_fpPreviewMode = FALSE;
+        }
 
         return presentHr;
     }
@@ -3597,6 +3788,14 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateVertexShader(IDirect3DDevice9 *This,
                 strcat(path, name);
                 f = fopen(path, "wb");
                 if (f) { fwrite(pFunction, 4, n, f); fclose(f); }
+                /* notes/52: remember which shader POINTER got which dump index, so a later draw-time
+                 * hit (Hook_SetVertexShaderConstantF, on a c96 skinned upload) can say exactly which
+                 * psyvr_vs_NN.bin is the skinned world shader worth disassembling offline. */
+                if (ppShader && *ppShader && g_vsDumpMapCount < VS_DUMP_MAP_MAX) {
+                    g_vsDumpPtr[g_vsDumpMapCount] = *ppShader;
+                    g_vsDumpMapIdx[g_vsDumpMapCount] = (int)idx;
+                    g_vsDumpMapCount++;
+                }
                 LogLine("CreateVertexShader #%ld: version=0x%08lX len=%u dwords -> %s",
                         idx, (unsigned long)pFunction[0], n, name);
             }
@@ -3642,6 +3841,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(IDirect3DDevice9 *This, ID
     }
     g_curShaderIsUI = isUI;
     g_curUIShaderIdx = isUI ? i : -1;
+    g_currentVSPtr = pShader;  /* notes/52: track for the c96 shader-identity log below */
     UIVp_Reconcile(This);   /* notes/42: shrink/restore the viewport for UI draws */
     UIShift_Reconcile(This);
     return g_pRealSetVertexShader(This, pShader);
