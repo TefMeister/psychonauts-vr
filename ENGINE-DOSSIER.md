@@ -17,8 +17,15 @@ transform-math problem. New leading suspect: Raz-lock reliability during
 real gameplay — still UNTESTED as of session 54: a real foreground-focus
 automation bug was found and fixed (§10, durable fix), but the door-entry
 walk turned out to be a deterministic miss, not random drift, blocking the
-actual test. Resume point: fix gameplay entry (proper walk tuning or an
-in-engine level-jump), then run the already-built RAZLOCK capture. See
+actual test. **Sessions 55-58 (pure static research, zero game execution):
+the Lua exec primitive — previously a "multi-session lift" blocking the
+clean engine-native FP fix — was fully traced statically to a single
+function call (`0x6B0C00`, §11), pending live verification. Also found a
+Lua-free level-load path (`SetPendingLevel`, §11) that could solve the
+automation blocker without walk-tuning, and disassembled the entire
+455-shader corpus offline (§8-ish, corrects the c50/UI belief).** Next live
+session priority: verify the Lua primitive with a trivial payload, then
+either the FP engine-native route or the level-jump automation fix. See
 §6, §10, §11, §12.
 
 ## 1. Identity
@@ -167,17 +174,22 @@ in-engine level-jump), then run the already-built RAZLOCK capture. See
   (format matches the game's `AutoDepthStencilFormat`, live-confirmed
   `D3DFMT_D24S8`) — sharing one between both eyes was an early, since-fixed
   root cause of a frozen/dark-eye bug (notes/22).
-- **UI/HUD**: drawn through a small, distinct family of shaders (10 of 455
-  total vertex shaders) that bypass the register-6 world-transform path
-  entirely (screen-space, "HUD at infinity"). Given explicit VR depth via a
-  separate mechanism (`PSYVR_UI_DEPTH`, a per-eye `c50.x` shift) rather than
-  the world-transform correction. **Dead end**: attempting to *shrink* the
-  UI viewport for comfort (notes/42) failed live because the game's
-  fullscreen fade/backdrop overlays share the exact same UI shader
-  signature as real HUD elements — shrinking one shrinks/darkens the other;
-  there is no shader-identity-level way to tell them apart, would need
-  per-draw texture/geometry classification instead. Demoted to an opt-in,
-  off-by-default knob (`PSYVR_UI_SCALE`).
+- **UI/HUD**: drawn through a small, distinct family of shaders (**exactly
+  10 of 455 total vertex shaders — dump indices 3, 447-455, confirmed
+  session 56 via a full offline corpus disassembly**) that bypass the
+  register-6 world-transform path entirely (screen-space, "HUD at
+  infinity"). Given explicit VR depth via a separate mechanism
+  (`PSYVR_UI_DEPTH`, a per-eye `c50.x` shift) rather than the world-transform
+  correction. **Correction (session 56):** register 50 is NOT UI-exclusive —
+  it appears in **100% of the 455 shaders** (the standard D3D9 half-pixel
+  texel-alignment offset every shader adds to `oPos`); our own choice to
+  reuse it for UI depth is what's UI-specific, not the register itself.
+  **Dead end**: attempting to *shrink* the UI viewport for comfort (notes/42)
+  failed live because the game's fullscreen fade/backdrop overlays share the
+  exact same UI shader signature as real HUD elements — shrinking one
+  shrinks/darkens the other; there is no shader-identity-level way to tell
+  them apart, would need per-draw texture/geometry classification instead.
+  Demoted to an opt-in, off-by-default knob (`PSYVR_UI_SCALE`).
 - **Shadows**: the engine has real **projected-texture shadows**
   (`SetLightShadowEntity`, `SetShadowBlendMode`, `SetShadowFixedDirection`
   etc., all live Lua bindings — notes/44). Not yet traced in a live capture;
@@ -192,8 +204,10 @@ in-engine level-jump), then run the already-built RAZLOCK capture. See
 
 This engine has no traditional console; the closest equivalent is calling
 these Lua-registered engine bindings once in-process execution exists
-(§10/§6's open item). None of these are wired up yet — table lists what's
-**known to exist** in the binary, not what we've exercised:
+(§10/§6's open item — as of session 57, believed close: a single confirmed
+function call away, pending live verification). None of these are wired up
+live yet — table lists what's **known to exist** in the binary, not what
+we've exercised:
 
 | Lua binding | VA (this build) | Effect / use |
 |---|---|---|
@@ -202,9 +216,11 @@ these Lua-registered engine bindings once in-process execution exists
 | `AttachCameraToEntity` | (in the 1129-binding table, `tools/lua-bindings.def`) | Camera-follows-entity mode |
 | `SetEntityCameraAlphaRadius` | ″ | Fade an entity near-camera (candidate for hiding Raz's head mesh in FP) |
 | `GetBoneWorldPosition` | `0x005B1630` (shim) / `0x005B1690` (impl) | Query a bone's world position — the clean source of Raz's head/shoulder position for FP, once Lua exec works |
-| `DumpSkeletonInfo` | `0x00571F10` | Dumps an entity's bone map — the intended way to identify Raz's head-bone index |
+| `DumpSkeletonInfo` | `0x00571F10` (shim) / `0x00571F70` (impl) | Dumps an entity's bone map. **Partially traced, session 58**: entity `+0x54` = packed bone-count bitfield `(dword>>5)&0x7FFFFFF`, `+0x5C` = bone-pointer array; per-bone records are 96 (`0x60`) bytes, layout not decoded. |
 | `SetEntityAlpha` / `SetEntityVisible` | `0x00593DA0` / `0x00593AA0` | Hide/fade an entity |
 | `SetShadowFixedDirection` etc. | (see §8) | Shadow control, untested |
+| `LoadNewLevel` | `0x005BBA90` (shim) / `0x005BBAF0` (impl) | **Fully mapped, session 55, NOT via Lua** — see the level-loader entry below and §11. Formats `name` into `workresource\levels\<name>.plb` (or uses `name` as-is if it already has an extension), then calls `SetPendingLevel`. |
+| `SetPendingLevel` (not a Lua binding — internal, called BY `LoadNewLevel`'s impl) | `0x004FFA40` | `__thiscall void(void* levelMgr, const char* path, BOOL flag)` on the singleton at `*(void**)0x78BC20` — stages an async level-transition request. **Callable directly from our own DLL code, no Lua needed at all.** See notes/55 for the full 49-code level list and the confirmed `STMU`=menu / `CA*`=Campgrounds / `CAJA`=Sasha's Lab identifications.
 
 Non-Lua, engine-native (already in use): `FirstPersonCamera` mode is
 reported to exist in the engine (notes/44, from string/function evidence);
@@ -349,14 +365,24 @@ Phase 7+ sub-project (first-person) and beyond, not the core conversion:
   confirmed correct). New leading suspect: `g_razNearValid` lock
   reliability during real gameplay (§11) — untested, needs a real
   gameplay capture, not more transform-math verification.
-- **Lua in-process execution is unfinished** (multi-session lift, notes/50):
-  `luaB_dostring` is an inlined compile-then-run, not a callable
-  `lua_dobuffer(L, char*, len, name)` — needs `lua_pushstring` located (or
-  the compile/run pair fully decoded to accept a raw buffer), a runtime
-  `lua_State*` capture (heap address, changes per launch), and a
-  non-reentrant game-thread command pump. This gates the clean, engine-
-  native fix for first-person (`SetCameraPosition`/`GetBoneWorldPosition`)
-  and everything after it (hand IK, mesh hiding, shadow verification).
+- ~~Lua in-process execution is unfinished (multi-session lift)~~ — **MOSTLY
+  RESOLVED STATICALLY, session 57, downgrade from "multi-session lift" to
+  "one function call, pending live verification."** `0x6B0C00(L, buf, len,
+  chunkname_or_NULL)` was fully traced as a complete compile-and-protected-
+  call primitive — it takes a raw buffer directly (confirmed via its
+  internal structure: compiles via `0x6B0C40`→`0x6BC550`/`0x6B0B30`, then
+  calls `0x6B08E0(L,0,-1)`, a confirmed `luaD_pcall`-style protected
+  executor, if compilation succeeded). **No `lua_pushstring` is needed at
+  all** — notes/50's premise that the push-side had to be found or the
+  compile/run pair fully decoded turned out to be satisfiable by the second
+  option. Still open before this counts as done: (1) runtime `lua_State*`
+  capture (heap address, changes per launch — unchanged from notes/46's
+  finding), (2) thread/reentrancy safety (call from our own frame hook, not
+  from inside a binding callback), (3) a live trivial-payload test before
+  anything camera-related. This still gates the clean, engine-native fix for
+  first-person (`SetCameraPosition`/`GetBoneWorldPosition`) and everything
+  after it (hand IK, mesh hiding, shadow verification) — but the estimated
+  cost to unblock it dropped sharply. See notes/57.
 - **Shadow pass bone-palette assumption is unverified** (§8) — projected
   shadows *may* consume the same bone overrides "for free", but this has
   never been captured live.
@@ -364,3 +390,15 @@ Phase 7+ sub-project (first-person) and beyond, not the core conversion:
   are still manual eyeballing of `.bmp` dumps; slows iteration and risks
   missing regressions the playbook's §2.4 automated-comparison step exists
   to catch.
+- **New opportunity, untested live** (session 55/notes/55): a Lua-free level
+  loader — `SetPendingLevel` @`0x4FFA40` (`__thiscall`, confirmed via
+  prologue/epilogue), reached from the Lua binding `LoadNewLevel`. Calling
+  it directly (`(*(void**)0x78BC20, "workresource\\levels\\<CODE>.plb",
+  flag)`) could solve the notes/54 automation blocker (deterministic
+  door-entry miss) without touching Lua exec or the menu UI at all — worth
+  trying before further walk-script tuning. All 49 level pack codes
+  catalogued from `WorkResource/PCLevelPackFiles/*.ppf`; `STMU` = the
+  menu/brain screen (confirmed — explains every automated capture's landing
+  spot this whole project), `CA*` = Campgrounds and `CAJA` = Sasha's Lab
+  (both confirmed via embedded strings), others inferred from animation-path
+  evidence but unconfirmed. See notes/55 for the full table and caveats.
