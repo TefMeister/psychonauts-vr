@@ -1,6 +1,46 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-20 (session 54: automation infrastructure fixed, but real-gameplay RAZLOCK
+Last updated: 2026-08-20 late evening (session 55-58: PURE STATIC RESEARCH per user request -
+"learn what you can without running the game" - zero game execution the whole session, only
+offline disassembly + filesystem/string inspection of the exe/data on disk).
+
+**BIGGEST FINDING: the Lua exec primitive appears to be a single function call, not a multi-session
+lift as notes/52 concluded.** `0x6B0C00(L, buf, len, chunkname_or_NULL)` was fully traced (notes/57)
+as a complete "compile + protected-call execute an arbitrary Lua string" primitive - no
+`lua_pushstring` needed at all (it takes a raw buffer directly). This substantially de-risks the
+"engine-native Lua" route for first-person (SetCameraPosition/GetBoneWorldPosition/
+DumpSkeletonInfo) that was deprioritized in notes/52. **Still needs live verification** (runtime
+`lua_State*` capture per notes/46, thread/reentrancy safety, and a trivial-payload test BEFORE
+anything camera-related) - that's the natural first experiment for the next live session.
+
+**Second major finding: a Lua-free level-load path.** `LoadNewLevel`/`SetPendingLevel` (notes/55)
+fully mapped - `((void(__thiscall*)(void*,const char*,BOOL))0x4FFA40)(*(void**)0x78BC20,
+"workresource\\levels\\<CODE>.plb", flag)` requests an async level transition directly, no Lua, no
+UI navigation. Could solve the notes/54 automation blocker (deterministic door-entry miss)
+entirely differently - worth trying before further walk-tuning. All 49 level codes catalogued;
+`STMU`=menu/brain screen (explains every capture's landing spot all project long), `CA*`=Campgrounds
+(confirmed via embedded strings), `CAJA`=Sasha's Lab (confirmed), several others inferred from
+animation-path evidence but unconfirmed (see notes/55 table). Not yet tested live.
+
+**Third: full 455-shader corpus disassembled offline** (notes/56, reusing dumps from session 52).
+Confirms register 50 appears in 100% of shaders (corrects the "UI-specific" belief from notes/36 -
+it's the standard D3D9 half-pixel offset). Exactly identifies the 10 UI shaders (indices 3,447-455)
+and reconfirms the 239-shader skinning cohort. Caught + corrected a false lead (naive "references
+register >=64" is NOT a reliable skinning-shader test - one rigid shader just uses a high-numbered
+material constant). Shadow-caster shaders NOT identifiable from vertex-shader text alone - needs a
+live render-target-correlated trace.
+
+**Fourth (partial): DumpSkeletonInfo traced** (notes/58) - entity struct offsets +0x54 (bone count,
+packed bitfield) and +0x5C (bone-pointer array) found; full 96-byte per-bone record layout NOT
+decoded (needs live cross-check, flagged for later, not attempted per tonight's no-execution rule).
+
+**Next live session, in priority order:** (1) capture runtime g_L + test the newly-mapped Lua exec
+primitive with a trivial payload; (2) if that works, try SetCameraPosition/GetBoneWorldPosition for
+FP, OR try the SetPendingLevel level-jump to solve automation; (3) decode the bone-record layout
+live if pursuing the render-level Raz-entity-offset shortcut. Prior status (session 54's RAZLOCK
+test still uncaptured) remains the FP-goal-specific open item if that thread is resumed instead.
+
+## Prior header (session 54: automation infrastructure fixed, but real-gameplay RAZLOCK
 test still NOT captured - stopped for the day, resume tomorrow. FOUND+FIXED a genuine, durable bug
 in tools/input/send_key.ps1: SetForegroundWindow's grant is single-use (consumed by the very next
 call, not durable across a sequence), and another process (the tool-harness's own powershell) is
