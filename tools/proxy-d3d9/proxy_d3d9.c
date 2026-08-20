@@ -585,6 +585,19 @@ static BOOL g_vrSkipPumpEye = FALSE;
  * never moves). */
 static BOOL g_trackingDisabled = FALSE;
 static BOOL g_fakePose = FALSE;
+/* notes/52: isolated empirical test for the head-tracking composition order (playbook-style
+ * instrument-before-assuming, after shader disassembly ruled out a WVP-convention bug). */
+static float g_htTestShift = 0.0f;   /* PSYVR_HT_TEST_SHIFT: raw world-unit Z shift injected into T */
+static BOOL  g_htDebug = FALSE;      /* PSYVR_HT_DEBUG: log origin-before vs origin-after the correction */
+/* notes/52: force-override knobs to test X1's construction (the FP-specific "move eye to Raz"
+ * matrix) in total isolation - no gameplay, no F4, no real Raz detection needed. Sets g_fpActive
+ * and a fixed g_razWorld directly, so X1 = f(known razWorld, known g_baseEye) is fully controlled
+ * and repeatable, letting HTDEBUG measure whether X1's dot-product construction + its composition
+ * into T (Mat4MulRow(T,X1,T)) produces the expected world-space shift - same method as the T-only
+ * test that already proved the downstream pipeline correct. */
+static BOOL  g_fpForceActive = FALSE;   /* PSYVR_FP_FORCE_ACTIVE=1 - checked alongside g_fpActive (declared later) */
+static BOOL  g_razForceValid = FALSE;   /* PSYVR_FP_FORCE_RAZ="dx,dy,dz" set -> razWorld = baseEye + (dx,dy,dz) each frame */
+static float g_razForceOffX = 0.0f, g_razForceOffY = 0.0f, g_razForceOffZ = 0.0f;
 
 /* notes/47: EXPERIMENTAL first-person prototype (PSYVR_FIRST_PERSON=1, default off). The game's
  * chase camera looks from g_baseEye toward g_baseAt; the look-at point tracks Raz, at distance
@@ -814,6 +827,25 @@ static void VRBridge_ReadEnableFlag(void)
     g_trackingDisabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
     len = GetEnvironmentVariableA("PSYVR_FAKE_POSE", buf, sizeof(buf));
     g_fakePose = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    len = GetEnvironmentVariableA("PSYVR_HT_TEST_SHIFT", buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf)) g_htTestShift = (float)atof(buf);
+    len = GetEnvironmentVariableA("PSYVR_HT_DEBUG", buf, sizeof(buf));
+    g_htDebug = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_htTestShift != 0.0f || g_htDebug)
+        LogLine("VRBridge: notes/52 composition-order test - PSYVR_HT_TEST_SHIFT=%.1f PSYVR_HT_DEBUG=%d",
+                g_htTestShift, g_htDebug ? 1 : 0);
+    len = GetEnvironmentVariableA("PSYVR_FP_FORCE_ACTIVE", buf, sizeof(buf));
+    g_fpForceActive = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_fpForceActive) LogLine("VRBridge: PSYVR_FP_FORCE_ACTIVE=1 - FP active from startup (notes/52 X1 isolation test)");
+    len = GetEnvironmentVariableA("PSYVR_FP_FORCE_RAZ", buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf)) {
+        float dx = 0, dy = 0, dz = 0;
+        if (sscanf(buf, "%f,%f,%f", &dx, &dy, &dz) == 3) {
+            g_razForceValid = TRUE;
+            g_razForceOffX = dx; g_razForceOffY = dy; g_razForceOffZ = dz;
+            LogLine("VRBridge: PSYVR_FP_FORCE_RAZ=%.1f,%.1f,%.1f - razWorld forced to baseEye+offset each frame (notes/52)", dx, dy, dz);
+        }
+    }
 
     /* notes/47: first-person prototype. */
     len = GetEnvironmentVariableA("PSYVR_FIRST_PERSON", buf, sizeof(buf));
@@ -1878,8 +1910,10 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
     }
 
     /* notes/47: first-person with head tracking OFF - use an identity head transform and jump
-     * straight to the forward-translation + Y build below. */
-    if (g_trackingDisabled || g_fpPreviewMode) {
+     * straight to the forward-translation + Y build below. notes/52: g_fakePose takes priority -
+     * it's an explicit "synthesize a pose for testing" request, needed to run a real (non-identity)
+     * T through this pipeline on the monitor path (no SteamVR) for the isolated translation test. */
+    if ((g_trackingDisabled || g_fpPreviewMode) && !g_fakePose) {
         Mat4Identity(T);   /* notes/51: monitor preview also uses a frozen (identity) head */
         goto fp_and_build;
     }
@@ -1947,6 +1981,13 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
         T[15] = 1.0f;
     }
 
+    /* notes/52: isolated empirical test - inject a KNOWN, raw translation directly into T,
+     * bypassing all pose/reference-capture/FP-anchor complexity, to directly measure (via
+     * HTDEBUG below) whether a known shift here produces the expected world-space displacement
+     * once composed into g_trackYt and applied to a register-6 upload. Settles the composition-
+     * order question with real data instead of more hand-derived matrix algebra. */
+    if (g_htTestShift != 0.0f) T[14] += g_htTestShift;
+
 fp_and_build:
     /* notes/47: first-person - slide the eye forward onto Raz (the look-at point sits
      * g_focusDistance ahead along view -Z, so the world shifts +Z by that much to bring it to
@@ -1956,12 +1997,22 @@ fp_and_build:
      * calls VRBridge_PumpPoses (which runs us), so the guard was always false and FP never
      * reached the render (user saw "keys did nothing visually"). g_focusDistance persists across
      * frames (set each BVM, clamped, default otherwise), so it's valid with or without the flag. */
-    if (g_firstPerson && g_fpActive) {
+    if (g_firstPerson && (g_fpActive || g_fpForceActive)) {
         float X1[16];
         Vec3 fwd = Vec3Normalize(Vec3Sub(g_baseAt, g_baseEye));
         Vec3 right = g_rightVec;
         Vec3 up = Vec3Normalize(Vec3Cross(right, fwd));
 
+        /* notes/52: X1-isolation test override - force a KNOWN razWorld (baseEye + fixed offset),
+         * bypassing the nearest-c96 detector entirely, so X1's construction can be tested with a
+         * fully controlled, repeatable input (no gameplay/Raz needed). */
+        if (g_razForceValid) {
+            g_razWorld.x = g_baseEye.x + g_razForceOffX;
+            g_razWorld.y = g_baseEye.y + g_razForceOffY;
+            g_razWorld.z = g_baseEye.z + g_razForceOffZ;
+            g_razValid = TRUE;
+            g_razMissFrames = 0;
+        } else
         /* notes/51: promote this frame's nearest-to-eye c96 origin (= Raz, see the recovery block
          * in Hook_SetVertexShaderConstantF) into the smoothed g_razWorld the camera locks to. A
          * single stable origin, not a centroid - so no inter-entity averaging jitter. If no
@@ -3068,6 +3119,36 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShaderConstantF(
         if (g_trackYValid) {
             Mat4MulRow(tracked, g_trackYt, pConstantData);
             src = tracked;
+
+            /* notes/52: HTDEBUG - recover the world-space origin from BOTH the pre-correction
+             * upload (pConstantData) and the post-correction one (tracked), using the SAME
+             * empirically-validated row-vector extraction the notes/49-51 entity-origin recovery
+             * uses (wr3 . g_pinvVinv). If the head-tracking correction is composing correctly, the
+             * two recovered origins should differ by ~PSYVR_HT_TEST_SHIFT world units; if the
+             * composition order/transpose is wrong, expect near-zero or a wildly different delta. */
+            if (g_htDebug && g_pinvVinvValid) {
+                static DWORD s_htLast = 0;
+                DWORD now = GetTickCount();
+                if (s_htLast == 0 || (DWORD)(now - s_htLast) >= 1000) {
+                    float wrOld[4], wrNew[4], oOld[4], oNew[4];
+                    int c, k;
+                    s_htLast = now;
+                    wrOld[0]=pConstantData[3]; wrOld[1]=pConstantData[7]; wrOld[2]=pConstantData[11]; wrOld[3]=pConstantData[15];
+                    wrNew[0]=tracked[3];       wrNew[1]=tracked[7];       wrNew[2]=tracked[11];       wrNew[3]=tracked[15];
+                    for (c = 0; c < 4; c++) {
+                        float sOld = 0.0f, sNew = 0.0f;
+                        for (k = 0; k < 4; k++) { sOld += wrOld[k]*g_pinvVinv[k*4+c]; sNew += wrNew[k]*g_pinvVinv[k*4+c]; }
+                        oOld[c] = sOld; oNew[c] = sNew;
+                    }
+                    if ((oOld[3]>1e-6f||oOld[3]<-1e-6f) && (oNew[3]>1e-6f||oNew[3]<-1e-6f)) {
+                        float ox0=oOld[0]/oOld[3], oy0=oOld[1]/oOld[3], oz0=oOld[2]/oOld[3];
+                        float ox1=oNew[0]/oNew[3], oy1=oNew[1]/oNew[3], oz1=oNew[2]/oNew[3];
+                        float dx=ox1-ox0, dy=oy1-oy0, dz=oz1-oz0;
+                        LogLine("HTDEBUG: shift=%.1f old=(%.1f,%.1f,%.1f) new=(%.1f,%.1f,%.1f) delta=(%.1f,%.1f,%.1f) |delta|=%.1f",
+                                g_htTestShift, ox0,oy0,oz0, ox1,oy1,oz1, dx,dy,dz, sqrtf(dx*dx+dy*dy+dz*dz));
+                    }
+                }
+            }
         }
 
         memcpy(patched, src, sizeof(patched));
