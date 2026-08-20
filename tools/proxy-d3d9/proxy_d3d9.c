@@ -598,6 +598,15 @@ static BOOL  g_htDebug = FALSE;      /* PSYVR_HT_DEBUG: log origin-before vs ori
 static BOOL  g_fpForceActive = FALSE;   /* PSYVR_FP_FORCE_ACTIVE=1 - checked alongside g_fpActive (declared later) */
 static BOOL  g_razForceValid = FALSE;   /* PSYVR_FP_FORCE_RAZ="dx,dy,dz" set -> razWorld = baseEye + (dx,dy,dz) each frame */
 static float g_razForceOffX = 0.0f, g_razForceOffY = 0.0f, g_razForceOffZ = 0.0f;
+/* notes/53: real-gameplay Raz-lock reliability diagnostic (the new leading suspect after the
+ * composition math was proven correct). Counts, per frame, whether the raw nearest-c96 detector
+ * found a candidate (g_razNearValid) and whether the smoothed/held lock stayed up (g_razValid),
+ * plus real lock-LOSS events (g_razValid true->false transitions) - the single most diagnostic
+ * number, since each one is a frame where the anchor snaps from razWorld-relative to the totally
+ * different chase-cam-relative fallback shift. */
+static BOOL g_razLockStats = FALSE;   /* PSYVR_RAZLOCK_STATS=1 */
+static LONG g_rlTotalFrames = 0, g_rlNearHit = 0, g_rlValidHit = 0, g_rlLossEvents = 0;
+static BOOL g_rlPrevValid = FALSE;
 
 /* notes/47: EXPERIMENTAL first-person prototype (PSYVR_FIRST_PERSON=1, default off). The game's
  * chase camera looks from g_baseEye toward g_baseAt; the look-at point tracks Raz, at distance
@@ -846,6 +855,9 @@ static void VRBridge_ReadEnableFlag(void)
             LogLine("VRBridge: PSYVR_FP_FORCE_RAZ=%.1f,%.1f,%.1f - razWorld forced to baseEye+offset each frame (notes/52)", dx, dy, dz);
         }
     }
+    len = GetEnvironmentVariableA("PSYVR_RAZLOCK_STATS", buf, sizeof(buf));
+    g_razLockStats = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_razLockStats) LogLine("VRBridge: PSYVR_RAZLOCK_STATS=1 - logging Raz-lock hit rate / loss events each second (notes/53)");
 
     /* notes/47: first-person prototype. */
     len = GetEnvironmentVariableA("PSYVR_FIRST_PERSON", buf, sizeof(buf));
@@ -2032,6 +2044,31 @@ fp_and_build:
             }
         } else if (g_razValid) {
             if (++g_razMissFrames > 8) { g_razValid = FALSE; g_razMissFrames = 0; }
+        }
+
+        /* notes/53: Raz-lock reliability stats - once per frame, count whether the raw detector
+         * found a candidate this frame (g_razNearValid) and whether the smoothed lock is up
+         * (g_razValid), and count real lock-LOSS events (g_razValid true->false transitions,
+         * i.e. frames where the anchor snaps to the different chase-cam-relative fallback). */
+        if (g_razLockStats) {
+            g_rlTotalFrames++;
+            if (g_razNearValid) g_rlNearHit++;
+            if (g_razValid) g_rlValidHit++;
+            if (g_rlPrevValid && !g_razValid) g_rlLossEvents++;
+            g_rlPrevValid = g_razValid;
+            {
+                static DWORD s_rlLast = 0;
+                DWORD now = GetTickCount();
+                if (s_rlLast == 0 || (DWORD)(now - s_rlLast) >= 1000) {
+                    s_rlLast = now;
+                    LogLine("RAZLOCK: total=%ld nearHit=%ld(%.0f%%) validHit=%ld(%.0f%%) lossEvents=%ld",
+                            g_rlTotalFrames, g_rlNearHit,
+                            g_rlTotalFrames ? 100.0f * g_rlNearHit / g_rlTotalFrames : 0.0f,
+                            g_rlValidHit,
+                            g_rlTotalFrames ? 100.0f * g_rlValidHit / g_rlTotalFrames : 0.0f,
+                            g_rlLossEvents);
+                }
+            }
         }
 
         /* notes/51: recover Raz's FULL World matrix (World = WVP * pinvVinv) from the winning draw's
