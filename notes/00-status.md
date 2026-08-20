@@ -1,5 +1,24 @@
 # Psychonauts VR — Status
 
+Last updated: 2026-08-20 (session 54: automation infrastructure fixed, but real-gameplay RAZLOCK
+test still NOT captured - stopped for the day, resume tomorrow. FOUND+FIXED a genuine, durable bug
+in tools/input/send_key.ps1: SetForegroundWindow's grant is single-use (consumed by the very next
+call, not durable across a sequence), and another process (the tool-harness's own powershell) is
+actively contending for foreground - so single-attempt focus grabs failed 3x in a row today. Fix:
+retry loop that re-grants AllowSetForegroundWindow fresh before every attempt (up to 5x). CONFIRMED
+durable - two full 13-key enter_gameplay.ps1 sequences completed cleanly after the fix (vs 3 prior
+failures). This should be treated as permanent project infrastructure going forward.
+STILL UNRESOLVED: enter_gameplay.ps1's blind walk-to-CONTINUE-door deterministically misses (lands
+at the identical wrong coordinates every time - not random, needs real tuning with a clean feedback
+loop, not the noisy throttled eye-dump timer used tonight). A manual-assist attempt ALSO stayed at
+menu-space coords for 103s/6221 frames - unclear if it actually reached gameplay. THE ACTUAL GOAL
+(capture g_razNearValid hit-rate during real walking, to test the notes/53 Raz-lock-flicker
+hypothesis) is STILL UNTESTED - blocked on reliably reaching real gameplay. Resume point: fix
+door-entry first (proper iterative tuning, or find an in-engine level-jump per playbook §2.1), THEN
+run PSYVR_RAZLOCK_STATS=1 (already built) during actual walking. Details in notes/54.)
+
+## Prior header (session 53: FP debugging resumed, composition math proven correct)
+
 Last updated: 2026-08-20 (session 53: RESUMED FP debugging per user request ("resume now that the
 convention's ruled out"). Built two isolated, fully-automated empirical tests (no gameplay needed -
 title screen alone suffices): (1) raw translation injected directly into head-tracking's T matrix,
