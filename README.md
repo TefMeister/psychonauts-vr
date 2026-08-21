@@ -22,6 +22,19 @@ The blow-by-blow development history lives in the sibling repositories
 `psychonauts-vr-modding-notes` for readable field notes). This repo is the
 consolidated engine knowledge, not the diary.
 
+## The five repositories for Psychonauts VR
+
+Everything for this game lives in five repositories, each with one job — so you
+always know where to look. You are in **psychonauts-vr-engine-research**.
+
+| Repository | What lives here |
+| --- | --- |
+| [psychonauts-vr-mod](https://github.com/TefMeister/psychonauts-vr-mod) | The mod itself — the DirectX 9 stereo + head-tracking VR proxy (`d3d9.dll`). |
+| [psychonauts-vr-dev-archive](https://github.com/TefMeister/psychonauts-vr-dev-archive) | Full development history — snapshots, probes, dead ends, raw recon. |
+| [psychonauts-vr-modding-notes](https://github.com/TefMeister/psychonauts-vr-modding-notes) | Readable field notes / progress ledger. |
+| [psychonauts-vr-staging](https://github.com/TefMeister/psychonauts-vr-staging) 🔒 | **Private** — unverified WIP builds, cross-machine handoff. |
+| **psychonauts-vr-engine-research** ← you are here | Distilled engine reference (dossier) + reusable VR RE playbook. |
+
 ## Status
 
 **The North Star is already reached**: stereo rendering and 6DOF head tracking
