@@ -131,6 +131,13 @@ either the FP engine-native route or the level-jump automation fix. See
   itself. See notes/52 for the full disassembly and method (a reusable,
   fully-automated, fully-offline verification recipe worth reusing on any
   future register/convention question for this engine).
+- **CPU-side upload chain (traced live, session 17, 8/8-sample register
+  trace):** the register-6 matrix is built at `exe+0x11D2CD`–`0x11D33E`
+  (absolute `0x0051D2CD`–`0x0051D33E`): two `MatrixMultiply` calls, then an
+  in-place `Transpose` (`exe+0x42E2A0`) whose result feeds
+  `SetVertexShaderConstantF(6, …)`. Useful as a pre-API patch point (earlier
+  than the vtable hook) if one is ever needed — the vtable hook has been
+  sufficient so far.
 - Projection `P`: recovered from the game's own
   `D3DXMatrixPerspectiveFovRH`-style call site — `xScale`/`yScale`/`zn`/`zf`
   are cached once per frame (`BuildProjectionMatrix`, "BPM") from that
@@ -286,8 +293,48 @@ not yet exercised.
   window-offscreen mover (`SetWindowPos`, `SWP_NOACTIVATE`) keeps the game
   rendering/receiving input without appearing on the physical screen.
 
+### Engine-side input internals (sessions 16–18, live-traced)
+
+Full mechanism map of how this engine consumes keyboard input — useful
+context for why the harness drives menus with window-level `SendInput`
+rather than memory-forged DirectInput state:
+
+- **Keyboard is polled DirectInput** — `GetDeviceState` on the keyboard
+  device only. Buffered `GetDeviceData` belongs to the **mouse exclusively**
+  (classified by `this` pointer: 42/42 hits on the mouse device, 0 on the
+  keyboard — session 17). Forging buffered keyboard events is therefore a
+  dead end by construction.
+- Persistent polled keyboard state buffer (DIK-indexed bytes) at
+  `0x00782D78`, stable across polls.
+- Consumers: a scan of a **3×21 keybinding table** at `0x00782008`
+  (3 categories × 21 slots), plus three hardcoded direct reads —
+  DIK_RETURN `0x00782D94`, DIK_SPACE `0x00782DB1`, DIK_ESCAPE `0x00782D79`
+  (exactly a title screen's confirm/quit keys) — each feeding
+  `SetKeyState(dik, pressed)` at `0x00405470`.
+- `SetKeyState` is an edge-detection state machine over a per-DIK byte array
+  at `0x00782130` (bit0 = held, bit1 = just-pressed, bit2 = just-released;
+  a per-frame sweep at `0x00405590` clears the edge bits). It also services
+  a **one-shot listener slot** — callback pointer `[0x00782F14]`, userdata
+  `[0x00782F18]`; the callback auto-unregisters when it returns 0.
+- Above that sits a generic binding-abstraction layer (`0x004055D0`)
+  translating keyState bits into per-binding-slot 0x00/0xFF digital-action
+  bytes, with query helpers `IsKeyHeld` `0x00405910` / `IsKeyJustPressed`
+  `0x00405930` (plus a third, uninspected, ~`0x00405950`).
+- **Why buffer-forging never advanced the title screen** (session 17's
+  decisive test): a forged DIK_SPACE press verifiably reaches `SetKeyState`
+  with correct edge semantics (`0x00`→`0x03` state transition observed), but
+  the one-shot listener slot is **unarmed** (`0x00000000`) while idling at
+  "Press [] to begin" — the title screen listens via some other, untraced
+  path. `SendInput` at the window level (above) sidesteps the question.
+
 ## 11. Dead ends & false leads (save future time)
 
+- **Forging keyboard input at the DirectInput-buffer or keyState level**
+  (sessions 15–18): refuted twice over — the keyboard never uses buffered
+  `GetDeviceData` (mouse only), and a correctly-forged polled-buffer press
+  reaches the input state machine but the title screen doesn't consume it
+  via the traced one-shot listener slot (see §10's input-internals map).
+  Drive menus with window-level `SendInput` instead.
 - **UI-shrink-for-comfort via shader classification** (§8): fullscreen
   fade/backdrop overlays are indistinguishable from real HUD elements at
   the shader level. Needs per-draw geometry/texture identity, not shader
