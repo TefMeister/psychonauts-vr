@@ -1,4 +1,4 @@
-# psychonauts-vr
+# psychonauts-vr-mod
 
 VR support mod for the original 2005 **Psychonauts** (Double Fine) — a DirectX 9, custom-engine game with no existing VR modding framework.
 
