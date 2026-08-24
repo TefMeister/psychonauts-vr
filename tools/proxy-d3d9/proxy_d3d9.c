@@ -606,6 +606,15 @@ static char g_levelJumpCode[64] = "workresource\\levels\\CAJA.plb";
 static BOOL g_cullToggleKeyEnabled = FALSE;
 #define VISTREE_CULLING_ITEM_ID 117
 #define DEBUG_FLAGS_ARRAY_OFFSET 44
+/* notes/64: NUMPAD8 one-shot "Render Wireframe" flag toggle - same direct-byte-write pattern as
+ * notes/62's Visibility Tree Culling toggle above, same generic-ID registration path
+ * (sub_628e60/sub_629410("Render Wireframe", "Display wireframe for rendered geometry", 21)
+ * confirmed via a fresh decompile of sub_627590). Built to distinguish "real geometry, just dark/
+ * unlit" from "genuinely nothing there" at the same void test spot notes/63 used for the culling
+ * A/B - wireframe draws edges regardless of lighting, so if lines appear in the void region the
+ * world is loaded there and it's a lighting/visibility read, not a missing-geometry gap. */
+static BOOL g_wireframeToggleKeyEnabled = FALSE;
+#define RENDER_WIREFRAME_ITEM_ID 21
 /* notes/52: isolated empirical test for the head-tracking composition order (playbook-style
  * instrument-before-assuming, after shader disassembly ruled out a WVP-convention bug). */
 static float g_htTestShift = 0.0f;   /* PSYVR_HT_TEST_SHIFT: raw world-unit Z shift injected into T */
@@ -888,6 +897,13 @@ static void VRBridge_ReadEnableFlag(void)
     if (g_cullToggleKeyEnabled)
         LogLine("VRBridge: PSYVR_CULL_TOGGLE_KEY=1 - NUMPAD9 will flip the Visibility Tree "
                 "Culling flag (engine+%d+%d)", DEBUG_FLAGS_ARRAY_OFFSET, VISTREE_CULLING_ITEM_ID);
+
+    /* notes/64: NUMPAD8 Render Wireframe flag toggle opt-in. */
+    len = GetEnvironmentVariableA("PSYVR_WIREFRAME_TOGGLE_KEY", buf, sizeof(buf));
+    g_wireframeToggleKeyEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_wireframeToggleKeyEnabled)
+        LogLine("VRBridge: PSYVR_WIREFRAME_TOGGLE_KEY=1 - NUMPAD8 will flip the Render "
+                "Wireframe flag (engine+%d+%d)", DEBUG_FLAGS_ARRAY_OFFSET, RENDER_WIREFRAME_ITEM_ID);
 
     len = GetEnvironmentVariableA("PSYVR_HT_TEST_SHIFT", buf, sizeof(buf));
     if (len > 0 && len < sizeof(buf)) g_htTestShift = (float)atof(buf);
@@ -2661,6 +2677,26 @@ void __cdecl CandB_AfterBoth_asm(void)
             }
         }
         s_prevNum9 = num9;
+    }
+
+    /* notes/64: NUMPAD8 - one-shot direct toggle of the "Render Wireframe" debug flag, same
+     * direct-byte-write pattern as NUMPAD9 above. Opt-in (PSYVR_WIREFRAME_TOGGLE_KEY=1, default
+     * off). */
+    if (g_wireframeToggleKeyEnabled) {
+        static SHORT s_prevNum8 = 0;
+        SHORT num8 = GetAsyncKeyState(VK_NUMPAD8);
+        if ((num8 & 0x8000) && !(s_prevNum8 & 0x8000)) {
+            void *engine = *(void **)0x78BC20;
+            if (engine) {
+                unsigned char *flag = (unsigned char *)engine + DEBUG_FLAGS_ARRAY_OFFSET + RENDER_WIREFRAME_ITEM_ID;
+                *flag = !*flag;
+                LogLine("WireframeToggle: NUMPAD8 pressed - Render Wireframe flag @ %p (engine+%d) now %d",
+                        flag, DEBUG_FLAGS_ARRAY_OFFSET + RENDER_WIREFRAME_ITEM_ID, (int)*flag);
+            } else {
+                LogLine("WireframeToggle: NUMPAD8 pressed but engine=*(void**)0x78BC20 is NULL, skipped");
+            }
+        }
+        s_prevNum8 = num8;
     }
 
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }
