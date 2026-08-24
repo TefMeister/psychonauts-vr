@@ -1,6 +1,41 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 even later (session 61: void-behind-player bug — following a parallel
+Last updated: 2026-08-24 latest (session 62: void-behind-player bug — decompiled the debug menu's
+toggle handler, confirmed "Visibility Tree Culling" resolves to one directly-flippable byte, built
+and live-verified a zero-UI NUMPAD9 hotkey for it; the live disappears-vs-persists screenshot test
+itself still not reached, blocked by scene-navigation issues unrelated to the toggle).
+
+**The Visibility Tree Culling flag is now a proven, working, zero-UI toggle**: `sub_629490`
+(the debug menu's checkbox-sync handler) decompiled cleanly to `flag = *(void**)0x78BC20 + 44 + 117`
+(one byte) for this specific item — confirmed correct against the live engine object in the log
+(`Visibility Tree Culling flag @ 02E59201 (engine+161) now 0`, matching `engine_ptr(02E59160)+0xA1`
+exactly). NUMPAD9 (`PSYVR_CULL_TOGGLE_KEY=1`) flips it directly, no menu/UI navigation needed at all.
+
+**Real, important lesson learned the hard way**: the Journal/pause menu's **"Continue" loads the most
+recent SAVE FILE, not the current session** — accidentally selecting it after F12's level-jump
+silently discarded the fresh level load and dropped into a locked-camera cutscene autosave instead.
+Fix: after F12, never navigate the pause/journal menu; dismiss only via raw `SendInput` (no
+`SetForegroundWindow` calls, which appear to be what triggers the focus-loss auto-pause that leads
+into that menu in the first place).
+
+**The actual live A/B test (does the void disappear when the flag is off?) was not completed this
+session** — not a toggle problem, a scene problem: `CAJA`'s spawn point sits next to a
+hard-to-escape NPC dialogue trigger, and an unplanned scene transition (likely triggered by an
+escape-attempt movement input) landed in a different area where the logged camera `right` vector
+stayed completely frozen for 8+ seconds despite active fake-pose head-yaw — meaning head-tracking
+wasn't visibly rotating that scene's camera at all, making "no void seen" uninformative there. No
+save files were modified or needed deleting (the user pre-authorized deleting the mid-cutscene
+autosave if needed; the successful run avoided the Continue-trap entirely, so it wasn't necessary).
+Full detail in notes/62.
+
+**Next session, in priority order**: (1) find a spawn/test location without an immediate NPC
+trigger (try other `CA*` Campgrounds codes, or find a way to suppress NPC dialogue triggers); (2)
+confirm the camera `right`/`eye` vector is actually changing frame-to-frame in the log before
+trusting any "no void" reading there — a frozen camera and a working disabled-cull flag look
+identical in a screenshot for very different reasons; (3) once both hold, the test itself is one
+keypress (NUMPAD9) and a before/after screenshot comparison — the hard infrastructure work is done.
+
+## Prior header (session 61: void-behind-player bug — following a parallel
 session's public-research lead, located Psychonauts' dormant developer debug menu in our own exe and
 found a major independent confirmation of the octree/visibility-tree culling hypothesis; the live
 Sphere-Camera/Show-Collision experiment itself was not reached this session).

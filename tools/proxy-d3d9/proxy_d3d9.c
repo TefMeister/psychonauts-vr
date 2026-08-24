@@ -595,6 +595,17 @@ static float g_fakePoseYawAmpRad = 0.44f;
  * this mechanism itself is proven). */
 static BOOL g_levelJumpKeyEnabled = FALSE;
 static char g_levelJumpCode[64] = "workresource\\levels\\CAJA.plb";
+/* notes/62: NUMPAD9 one-shot "Visibility Tree Culling" flag toggle (see CandB_AfterBoth_asm).
+ * Direct memory write, zero menu/UI interaction - traced live via decompile of the debug menu's
+ * shared toggle-sync handler (sub_629490 @ exe+0x629490): for any item registered through
+ * sub_629410 (the generic-ID path, as "Visibility Tree Culling" is, with id=117), the handler reads
+ * a single byte at engine_ptr+44+id to sync the menu checkbox's display state - i.e. the real,
+ * live flag storage is exactly *(BYTE*)(*(void**)0x78BC20 + 44 + 117). This hotkey flips that byte
+ * directly; the game's own click handler was never traced (not needed - direct write is simpler
+ * and doesn't require the debug menu to be open/navigable at all). */
+static BOOL g_cullToggleKeyEnabled = FALSE;
+#define VISTREE_CULLING_ITEM_ID 117
+#define DEBUG_FLAGS_ARRAY_OFFSET 44
 /* notes/52: isolated empirical test for the head-tracking composition order (playbook-style
  * instrument-before-assuming, after shader disassembly ruled out a WVP-convention bug). */
 static float g_htTestShift = 0.0f;   /* PSYVR_HT_TEST_SHIFT: raw world-unit Z shift injected into T */
@@ -870,6 +881,14 @@ static void VRBridge_ReadEnableFlag(void)
         }
         LogLine("VRBridge: PSYVR_LEVEL_JUMP_KEY=1 - F12 will call SetPendingLevel(\"%s\")", g_levelJumpCode);
     }
+
+    /* notes/62: NUMPAD9 Visibility Tree Culling flag toggle opt-in. */
+    len = GetEnvironmentVariableA("PSYVR_CULL_TOGGLE_KEY", buf, sizeof(buf));
+    g_cullToggleKeyEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_cullToggleKeyEnabled)
+        LogLine("VRBridge: PSYVR_CULL_TOGGLE_KEY=1 - NUMPAD9 will flip the Visibility Tree "
+                "Culling flag (engine+%d+%d)", DEBUG_FLAGS_ARRAY_OFFSET, VISTREE_CULLING_ITEM_ID);
+
     len = GetEnvironmentVariableA("PSYVR_HT_TEST_SHIFT", buf, sizeof(buf));
     if (len > 0 && len < sizeof(buf)) g_htTestShift = (float)atof(buf);
     len = GetEnvironmentVariableA("PSYVR_HT_DEBUG", buf, sizeof(buf));
@@ -2620,6 +2639,28 @@ void __cdecl CandB_AfterBoth_asm(void)
                     "BVM camera-coord jump in the next few seconds' log lines");
         }
         s_prevF12 = f12;
+    }
+
+    /* notes/62: NUMPAD9 - one-shot direct toggle of the "Visibility Tree Culling" debug flag
+     * (exe+0x629490 decompile: for a generic-ID item like this one, id=117, the menu's own display
+     * sync reads *(BYTE*)(engine_ptr + 44 + id) - writing that same byte directly here sidesteps
+     * the debug menu's UI entirely, no navigation/focus needed). Opt-in (PSYVR_CULL_TOGGLE_KEY=1,
+     * default off) - this is a real gameplay-affecting engine flag, not a diagnostic no-op. */
+    if (g_cullToggleKeyEnabled) {
+        static SHORT s_prevNum9 = 0;
+        SHORT num9 = GetAsyncKeyState(VK_NUMPAD9);
+        if ((num9 & 0x8000) && !(s_prevNum9 & 0x8000)) {
+            void *engine = *(void **)0x78BC20;
+            if (engine) {
+                unsigned char *flag = (unsigned char *)engine + DEBUG_FLAGS_ARRAY_OFFSET + VISTREE_CULLING_ITEM_ID;
+                *flag = !*flag;
+                LogLine("CullToggle: NUMPAD9 pressed - Visibility Tree Culling flag @ %p (engine+%d) now %d",
+                        flag, DEBUG_FLAGS_ARRAY_OFFSET + VISTREE_CULLING_ITEM_ID, (int)*flag);
+            } else {
+                LogLine("CullToggle: NUMPAD9 pressed but engine=*(void**)0x78BC20 is NULL, skipped");
+            }
+        }
+        s_prevNum9 = num9;
     }
 
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }
