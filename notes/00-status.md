@@ -1,6 +1,36 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 later (session 60: void-behind-player bug — user reframed candidate 1
+Last updated: 2026-08-24 even later (session 61: void-behind-player bug — following a parallel
+session's public-research lead, located Psychonauts' dormant developer debug menu in our own exe and
+found a major independent confirmation of the octree/visibility-tree culling hypothesis; the live
+Sphere-Camera/Show-Collision experiment itself was not reached this session).
+
+**"Visibility Tree Culling" is a real, named, toggleable debug option shipped in the game's own
+dormant developer menu — independently confirms notes/59's octree-culling hypothesis directly from
+the developers' own terminology.** Fully decompiled the debug-menu construction function
+(`exe+0x627590`) and confirmed every item TCRF/the research note listed is present intact in our
+exe: Fly Camera, Sphere Camera, Show Collision, Collision Wireframe/Spheres, Show Nav Path, and
+critically **"Visibility Tree Culling"** ("Enable/disable use of visibility tree for culling") plus
+**"Debug Visibility Tree"** (node visualization) — real shipped code, not speculation. This strongly
+supports the theory that five sessions centered on camera-matrix code never found an isolated
+frustum test because there isn't one: visibility is decided by walking a tree structure (very likely
+the same PLB octree Jill Crungus documented on the collision side), not a standalone plane compare.
+Traced one level into the item-registration helpers (found where the item's numeric ID, e.g. 117 for
+Visibility Tree Culling, gets stored) but ran out of time before reaching the actual flag storage or
+the menu's activation trigger — **the live disappears-vs-persists screenshot test the user asked for
+was not reached this session.** No memory or file writes were made — pure read-only recon, nothing to
+revert. Full detail in notes/61.
+
+**Next, in priority order:** (1) decompile `sub_629490` (the shared toggle/select handler) to find
+whether item ID 117 maps to a directly-flippable global flag — if so, a hotkey can toggle
+"Visibility Tree Culling" with zero menu UI needed, sidestepping session 60's still-unresolved
+window-focus blocker entirely; (2) if not, find `sub_627590`'s live caller via EBP-chain (angr's
+static call graph found none — likely an indirect/vtable call) to locate the menu-system object and
+either call `SelectMenu`/`SelectPage` directly or fall back to McDonald's original Journal-pointer
+repoint technique; (3) either path still needs `SetPendingLevel` (notes/60's F12 hotkey, proven
+working) to reach real gameplay first.
+
+## Prior header (session 60: void-behind-player bug — user reframed candidate 1
 around the mouse-camera/body-facing decoupling already visible in flat play; big win on the side
 quest, `SetPendingLevel` live-verified working for the first time; mouse-yaw hunt itself blocked
 mid-session on a window-focus issue).
