@@ -22,9 +22,9 @@ The blow-by-blow development history lives in the sibling repositories
 `psychonauts-vr-modding-notes` for readable field notes). This repo is the
 consolidated engine knowledge, not the diary.
 
-## The five repositories for Psychonauts VR
+## The six repositories for Psychonauts VR
 
-Everything for this game lives in five repositories, each with one job — so you
+Everything for this game lives in six repositories, each with one job — so you
 always know where to look. You are in **psychonauts-vr-engine-research**.
 
 | Repository | What lives here |
@@ -34,6 +34,7 @@ always know where to look. You are in **psychonauts-vr-engine-research**.
 | [psychonauts-vr-modding-notes](https://github.com/TefMeister/psychonauts-vr-modding-notes) | Readable field notes / progress ledger. |
 | [psychonauts-vr-staging](https://github.com/TefMeister/psychonauts-vr-staging) 🔒 | **Private** — unverified WIP builds, cross-machine handoff. |
 | **psychonauts-vr-engine-research** ← you are here | Distilled engine reference (dossier) + reusable VR RE playbook. |
+| [psychonauts-vr-external-research](https://github.com/TefMeister/psychonauts-vr-external-research) | Ongoing public-research leads, gathered separately from hands-on modding work. |
 
 ## Status
 
