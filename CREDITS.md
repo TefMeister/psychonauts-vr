@@ -26,6 +26,8 @@ ourselves, plus third-party components whose licenses permit redistribution
 | PsychonautsStudio (file tools) | RayCarrot | https://github.com/RayCarrot/PsychonautsStudio |
 | DoubleFine Explorer | bgbennyboy | https://github.com/bgbennyboy/DoubleFine-Explorer |
 | "Classic Postmortem: Double Fine's Psychonauts" | Caroline Esmurdoc, *Game Developer Magazine* (Aug 2005) | https://www.gamedeveloper.com |
+| Vireio Perception / VRBoost (DirectInput mouse-delta injection technique, cross-applied from Far Cry 2 research) | cybereality and the Vireio Perception contributors | https://github.com/cybereality/Perception |
+| dinput8-hook (minimal DirectInput hook reference) | fiki574 | https://github.com/fiki574/dinput8-hook |
 
 Development on this project is AI-assisted: much of the research, code, and
 documentation was produced with **Claude (Anthropic)** (https://claude.com)
