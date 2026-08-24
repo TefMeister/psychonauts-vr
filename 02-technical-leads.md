@@ -23,6 +23,16 @@ deeper pass (read individual posts, not just the index) once we're past the init
 hook and need to touch entity/camera data structures for VR comfort options (e.g. exposing an
 FOV/head-position hook beyond stereo rendering alone).
 
+**Update 2026-08-24 (deeper pass, see notes/59 for full detail):** read the "Making Levels"
+(2024-04-26) post in full. Levels are **PLB** files; meshes split into **meshfrags**; collision
+is an **octree** (8-way, bit-packed nodes, "SSECube" AABB bound). Flagged in notes/59 as a
+plausible shared mechanism with the still-unfound frustum/cull test — worth checking whether the
+octree-walk code collision uses is the *same* function the renderer calls at draw-time. Also
+found via the same pass: Lance McDonald's working debug-menu patch for Steam/GOG (ESC to open),
+which exposes a "Sphere Camera" (no collision, unrestrained) directly useful for isolating
+whether the black-void bug is tied to the normal gameplay camera specifically — see notes/59,
+now the top actionable lead for the void hunt.
+
 ## Helix Mod / 3Dmigoto fix (2013)
 https://helixmod.blogspot.com/2013/05/psychonauts.html
 
