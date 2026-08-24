@@ -623,6 +623,17 @@ static BOOL g_wireframeToggleKeyEnabled = FALSE;
  * so collision wireframe can reveal geometry the renderer decided not to submit. */
 static BOOL g_collisionWireframeToggleKeyEnabled = FALSE;
 #define COLLISION_WIREFRAME_ITEM_ID 22
+/* notes/66: NUMPAD6 one-shot "Collision Spheres" flag toggle - a fresh full decompile of
+ * sub_627590 (angr, this session) recovered the COMPLETE debug-menu item list and settled an
+ * open question: TCRF's "Show Collision" is NOT a real registered item in this exe at all - no
+ * such string/id exists anywhere in the function. The real, closest equivalent is "Collision
+ * Spheres" (id 0x11=17, "Display collision spheres"), registered via the same sub_629410
+ * generic-ID checkbox path as items 117/21/22 (all already proven direct-byte-toggleable) - used
+ * here as the POSITIVE CONTROL notes/65 flagged as needed before trusting Collision Wireframe's
+ * negative void result (that sanity check showed nothing changed even on definitely-present
+ * nearby geometry, so it couldn't be trusted). */
+static BOOL g_collisionSpheresToggleKeyEnabled = FALSE;
+#define COLLISION_SPHERES_ITEM_ID 0x11
 /* notes/65: opt-in WndProc subclass that swallows focus-loss notifications (WM_ACTIVATE/
  * WM_ACTIVATEAPP/WM_NCACTIVATE/WM_KILLFOCUS) before the game's own window procedure sees them -
  * built specifically to defeat the "while you were away, your game was automatically paused"
@@ -1003,6 +1014,13 @@ static void VRBridge_ReadEnableFlag(void)
     if (g_collisionWireframeToggleKeyEnabled)
         LogLine("VRBridge: PSYVR_COLLISION_WIREFRAME_TOGGLE_KEY=1 - NUMPAD7 will flip the "
                 "Collision Wireframe flag (engine+%d+%d)", DEBUG_FLAGS_ARRAY_OFFSET, COLLISION_WIREFRAME_ITEM_ID);
+
+    /* notes/66: NUMPAD6 Collision Spheres flag toggle opt-in (positive-control tool). */
+    len = GetEnvironmentVariableA("PSYVR_COLLISION_SPHERES_TOGGLE_KEY", buf, sizeof(buf));
+    g_collisionSpheresToggleKeyEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_collisionSpheresToggleKeyEnabled)
+        LogLine("VRBridge: PSYVR_COLLISION_SPHERES_TOGGLE_KEY=1 - NUMPAD6 will flip the "
+                "Collision Spheres flag (engine+%d+%d)", DEBUG_FLAGS_ARRAY_OFFSET, COLLISION_SPHERES_ITEM_ID);
 
     /* notes/65: opt-in auto-pause suppression - see Hook_GameWndProc/PatchIATEntry comments. Does
      * BOTH the WndProc message-swallow (cheap, harmless, catches whatever DOES come through as a
@@ -2831,6 +2849,27 @@ void __cdecl CandB_AfterBoth_asm(void)
             }
         }
         s_prevNum7 = num7;
+    }
+
+    /* notes/66: NUMPAD6 - one-shot direct toggle of the "Collision Spheres" debug flag, same
+     * direct-byte-write pattern as NUMPAD7/8/9 above. Opt-in (PSYVR_COLLISION_SPHERES_TOGGLE_KEY=1,
+     * default off). Positive-control tool: proves whether debug-menu visual flags render anything
+     * at all in this PC build before trusting a negative result from any of them. */
+    if (g_collisionSpheresToggleKeyEnabled) {
+        static SHORT s_prevNum6 = 0;
+        SHORT num6 = GetAsyncKeyState(VK_NUMPAD6);
+        if ((num6 & 0x8000) && !(s_prevNum6 & 0x8000)) {
+            void *engine = *(void **)0x78BC20;
+            if (engine) {
+                unsigned char *flag = (unsigned char *)engine + DEBUG_FLAGS_ARRAY_OFFSET + COLLISION_SPHERES_ITEM_ID;
+                *flag = !*flag;
+                LogLine("CollisionSpheresToggle: NUMPAD6 pressed - Collision Spheres flag @ %p (engine+%d) now %d",
+                        flag, DEBUG_FLAGS_ARRAY_OFFSET + COLLISION_SPHERES_ITEM_ID, (int)*flag);
+            } else {
+                LogLine("CollisionSpheresToggle: NUMPAD6 pressed but engine=*(void**)0x78BC20 is NULL, skipped");
+            }
+        }
+        s_prevNum6 = num6;
     }
 
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }

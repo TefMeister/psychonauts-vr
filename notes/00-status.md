@@ -1,5 +1,18 @@
 # Psychonauts VR — Status
 
+Last updated: 2026-08-24 later still (session 66: settled the positive-control question notes/65
+raised. Fresh full decompile of the debug-menu registration function proved "Show Collision" isn't
+a real item at all (TCRF/notes/59 was wrong about this exe); tested its closest real equivalent
+"Collision Spheres" (id 17) plus, as a last attempt, the structurally-different "Show Skel" (id 23)
+— both confirmed writing to the correct memory address, both show ZERO visible effect against
+Raz's own body and clearly-visible terrain. Four debug-menu visual toggles now (Render Wireframe,
+Collision Wireframe, Collision Spheres, Show Skel), zero visible effect from any of them — the
+debug menu's visual/display system is convergently confirmed non-functional on this PC build,
+matching TCRF's own caveat. This avenue is exhausted; recommend the home-PC in-headset test as the
+strongest remaining path. Full detail in notes/66.
+
+## Prior header (session 65: auto-pause blocker fixed, Collision Wireframe inconclusive)
+
 Last updated: 2026-08-24 later still (session 65: fixed the auto-pause blocker for real via a
 `GetForegroundWindow` IAT patch; wired + tested Collision Wireframe (item 22) — clean negative
 result, with an honest caveat about whether the debug visualization even renders anything in this
