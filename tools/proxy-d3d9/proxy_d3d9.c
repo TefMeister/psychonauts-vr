@@ -285,6 +285,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <ctype.h>
 #include "../vr-bridge/openvr-sdk/headers/openvr_capi.h"
 /* Do NOT include <stdbool.h> - openvr_capi.h typedefs its own bool as char on Windows, which
  * collides with <stdbool.h>'s #define bool _Bool if both are included in the same translation
@@ -615,6 +616,97 @@ static BOOL g_cullToggleKeyEnabled = FALSE;
  * world is loaded there and it's a lighting/visibility read, not a missing-geometry gap. */
 static BOOL g_wireframeToggleKeyEnabled = FALSE;
 #define RENDER_WIREFRAME_ITEM_ID 21
+/* notes/65: NUMPAD7 one-shot "Collision Wireframe" flag toggle - same direct-byte-write pattern,
+ * item id 22 confirmed in the same sub_627590 decompile as item 21 above (notes/64). This is the
+ * theoretically CORRECT tool for the real-gap-vs-dark-terrain question (notes/59's original
+ * recommendation): collision queries typically run independent of render-time visibility culling,
+ * so collision wireframe can reveal geometry the renderer decided not to submit. */
+static BOOL g_collisionWireframeToggleKeyEnabled = FALSE;
+#define COLLISION_WIREFRAME_ITEM_ID 22
+/* notes/65: opt-in WndProc subclass that swallows focus-loss notifications (WM_ACTIVATE/
+ * WM_ACTIVATEAPP/WM_NCACTIVATE/WM_KILLFOCUS) before the game's own window procedure sees them -
+ * built specifically to defeat the "while you were away, your game was automatically paused"
+ * dialog that has now blocked live testing in notes/60 and notes/64 (five prior focus-recovery
+ * techniques all failed: SetForegroundWindow retry, AttachThreadInput, a coordinate-verified mouse
+ * click, minimize/restore, SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT) - ACCESS_DENIED).
+ * Different approach: rather than fighting to regain real OS focus, prevent the game from ever
+ * finding out it lost focus in the first place - our own GetAsyncKeyState-based hotkeys (F12/
+ * NUMPAD7/8/9) already don't need real focus (they poll global key state), so if the game itself
+ * never sees a deactivate message, its own auto-pause logic (whatever internal check triggers the
+ * dialog) should simply never fire. */
+static BOOL g_suppressAutoPause = FALSE;
+static HWND g_gameHwnd = NULL;
+static WNDPROC g_origWndProc = NULL;
+
+/* notes/65 part 2: the WndProc message-swallow above only ever caught ONE spurious message across
+ * a full failing run (see the live log) - i.e. the "while you were away" auto-pause is NOT purely
+ * reactive to window messages. Far more likely: the game polls GetForegroundWindow() (or an
+ * equivalent) directly, once per tick, and compares it against its own hwnd - a common "auto-pause
+ * when not the real foreground app" pattern that no message-suppression can catch. Real fix: IAT-
+ * patch user32.dll!GetForegroundWindow in the game exe's own import table so every call the game
+ * makes to it returns the game's own hwnd unconditionally, regardless of real OS focus state. */
+static HWND WINAPI Hook_GetForegroundWindow(void)
+{
+    return g_gameHwnd ? g_gameHwnd : GetForegroundWindow();
+}
+
+/* Walks the running exe's PE import directory, finds the IAT slot for
+ * <dllNameLower>!<funcName>, and overwrites it with hookFunc. Returns TRUE on success. General-
+ * purpose (unlike MakeTrampoline/PatchJump, which byte-patch a function's own prologue and assume
+ * this project's known x86 codegen patterns) - this only ever touches one pointer in a table we
+ * already know the exact layout of, so it works regardless of the target function's own code. */
+static BOOL PatchIATEntry(const char *dllNameLower, const char *funcName, void *hookFunc)
+{
+    HMODULE exe = GetModuleHandleA(NULL);
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)exe;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE *)exe + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
+    IMAGE_DATA_DIRECTORY impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (impDir.VirtualAddress == 0) return FALSE;
+    PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE *)exe + impDir.VirtualAddress);
+    for (; imp->Name != 0; imp++) {
+        const char *modName = (const char *)((BYTE *)exe + imp->Name);
+        char modNameLower[64]; int i;
+        for (i = 0; modName[i] && i < 63; i++) modNameLower[i] = (char)tolower((unsigned char)modName[i]);
+        modNameLower[i] = '\0';
+        if (strcmp(modNameLower, dllNameLower) != 0) continue;
+
+        PIMAGE_THUNK_DATA thunkOrig = (PIMAGE_THUNK_DATA)((BYTE *)exe + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        PIMAGE_THUNK_DATA thunkIAT  = (PIMAGE_THUNK_DATA)((BYTE *)exe + imp->FirstThunk);
+        for (; thunkOrig->u1.AddressOfData != 0; thunkOrig++, thunkIAT++) {
+            if (IMAGE_SNAP_BY_ORDINAL(thunkOrig->u1.Ordinal)) continue;
+            PIMAGE_IMPORT_BY_NAME byName = (PIMAGE_IMPORT_BY_NAME)((BYTE *)exe + thunkOrig->u1.AddressOfData);
+            if (strcmp((const char *)byName->Name, funcName) != 0) continue;
+
+            DWORD oldProtect;
+            if (!VirtualProtect(&thunkIAT->u1.Function, sizeof(void *), PAGE_READWRITE, &oldProtect))
+                return FALSE;
+            thunkIAT->u1.Function = (ULONG_PTR)hookFunc;
+            VirtualProtect(&thunkIAT->u1.Function, sizeof(void *), oldProtect, &oldProtect);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static LRESULT CALLBACK Hook_GameWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_ACTIVATEAPP || msg == WM_ACTIVATE || msg == WM_NCACTIVATE || msg == WM_KILLFOCUS) {
+        static DWORD s_lastLog = 0;
+        DWORD now = GetTickCount();
+        if (now - s_lastLog > 2000) {
+            LogLine("AutoPauseSuppress: swallowed msg=0x%X wParam=0x%p (not forwarded to game WndProc)",
+                    msg, (void *)wParam);
+            s_lastLog = now;
+        }
+        /* WM_NCACTIVATE's return value affects the non-client area's drawn active/inactive state;
+         * returning TRUE keeps it drawn as active regardless of real focus. The others are
+         * notifications, not queries - any return value is fine, the point is not forwarding them. */
+        return (msg == WM_NCACTIVATE) ? TRUE : 0;
+    }
+    return CallWindowProcA(g_origWndProc, hWnd, msg, wParam, lParam);
+}
 /* notes/52: isolated empirical test for the head-tracking composition order (playbook-style
  * instrument-before-assuming, after shader disassembly ruled out a WVP-convention bug). */
 static float g_htTestShift = 0.0f;   /* PSYVR_HT_TEST_SHIFT: raw world-unit Z shift injected into T */
@@ -904,6 +996,27 @@ static void VRBridge_ReadEnableFlag(void)
     if (g_wireframeToggleKeyEnabled)
         LogLine("VRBridge: PSYVR_WIREFRAME_TOGGLE_KEY=1 - NUMPAD8 will flip the Render "
                 "Wireframe flag (engine+%d+%d)", DEBUG_FLAGS_ARRAY_OFFSET, RENDER_WIREFRAME_ITEM_ID);
+
+    /* notes/65: NUMPAD7 Collision Wireframe flag toggle opt-in. */
+    len = GetEnvironmentVariableA("PSYVR_COLLISION_WIREFRAME_TOGGLE_KEY", buf, sizeof(buf));
+    g_collisionWireframeToggleKeyEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_collisionWireframeToggleKeyEnabled)
+        LogLine("VRBridge: PSYVR_COLLISION_WIREFRAME_TOGGLE_KEY=1 - NUMPAD7 will flip the "
+                "Collision Wireframe flag (engine+%d+%d)", DEBUG_FLAGS_ARRAY_OFFSET, COLLISION_WIREFRAME_ITEM_ID);
+
+    /* notes/65: opt-in auto-pause suppression - see Hook_GameWndProc/PatchIATEntry comments. Does
+     * BOTH the WndProc message-swallow (cheap, harmless, catches whatever DOES come through as a
+     * message) AND the GetForegroundWindow IAT patch (the fix that actually matters, per this
+     * session's live evidence that the pause survived with only one spurious message ever
+     * swallowed - so it's very likely a per-tick poll, not message-driven). */
+    len = GetEnvironmentVariableA("PSYVR_SUPPRESS_AUTOPAUSE", buf, sizeof(buf));
+    g_suppressAutoPause = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_suppressAutoPause) {
+        LogLine("VRBridge: PSYVR_SUPPRESS_AUTOPAUSE=1 - will subclass the game window to swallow "
+                "focus-loss messages once CreateDevice provides a window handle");
+        BOOL iatOk = PatchIATEntry("user32.dll", "GetForegroundWindow", (void *)Hook_GetForegroundWindow);
+        LogLine("AutoPauseSuppress: GetForegroundWindow IAT patch %s", iatOk ? "OK" : "FAILED (entry not found)");
+    }
 
     len = GetEnvironmentVariableA("PSYVR_HT_TEST_SHIFT", buf, sizeof(buf));
     if (len > 0 && len < sizeof(buf)) g_htTestShift = (float)atof(buf);
@@ -2699,6 +2812,27 @@ void __cdecl CandB_AfterBoth_asm(void)
         s_prevNum8 = num8;
     }
 
+    /* notes/65: NUMPAD7 - one-shot direct toggle of the "Collision Wireframe" debug flag, same
+     * direct-byte-write pattern as NUMPAD8/9 above. Opt-in (PSYVR_COLLISION_WIREFRAME_TOGGLE_KEY=1,
+     * default off). This is the theoretically-correct tool for the real-gap-vs-dark-terrain test -
+     * see the constant's comment. */
+    if (g_collisionWireframeToggleKeyEnabled) {
+        static SHORT s_prevNum7 = 0;
+        SHORT num7 = GetAsyncKeyState(VK_NUMPAD7);
+        if ((num7 & 0x8000) && !(s_prevNum7 & 0x8000)) {
+            void *engine = *(void **)0x78BC20;
+            if (engine) {
+                unsigned char *flag = (unsigned char *)engine + DEBUG_FLAGS_ARRAY_OFFSET + COLLISION_WIREFRAME_ITEM_ID;
+                *flag = !*flag;
+                LogLine("CollisionWireframeToggle: NUMPAD7 pressed - Collision Wireframe flag @ %p (engine+%d) now %d",
+                        flag, DEBUG_FLAGS_ARRAY_OFFSET + COLLISION_WIREFRAME_ITEM_ID, (int)*flag);
+            } else {
+                LogLine("CollisionWireframeToggle: NUMPAD7 pressed but engine=*(void**)0x78BC20 is NULL, skipped");
+            }
+        }
+        s_prevNum7 = num7;
+    }
+
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }
     g_stereoPhase = STEREO_PHASE_IDLE;
     UIShift_ReconcileFwd(); /* notes/36: phase idle - removes any applied UI shift */
@@ -4299,6 +4433,17 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(
         InstallSetVSConstFHook(*ppReturnedDeviceInterface);
         if (pPresentationParameters) {
             SetupStereoSurfaces(*ppReturnedDeviceInterface, pPresentationParameters);
+        }
+
+        /* notes/65: capture the game's real window handle and, if PSYVR_SUPPRESS_AUTOPAUSE=1,
+         * subclass it so focus-loss messages never reach the game's own WndProc - see
+         * Hook_GameWndProc's comment for why. */
+        g_gameHwnd = hFocusWindow ? hFocusWindow
+                     : (pPresentationParameters ? pPresentationParameters->hDeviceWindow : NULL);
+        if (g_suppressAutoPause && g_gameHwnd && !g_origWndProc) {
+            g_origWndProc = (WNDPROC)SetWindowLongPtrA(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)Hook_GameWndProc);
+            LogLine("AutoPauseSuppress: subclassed game window %p, orig WndProc=%p",
+                    (void *)g_gameHwnd, (void *)g_origWndProc);
         }
     }
 
