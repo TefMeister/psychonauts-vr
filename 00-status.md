@@ -1,6 +1,31 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 final (session 63: void-behind-player bug — **the live A/B test is done**.
+Last updated: 2026-08-24 later (session 64: built the "Render Wireframe" toggle notes/63 called
+for, but caught a methodology mistake before trusting a result from it, and hit a severe,
+still-unresolved auto-pause/focus blocker that prevented any live comparison this session).
+
+**Session 64 summary**: found + wired a second debug-menu flag toggle (NUMPAD8 = "Render
+Wireframe", item id 21, same direct-byte-write mechanism as notes/62's Visibility Tree Culling
+toggle) — confirmed working via the log. **But realized before drawing any conclusion from it that
+render-fill-mode wireframe can't actually distinguish "real geometry, just dark" from "genuinely
+absent"** — it only changes how already-issued draw calls rasterize, not whether culled geometry
+gets submitted at all. The theoretically correct tool is **"Collision Wireframe" (item id 22, found
+but not yet wired)** — collision queries typically run independent of render-time visibility
+culling, so it could show geometry the render pipeline culled. Full reasoning in dev-archive
+notes/64.
+
+**Also hit a much worse version of the auto-pause problem than notes/60 saw**: the "while you were
+away" dialog now reappears within single-digit seconds of nearly every level load, not after AFK
+time. **Five different focus/foreground techniques have now failed across two sessions**
+(SetForegroundWindow retry loop, AttachThreadInput, a screen-coordinate-verified direct mouse
+click, minimize/restore, Alt+Tab, and a new `SystemParametersInfo` attempt that hit
+ACCESS_DENIED). This looks like a real structural constraint rather than a technique gap, and has
+now blocked 2 of the last 3 sessions' actual empirical goals — likely worth a dedicated session of
+its own. Full detail, including untried ideas, in dev-archive notes/64.
+
+No save files touched, no code shipped beyond the new opt-in NUMPAD8 hotkey (default off).
+
+## Prior header (session 63: void-behind-player bug — **the live A/B test is done**.
 Disabling Visibility Tree Culling does NOT remove the black void. Clean negative result, with a
 serious caveat about what the void even is — see below).
 
