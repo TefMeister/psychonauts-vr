@@ -1,39 +1,40 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 latest (session 62: void-behind-player bug — decompiled the debug menu's
-toggle handler, confirmed "Visibility Tree Culling" resolves to one directly-flippable byte, built
-and live-verified a zero-UI NUMPAD9 hotkey for it; the live disappears-vs-persists screenshot test
-itself still not reached, blocked by scene-navigation issues unrelated to the toggle).
+Last updated: 2026-08-24 final (session 63: void-behind-player bug — **the live A/B test is done**.
+Disabling Visibility Tree Culling does NOT remove the black void. Clean negative result, with a
+serious caveat about what the void even is — see below).
 
-**The Visibility Tree Culling flag is now a proven, working, zero-UI toggle**: `sub_629490`
-(the debug menu's checkbox-sync handler) decompiled cleanly to `flag = *(void**)0x78BC20 + 44 + 117`
-(one byte) for this specific item — confirmed correct against the live engine object in the log
-(`Visibility Tree Culling flag @ 02E59201 (engine+161) now 0`, matching `engine_ptr(02E59160)+0xA1`
-exactly). NUMPAD9 (`PSYVR_CULL_TOGGLE_KEY=1`) flips it directly, no menu/UI navigation needed at all.
+**Direct answer to the question this whole investigation has been chasing**: toggling the
+Visibility Tree Culling flag off (NUMPAD9, confirmed in the log) does **not** change the black
+region seen when looking behind the player via simulated head-yaw. Matched-phase screenshots with
+the flag ON vs. OFF are near pixel-identical (`notes/assets/63-void-ab-test/tp5...` vs `off1...`,
+and `tp4...` vs `off4...` in the dev-archive repo). Full writeup, methodology, and images in
+dev-archive notes/63.
 
-**Real, important lesson learned the hard way**: the Journal/pause menu's **"Continue" loads the most
-recent SAVE FILE, not the current session** — accidentally selecting it after F12's level-jump
-silently discarded the fresh level load and dropped into a locked-camera cutscene autosave instead.
-Fix: after F12, never navigate the pause/journal menu; dismiss only via raw `SendInput` (no
-`SetForegroundWindow` calls, which appear to be what triggers the focus-loss auto-pause that leads
-into that menu in the first place).
+**Important caveat uncovered in the same session**: the smoother of the two black shapes closely
+matches the silhouette of a real, unlit rock/cliff face visible from other angles in the same test
+area (`off6_rockformation_context.png`) — a third-person camera swung ±170° by sway is very likely to
+point straight at nearby terrain the normal camera never aims at, which would render near-black in
+silhouette against bright sky for entirely mundane reasons (no missing geometry involved). **The
+octree/Visibility-Tree-Culling hypothesis this investigation has pursued since notes/59 may be
+chasing the wrong mechanism, or at least this specific flag isn't gating whatever the real cause is.**
+Next session's cleanest path: use the debug menu's other flags (notes/61) to try wireframe/unlit-flat
+rendering at the same test phase — that would distinguish "real gap" (stays black regardless) from
+"backlit terrain" (shows up as flat-shaded geometry) cleanly, without needing camera-angle guesswork.
 
-**The actual live A/B test (does the void disappear when the flag is off?) was not completed this
-session** — not a toggle problem, a scene problem: `CAJA`'s spawn point sits next to a
-hard-to-escape NPC dialogue trigger, and an unplanned scene transition (likely triggered by an
-escape-attempt movement input) landed in a different area where the logged camera `right` vector
-stayed completely frozen for 8+ seconds despite active fake-pose head-yaw — meaning head-tracking
-wasn't visibly rotating that scene's camera at all, making "no void seen" uninformative there. No
-save files were modified or needed deleting (the user pre-authorized deleting the mid-cutscene
-autosave if needed; the successful run avoided the Continue-trap entirely, so it wasn't necessary).
-Full detail in notes/62.
+**Also found and fixed this session: a hidden gap in the test methodology itself.** Fake-pose head-yaw
+sway (`PSYVR_FAKE_POSE`) only actually renders on the monitor-preview path when `PSYVR_FIRST_PERSON=1`
+is ALSO set (`proxy_d3d9.c` ~line 3593 gates the call). This was never set in notes/59-62 — meaning
+**no session before this one was ever actually testing live head-tracking rotation**; apparent
+"camera differences" earlier were just normal third-person gameplay motion. The `BVM cache SET` log
+line's `right` vector (used in notes/62 as a rotation sanity-check) is *also* not valid for this
+purpose — it logs the game's unmodified base camera, not our per-draw overlay rotation, and stayed
+frozen even in captures that visibly did rotate on screen this session. Judge rotation from the
+actual rendered frame only, never that log line.
 
-**Next session, in priority order**: (1) find a spawn/test location without an immediate NPC
-trigger (try other `CA*` Campgrounds codes, or find a way to suppress NPC dialogue triggers); (2)
-confirm the camera `right`/`eye` vector is actually changing frame-to-frame in the log before
-trusting any "no void" reading there — a frozen camera and a working disabled-cull flag look
-identical in a screenshot for very different reasons; (3) once both hold, the test itself is one
-keypress (NUMPAD9) and a before/after screenshot comparison — the hard infrastructure work is done.
+**No save files were touched this session** (test used only F12, NUMPAD9, and one raw ENTER to
+dismiss an auto-pause dialog — no Journal/save-menu navigation at all, avoiding the notes/62 trap
+entirely). No new DLL build was needed — notes/62's toggle build was reused as-is.
 
 ## Prior header (session 61: void-behind-player bug — following a parallel
 session's public-research lead, located Psychonauts' dormant developer debug menu in our own exe and
