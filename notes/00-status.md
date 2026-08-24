@@ -1,6 +1,29 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 later (session 64: built the "Render Wireframe" toggle notes/63 called
+Last updated: 2026-08-24 later still (session 65: fixed the auto-pause blocker for real via a
+`GetForegroundWindow` IAT patch; wired + tested Collision Wireframe (item 22) — clean negative
+result, with an honest caveat about whether the debug visualization even renders anything in this
+build. Full detail in notes/65.
+
+**Session 65 summary**: Session 64's auto-pause/focus blocker is now FIXED. Root cause: the pause
+is very likely a per-tick `GetForegroundWindow()` poll, not a reactive window message (a WndProc
+message-swallow fix worked once then failed, logging almost no suppressed messages — the tell).
+Real fix: `PatchIATEntry()`, a new general-purpose IAT-patching helper, redirects the exe's own
+`user32.dll!GetForegroundWindow` import to always return the game's own hwnd. Confirmed clean across
+two full relaunch cycles, 20-30+ seconds of continuous gameplay each, zero pause dialogs. Wired
+`COLLISION_WIREFRAME_ITEM_ID 22` (NUMPAD7, same pattern as notes/62/64, confirmed at `engine+66`)
+and ran the matched-phase A/B notes/64 called for: **the void stays completely black with Collision
+Wireframe on, no lines, no difference from the baseline.** But a sanity check on definitely-present
+geometry (fence/rocks/plants) ALSO showed no visible wireframe overlay either way — so this result
+is a clean negative, not a fully conclusive one; it's consistent with "no collision geometry there
+either" but equally consistent with "this debug option doesn't render anything in this build; TCRF
+flagged some options as broken on PC. Next step: find a debug-menu option with a CONFIRMED-working
+positive control (Show Collision was TCRF's specific "still works" call-out) before trusting any
+more of these visualizations. Full reasoning + 4 evidence screenshots in notes/65.
+
+## Prior header (session 64)
+
+(Last updated: 2026-08-24 later (session 64: built the "Render Wireframe" toggle notes/63 called
 for, but caught a methodology mistake before trusting a result from it — see below — and hit a
 severe, still-unresolved auto-pause/focus blocker that prevented any live comparison this session).
 
@@ -12,7 +35,7 @@ absent"**, since it only changes how already-issued draw calls rasterize, not wh
 geometry gets submitted at all. The theoretically correct tool is **"Collision Wireframe" (item id
 22, found in the same decompile, not yet wired)** — collision queries typically run independent of
 render-time visibility culling, so it could actually show geometry the render pipeline culled. Full
-reasoning in notes/64.
+reasoning in notes/64.)
 
 **Also hit a much worse version of the auto-pause problem than notes/60 saw**: the "while you were
 away" dialog now reappears within single-digit seconds of nearly every level load, not after AFK
