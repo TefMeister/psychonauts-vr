@@ -1,8 +1,43 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-20 late evening (session 55-58: PURE STATIC RESEARCH per user request -
-"learn what you can without running the game" - zero game execution the whole session, only
-offline disassembly + filesystem/string inspection of the exe/data on disk).
+Last updated: 2026-08-24 (session 59: void-behind-player bug — closed out the multi-session CPU-side
+cull-test hunt (live x64dbg + angr decompile) with a real, if partial, answer; then built + tested
+candidate 3, the FOV_SCALE widen stopgap, monitor-only).
+
+**Cull-test hunt closed (for now) with a real finding, not the target mechanism.** Traced both
+per-frame `BuildViewMatrix` call sites: "Site B" (`exe+0x67F296`) turns out to be the world-space
+icon/HUD-marker overlay renderer, not the main scene — a dead end two sessions were spent on before
+recognizing it. "Site A" (`exe+0x512C9B`) sits inside **`CandB`** (`exe+0x4FEDA0`), the very function
+this mod's own `Hook_CandB` already calls twice per frame for stereo — and decompiling it shows
+**CandB is the camera's own entity-update tick, not a renderer**, protected by a critical section +
+a reentrancy guard that makes the mod's second per-eye invocation take a harmless short-circuit path
+instead of re-running game logic. **This resolves notes/10 §5's long-open "does double-calling
+double-advance game logic" question** (answer: not for CandB specifically, thanks to its own guard —
+not a general engine guarantee). The actual cull/frustum test itself (or an alternative like a
+room/portal-active flag) is still **not located** after four sessions of RE effort; paused per user
+direction rather than continuing to sink RE time into it. Full detail in notes/59.
+
+**Candidate 3 (widen `PSYVR_FOV_SCALE`) implemented and built, but the monitor test was
+inconclusive** — not because the fix doesn't work, but because the only reachable test scene (the
+title/menu screen) is a densely enclosing decorative background that never shows the void at any
+tested scale (1.8 or 2.5). Real outdoor gameplay is needed to test this properly, and automated entry
+into it is still blocked by the same door-timing unreliability flagged in session 54. Code changes
+(FOV_SCALE ceiling raised 2.5→4.0, new `PSYVR_FAKE_POSE_YAW_DEG` test knob) are built and deployed to
+the game directory (old build backed up alongside, clearly labeled) as working infrastructure for
+whoever solves gameplay entry next, or for direct home-PC in-headset testing. **Shipped default left
+at 1.8** — no real evidence yet to justify changing it. Full detail in notes/59.
+
+**Next, in priority order:** (1) either fix automated gameplay entry (the untested `SetPendingLevel`
+Lua-free level-jump from notes/55 is the leading candidate — sidesteps the door-timing problem
+entirely) and rerun the FOV_SCALE A/B in a real level, or hand this straight to the user for a
+home-PC in-headset A/B, which trivially reproduces the bug; (2) if FOV_SCALE alone proves
+insufficient at a real void-baseline, resume the cull-test hunt with a different entry point than
+either BuildViewMatrix site (e.g. start from a live-resolved `DrawIndexedPrimitive` breakpoint on
+real world geometry, not the title screen, and walk upward from there).
+
+## Prior header (session 55-58: PURE STATIC RESEARCH per user request - "learn what you can without
+running the game" - zero game execution the whole session, only offline disassembly +
+filesystem/string inspection of the exe/data on disk).
 
 **BIGGEST FINDING: the Lua exec primitive appears to be a single function call, not a multi-session
 lift as notes/52 concluded.** `0x6B0C00(L, buf, len, chunkname_or_NULL)` was fully traced (notes/57)
