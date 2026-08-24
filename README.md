@@ -1,4 +1,4 @@
-# psychonauts-vr-research
+# psychonauts-vr-external-research
 
 Ongoing **public research** findings for the Psychonauts VR mod — leads, prior art, and technique write-ups gathered from publicly available sources (blogs, forums, existing tools, documentation), kept **separate from hands-on modding work**.
 
@@ -7,7 +7,7 @@ This repo exists so a dedicated research-only session can run *at the same time*
 ## The six repositories for Psychonauts VR
 
 Everything for this game lives in six repositories, each with one job — so you
-always know where to look. You are in **psychonauts-vr-research**.
+always know where to look. You are in **psychonauts-vr-external-research**.
 
 | Repository | What lives here |
 | --- | --- |
@@ -16,7 +16,7 @@ always know where to look. You are in **psychonauts-vr-research**.
 | [psychonauts-vr-modding-notes](https://github.com/TefMeister/psychonauts-vr-modding-notes) | Readable field notes / progress ledger. |
 | [psychonauts-vr-staging](https://github.com/TefMeister/psychonauts-vr-staging) 🔒 | **Private** — unverified WIP builds, cross-machine handoff. |
 | [psychonauts-vr-engine-research](https://github.com/TefMeister/psychonauts-vr-engine-research) | Distilled engine reference (dossier) + reusable VR RE playbook. |
-| **psychonauts-vr-research** ← you are here | Ongoing public-research leads — read-only input to the other five, never the other way around. |
+| **psychonauts-vr-external-research** ← you are here | Ongoing public-research leads — read-only input to the other five, never the other way around. |
 
 ## How this repo is used
 
