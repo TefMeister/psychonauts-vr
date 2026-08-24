@@ -1,5 +1,18 @@
 # Psychonauts VR — Status
 
+Last updated: 2026-08-24 later still (session 66: the debug-menu-visualization avenue is now
+CLOSED OUT. "Show Collision" turned out not to be a real menu item (a fresh full decompile of the
+registration function proved it); tested its real equivalent "Collision Spheres" plus a
+structurally different item "Show Skel" as final positive-control attempts — both confirmed
+writing correctly, both show zero visible effect on Raz's own body and clearly-visible terrain.
+That's 4 different debug-menu visual toggles tested across two sessions, 4/4 showing no visible
+effect at all — convergent evidence the whole debug-menu display/rendering system doesn't work on
+this PC build (matches a caveat on TCRF's own page), not a per-item fluke. **Recommendation: stop
+spending dev-PC sessions on this menu's visual toggles — the home-PC in-headset test is now the
+strongest remaining path for the void investigation.** Full detail in notes/66.
+
+## Prior header (session 65: auto-pause blocker fixed, Collision Wireframe inconclusive)
+
 Last updated: 2026-08-24 later still (session 65: the auto-pause blocker is FIXED; Collision
 Wireframe tested — clean negative result, but with an honest caveat).
 
