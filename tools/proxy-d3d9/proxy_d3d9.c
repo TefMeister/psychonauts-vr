@@ -585,6 +585,9 @@ static BOOL g_vrSkipPumpEye = FALSE;
  * never moves). */
 static BOOL g_trackingDisabled = FALSE;
 static BOOL g_fakePose = FALSE;
+/* notes/59: PSYVR_FAKE_POSE_YAW_DEG override for the fake-pose sway's yaw amplitude - see the
+ * comment at its use site. Default matches the original hardcoded 0.44rad (~25.2deg). */
+static float g_fakePoseYawAmpRad = 0.44f;
 /* notes/52: isolated empirical test for the head-tracking composition order (playbook-style
  * instrument-before-assuming, after shader disassembly ruled out a WVP-convention bug). */
 static float g_htTestShift = 0.0f;   /* PSYVR_HT_TEST_SHIFT: raw world-unit Z shift injected into T */
@@ -836,6 +839,17 @@ static void VRBridge_ReadEnableFlag(void)
     g_trackingDisabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
     len = GetEnvironmentVariableA("PSYVR_FAKE_POSE", buf, sizeof(buf));
     g_fakePose = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    /* notes/59: fake-pose yaw amplitude override, degrees, 0..175 (stay short of 180 - the sin/cos
+     * construction is well-defined there but a full flip is not a meaningful "look behind" test). */
+    len = GetEnvironmentVariableA("PSYVR_FAKE_POSE_YAW_DEG", buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf)) {
+        float degv = 0.0f;
+        if (sscanf(buf, "%f", &degv) == 1 && degv >= 0.0f && degv <= 175.0f)
+            g_fakePoseYawAmpRad = degv * 0.017453293f;
+    }
+    if (g_fakePose)
+        LogLine("VRBridge: fake-pose yaw amplitude = %.1f deg (PSYVR_FAKE_POSE_YAW_DEG, default 25.2)",
+                g_fakePoseYawAmpRad * 57.29578f);
     len = GetEnvironmentVariableA("PSYVR_HT_TEST_SHIFT", buf, sizeof(buf));
     if (len > 0 && len < sizeof(buf)) g_htTestShift = (float)atof(buf);
     len = GetEnvironmentVariableA("PSYVR_HT_DEBUG", buf, sizeof(buf));
@@ -923,13 +937,18 @@ static void VRBridge_ReadEnableFlag(void)
         LogLine("VRBridge: UI depth = %.0f world units (PSYVR_UI_DEPTH; 0 = UI stays at infinity)", g_uiDepthWorld);
 
         /* notes/37: FOV multiplier, clamped to a sane range. 1.0 = untouched. */
+        /* notes/59: ceiling temporarily raised 2.5->4.0 to test candidate-3 (widen the cull/render
+         * margin further) against the void-behind-player bug, per notes/40's mitigation #3 - this
+         * is exploratory headroom for that specific test, not a claim that values this high are a
+         * good shipping default (see notes/59 for the GPU-cost tradeoff and actual measured result). */
         len = GetEnvironmentVariableA("PSYVR_FOV_SCALE", dbuf, sizeof(dbuf));
         if (len > 0 && len < sizeof(dbuf)) {
             float v = 0.0f;
-            if (sscanf(dbuf, "%f", &v) == 1 && v >= 0.5f && v <= 2.5f)
+            if (sscanf(dbuf, "%f", &v) == 1 && v >= 0.5f && v <= 4.0f)
                 g_fovScaleAsm = v;
         }
-        LogLine("VRBridge: FOV scale = %.2f (PSYVR_FOV_SCALE, 0.5..2.5; 1.0 = game default)", g_fovScaleAsm);
+        LogLine("VRBridge: FOV scale = %.2f (PSYVR_FOV_SCALE, 0.5..4.0 - ceiling raised from 2.5 "
+                "for notes/59's void-test headroom; 1.0 = game default)", g_fovScaleAsm);
 
         /* notes/43: EXPERIMENTAL per-draw UI viewport shrink, OFF by default (1.0). The notes/42
          * auto-shrink idea failed live: the game's fullscreen overlays (fades, pause/menu
@@ -1943,10 +1962,14 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
     }
 
     if (g_fakePose) {
-        /* Synthesized gentle sway (~±25° yaw, ~±8° pitch, ±6cm lateral) - makes the tracking
-         * path visible on a monitor even though the null driver's real pose never moves. */
+        /* Synthesized gentle sway (~±25° yaw by default, ~±8° pitch, ±6cm lateral) - makes the
+         * tracking path visible on a monitor even though the null driver's real pose never moves.
+         * notes/59: yaw amplitude is now overridable (PSYVR_FAKE_POSE_YAW_DEG, read once at
+         * startup into g_fakePoseYawAmpRad) so an off-axis void test can sweep well past the
+         * default gentle sway without a separate test harness - default behavior (0.44rad~=25deg)
+         * is unchanged when unset. */
         float t = (float)GetTickCount() * 0.001f;
-        float yaw = 0.44f * sinf(t * 0.5f), pitch = 0.14f * sinf(t * 0.33f);
+        float yaw = g_fakePoseYawAmpRad * sinf(t * 0.5f), pitch = 0.14f * sinf(t * 0.33f);
         float cy = cosf(yaw), sy = sinf(yaw), cp = cosf(pitch), sp = sinf(pitch);
         float ry[16], rx[16];
         Mat4Identity(ry); ry[0] = cy; ry[2] = -sy; ry[8] = sy; ry[10] = cy;      /* RotY, row-vector */
