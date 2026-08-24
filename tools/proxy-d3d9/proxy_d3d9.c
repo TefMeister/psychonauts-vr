@@ -588,6 +588,13 @@ static BOOL g_fakePose = FALSE;
 /* notes/59: PSYVR_FAKE_POSE_YAW_DEG override for the fake-pose sway's yaw amplitude - see the
  * comment at its use site. Default matches the original hardcoded 0.44rad (~25.2deg). */
 static float g_fakePoseYawAmpRad = 0.44f;
+/* notes/59 part 2: F12 one-shot level jump (see CandB_AfterBoth_asm). g_levelJumpCode defaults to
+ * CAJA (Sasha's Lab) - the one notes/55 confirmed via a literal loading-screen string match
+ * ("CAJA_sashalab_load.dds"), the safest bet for actually being a real loadable level. Override
+ * with PSYVR_LEVEL_JUMP_CODE for a different one (e.g. an outdoor CA* Campgrounds sub-area, once
+ * this mechanism itself is proven). */
+static BOOL g_levelJumpKeyEnabled = FALSE;
+static char g_levelJumpCode[64] = "workresource\\levels\\CAJA.plb";
 /* notes/52: isolated empirical test for the head-tracking composition order (playbook-style
  * instrument-before-assuming, after shader disassembly ruled out a WVP-convention bug). */
 static float g_htTestShift = 0.0f;   /* PSYVR_HT_TEST_SHIFT: raw world-unit Z shift injected into T */
@@ -850,6 +857,19 @@ static void VRBridge_ReadEnableFlag(void)
     if (g_fakePose)
         LogLine("VRBridge: fake-pose yaw amplitude = %.1f deg (PSYVR_FAKE_POSE_YAW_DEG, default 25.2)",
                 g_fakePoseYawAmpRad * 57.29578f);
+
+    /* notes/59 part 2: F12 level-jump opt-in + optional level-code override. */
+    len = GetEnvironmentVariableA("PSYVR_LEVEL_JUMP_KEY", buf, sizeof(buf));
+    g_levelJumpKeyEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_levelJumpKeyEnabled) {
+        char codeBuf[32];
+        len = GetEnvironmentVariableA("PSYVR_LEVEL_JUMP_CODE", codeBuf, sizeof(codeBuf));
+        if (len > 0 && len < sizeof(codeBuf)) {
+            _snprintf(g_levelJumpCode, sizeof(g_levelJumpCode), "workresource\\levels\\%s.plb", codeBuf);
+            g_levelJumpCode[sizeof(g_levelJumpCode) - 1] = '\0';
+        }
+        LogLine("VRBridge: PSYVR_LEVEL_JUMP_KEY=1 - F12 will call SetPendingLevel(\"%s\")", g_levelJumpCode);
+    }
     len = GetEnvironmentVariableA("PSYVR_HT_TEST_SHIFT", buf, sizeof(buf));
     if (len > 0 && len < sizeof(buf)) g_htTestShift = (float)atof(buf);
     len = GetEnvironmentVariableA("PSYVR_HT_DEBUG", buf, sizeof(buf));
@@ -2583,6 +2603,25 @@ void __cdecl CandB_BeforeEye2_asm(void)
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
 void __cdecl CandB_AfterBoth_asm(void)
 {
+    /* notes/59 part 2: F12 - one-shot Lua-free level jump (notes/55's SetPendingLevel finding,
+     * never live-tested before now). Opt-in (PSYVR_LEVEL_JUMP_KEY=1, default off) since this calls
+     * real, non-diagnostic engine code with a hardcoded level - not something to leave live by
+     * accident. Runs here (unconditionally every real frame) rather than inside the VR-bridge-gated
+     * head-tracking block, so it works with no headset/SteamVR involved at all. */
+    if (g_levelJumpKeyEnabled) {
+        static SHORT s_prevF12 = 0;
+        SHORT f12 = GetAsyncKeyState(VK_F12);
+        if ((f12 & 0x8000) && !(s_prevF12 & 0x8000)) {
+            void *engine = *(void **)0x78BC20;
+            LogLine("LevelJump: F12 pressed - engine=%p, calling SetPendingLevel(\"%s\")",
+                    engine, g_levelJumpCode);
+            ((void (__thiscall *)(void *, const char *, BOOL))0x4FFA40)(engine, g_levelJumpCode, TRUE);
+            LogLine("LevelJump: SetPendingLevel call returned (no crash) - watch for a world-space "
+                    "BVM camera-coord jump in the next few seconds' log lines");
+        }
+        s_prevF12 = f12;
+    }
+
     if (g_traceActive) { TraceFlushDrawsFwd(); LogLine("TRACE: -- AfterBoth (restoring BACKBUF) --"); }
     g_stereoPhase = STEREO_PHASE_IDLE;
     UIShift_ReconcileFwd(); /* notes/36: phase idle - removes any applied UI shift */

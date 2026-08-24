@@ -1,6 +1,39 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 (session 59: void-behind-player bug — closed out the multi-session CPU-side
+Last updated: 2026-08-24 later (session 60: void-behind-player bug — user reframed candidate 1
+around the mouse-camera/body-facing decoupling already visible in flat play; big win on the side
+quest, `SetPendingLevel` live-verified working for the first time; mouse-yaw hunt itself blocked
+mid-session on a window-focus issue).
+
+**`SetPendingLevel` (notes/55) is now proven live-working — first time ever invoked, zero crash,
+real world-space camera coords confirmed.** New opt-in F12 hotkey (`PSYVR_LEVEL_JUMP_KEY=1`,
+`PSYVR_LEVEL_JUMP_CODE` to pick a level) calls it directly from a cold title screen; jumped straight
+into Sasha's Lab (`CAJA`) twice, clean both times. **This is a real, reusable capability beyond this
+session** — a reliable scriptable path into real gameplay that sidesteps `enter_gameplay.ps1`'s
+long-flagged door-timing unreliability (session 54), which has blocked every real-scene void/FOV
+test so far (including notes/59's inconclusive title-screen-only FOV_SCALE result). Full detail in
+notes/60.
+
+**Mouse-camera-yaw hunt (the user's reframed, lower-risk candidate-1 injection point) did not land
+this session.** Confirmed Site A's containing function (`sub_5123d0`, called conditionally from
+`CandB`) has no mouse-input references and looks like a camera-follow/focus-distance helper, not
+where mouse-look lives — a real if partial answer, but it means the CandB-side chain (notes/59) was
+the wrong place to keep digging for this. Pivoted toward DirectInput's `GetDeviceState`, didn't
+complete the live capture before time ran out. **Separately, hit a real blocker**: once inside the
+freshly-loaded level, the game auto-pauses on window-focus-loss, and this session could not reliably
+force real OS foreground onto the game window to dismiss it or test mouse-look (multiple techniques
+tried, all failed except one Alt+Tab that changed focus to the wrong window). `GetAsyncKeyState`-based
+hotkeys (F12 above) work fine regardless of focus; anything needing genuine window activation
+doesn't, this session. Full detail in notes/60.
+
+**Next, in priority order:** (1) solve the foreground-focus problem (its own short, focused
+investigation — blocks mouse-look testing, in-gameplay FOV_SCALE testing, and further void
+reproduction alike); (2) resume the mouse-yaw hunt from the input side — catch `DirectInput8Create`'s
+return live, breakpoint the mouse device's `GetDeviceState` (vtable slot 9), walk its caller chain —
+a fresh entry point, not another pass over `BuildViewMatrix`'s callers; (3) once both are unblocked,
+rerun notes/59's FOV_SCALE A/B in the now-reachable real level instead of the title screen.
+
+## Prior header (session 59: void-behind-player bug — closed out the multi-session CPU-side
 cull-test hunt (live x64dbg + angr decompile) with a real, if partial, answer; then built + tested
 candidate 3, the FOV_SCALE widen stopgap, monitor-only).
 
