@@ -6,9 +6,9 @@ For the readable field notes, see [psychonauts-vr-modding-notes](https://github.
 
 This project adds VR support to the original 2005 **Psychonauts** (Double Fine), a DirectX 9 title on a custom in-house engine with no existing VR modding framework — everything here is built from scratch via reverse engineering.
 
-## The five repositories for Psychonauts VR
+## The six repositories for Psychonauts VR
 
-Everything for this game lives in five repositories, each with one job — so you
+Everything for this game lives in six repositories, each with one job — so you
 always know where to look. You are in **psychonauts-vr-dev-archive**.
 
 | Repository | What lives here |
@@ -18,6 +18,7 @@ always know where to look. You are in **psychonauts-vr-dev-archive**.
 | [psychonauts-vr-modding-notes](https://github.com/TefMeister/psychonauts-vr-modding-notes) | Readable field notes / progress ledger. |
 | [psychonauts-vr-staging](https://github.com/TefMeister/psychonauts-vr-staging) 🔒 | **Private** — unverified WIP builds, cross-machine handoff. |
 | [psychonauts-vr-engine-research](https://github.com/TefMeister/psychonauts-vr-engine-research) | Distilled engine reference (dossier) + reusable VR RE playbook. |
+| [psychonauts-vr-external-research](https://github.com/TefMeister/psychonauts-vr-external-research) | Ongoing public-research leads, gathered separately from hands-on modding work. |
 
 ## Credits
 
