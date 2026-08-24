@@ -1,6 +1,36 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 final (session 63: void-behind-player bug — **the live A/B test is done**.
+Last updated: 2026-08-24 later (session 64: built the "Render Wireframe" toggle notes/63 called
+for, but caught a methodology mistake before trusting a result from it — see below — and hit a
+severe, still-unresolved auto-pause/focus blocker that prevented any live comparison this session).
+
+**Session 64 summary**: Found + wired a second debug-menu flag toggle (NUMPAD8 = "Render
+Wireframe", item id 21, same direct-byte-write mechanism as notes/62's Visibility Tree Culling
+toggle) — confirmed working via the log. **But realized before drawing any conclusion from it that
+render-fill-mode wireframe can't actually distinguish "real geometry, just dark" from "genuinely
+absent"**, since it only changes how already-issued draw calls rasterize, not whether culled
+geometry gets submitted at all. The theoretically correct tool is **"Collision Wireframe" (item id
+22, found in the same decompile, not yet wired)** — collision queries typically run independent of
+render-time visibility culling, so it could actually show geometry the render pipeline culled. Full
+reasoning in notes/64.
+
+**Also hit a much worse version of the auto-pause problem than notes/60 saw**: the "while you were
+away" dialog now reappears within single-digit seconds of nearly every level load, not after AFK
+time — got exactly one clean gameplay frame per attempt before it retriggered. **Five different
+focus/foreground techniques have now failed across two sessions** (SetForegroundWindow retry loop,
+AttachThreadInput, a screen-coordinate-verified direct mouse click, minimize/restore, Alt+Tab, and
+this session's new attempt — disabling the OS foreground-lock via `SystemParametersInfo`, which
+failed with ACCESS_DENIED). This looks like a real structural constraint (a persistent, protected
+foreground window elsewhere on the machine) rather than a technique gap, and it's now blocked 2 of
+the last 3 sessions' actual empirical goals — worth a dedicated session of its own rather than a
+retry each time. Full detail, including concrete untried ideas (pre-arm the toggle before F12
+instead of racing it live; check if the pause is specifically tied to the `SetPendingLevel`
+transition; or just have a human click once, which worked in notes/63), in notes/64.
+
+No save files touched, no code shipped beyond the new opt-in NUMPAD8 hotkey (default off), old DLL
+backed up as `d3d9.dll.pre-notes64-backup`.
+
+## Prior header (session 63: void-behind-player bug — **the live A/B test is done**.
 Disabling Visibility Tree Culling does NOT remove the black void. Clean negative result, with a
 serious caveat about what the void even is — see below).
 
