@@ -1,27 +1,27 @@
 # Psychonauts VR — Status
 
-Last updated: 2026-08-24 later (session 64: built the "Render Wireframe" toggle notes/63 called
-for, but caught a methodology mistake before trusting a result from it, and hit a severe,
-still-unresolved auto-pause/focus blocker that prevented any live comparison this session).
+Last updated: 2026-08-24 later still (session 65: the auto-pause blocker is FIXED; Collision
+Wireframe tested — clean negative result, but with an honest caveat).
 
-**Session 64 summary**: found + wired a second debug-menu flag toggle (NUMPAD8 = "Render
-Wireframe", item id 21, same direct-byte-write mechanism as notes/62's Visibility Tree Culling
-toggle) — confirmed working via the log. **But realized before drawing any conclusion from it that
-render-fill-mode wireframe can't actually distinguish "real geometry, just dark" from "genuinely
-absent"** — it only changes how already-issued draw calls rasterize, not whether culled geometry
-gets submitted at all. The theoretically correct tool is **"Collision Wireframe" (item id 22, found
-but not yet wired)** — collision queries typically run independent of render-time visibility
-culling, so it could show geometry the render pipeline culled. Full reasoning in dev-archive
-notes/64.
+**Session 65 summary**: **The auto-pause/focus blocker that stopped notes/60 and notes/64 is now
+fixed.** Root cause turned out to be a per-tick `GetForegroundWindow()` poll, not a reactive window
+message — an opt-in IAT patch (`PSYVR_SUPPRESS_AUTOPAUSE=1`) makes the game's own
+`GetForegroundWindow` calls always return its own window handle. Confirmed clean across two full
+relaunch-and-test cycles, 20-30+ seconds of continuous rotating-camera gameplay each, zero pause
+dialogs. This should unblock live testing generally going forward, not just this investigation.
 
-**Also hit a much worse version of the auto-pause problem than notes/60 saw**: the "while you were
-away" dialog now reappears within single-digit seconds of nearly every level load, not after AFK
-time. **Five different focus/foreground techniques have now failed across two sessions**
-(SetForegroundWindow retry loop, AttachThreadInput, a screen-coordinate-verified direct mouse
-click, minimize/restore, Alt+Tab, and a new `SystemParametersInfo` attempt that hit
-ACCESS_DENIED). This looks like a real structural constraint rather than a technique gap, and has
-now blocked 2 of the last 3 sessions' actual empirical goals — likely worth a dedicated session of
-its own. Full detail, including untried ideas, in dev-archive notes/64.
+Wired the "Collision Wireframe" toggle (item 22, NUMPAD7) that notes/64 identified as the correct
+tool and ran the matched-phase comparison: **the void stays completely, uniformly black with
+Collision Wireframe on — no lines, no difference from the baseline.** However, a sanity check on
+definitely-present nearby geometry (a fence/rocks/plants, not the void) *also* showed no visible
+wireframe overlay either way — so this is a clean negative result, not a fully conclusive one. It's
+consistent with "there's genuinely no collision geometry there either" (a real gap), but equally
+consistent with "this specific debug visualization doesn't render anything in this build" (TCRF
+itself flags some options as broken on the PC port). **Recommended next step: confirm a debug-menu
+option is actually rendering something (a positive control) before trusting more results from
+this menu** — TCRF specifically called out Show Collision (a different item, not yet located) as
+one of the ones still known to work. Full reasoning + 4 evidence screenshots in dev-archive
+notes/65.
 
 No save files touched, no code shipped beyond the new opt-in NUMPAD8 hotkey (default off).
 
