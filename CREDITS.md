@@ -28,6 +28,8 @@ ourselves, plus third-party components whose licenses permit redistribution
 | "Classic Postmortem: Double Fine's Psychonauts" | Caroline Esmurdoc, *Game Developer Magazine* (Aug 2005) | https://www.gamedeveloper.com |
 | Vireio Perception / VRBoost (DirectInput mouse-delta injection technique, cross-applied from Far Cry 2 research) | cybereality and the Vireio Perception contributors | https://github.com/cybereality/Perception |
 | dinput8-hook (minimal DirectInput hook reference) | fiki574 | https://github.com/fiki574/dinput8-hook |
+| "Psi-Epilepsy: Fixing Object Pop-In and Refresh Rate Bugs" guide | Steam Community guide author | https://steamcommunity.com/sharedfiles/filedetails/?id=841015059 |
+| AMD flickering-fix forum thread | GOG.com forum community | https://www.gog.com/forum/psychonauts/solution_resolving_flickering_issues_on_amd_cards |
 
 Development on this project is AI-assisted: much of the research, code, and
 documentation was produced with **Claude (Anthropic)** (https://claude.com)
