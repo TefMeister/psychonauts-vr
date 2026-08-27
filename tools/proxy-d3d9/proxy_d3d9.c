@@ -623,6 +623,10 @@ static char  g_autoCmdPath[MAX_PATH] = "";
 static LONG  g_autoInCommand     = 0;     /* re-entrancy guard */
 static BOOL  g_camHold           = FALSE; /* re-apply target every frame */
 static float g_camHoldPos[3]     = { 0.0f, 0.0f, 0.0f };
+/* Facing has its own hold: the game re-aims the camera every frame during
+ * gameplay, so a one-shot direction write is overwritten before it is seen. */
+static BOOL  g_lookHold          = FALSE;
+static float g_lookHoldDir[3]    = { 0.0f, 0.0f, 1.0f };
 
 /* notes/67: dialogue/menu UI at its own virtual depth, so conversation options
  * stand out in front of the persistent HUD instead of sharing one plane.
@@ -2939,6 +2943,11 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> FAILED (bad args or no camera)", cmd);
         }
 
+    } else if (_strnicmp(cmd, "lookhold ", 9) == 0) {
+        g_lookHold = (cmd[9] == '1');
+        LogLine("Auto: END   \"%s\" -> lookhold=%d dir %.4f %.4f %.4f", cmd, (int)g_lookHold,
+                g_lookHoldDir[0], g_lookHoldDir[1], g_lookHoldDir[2]);
+
     } else if (_strnicmp(cmd, "camhold ", 8) == 0) {
         g_camHold = (cmd[8] == '1');
         if (g_camHold && !AutoReadCameraPos(g_camHoldPos))
@@ -3012,6 +3021,41 @@ static void AutoRunCommand(const char *cmd)
      * axis order, handedness) is NOT known, and writing a rotation built on a
      * guessed convention would just produce a confusing wrong result. Sampling
      * it while the game turns the camera is how the convention gets settled. */
+    /* notes/67: WRITE the camera's facing direction. camera+0x20 is three
+     * floats, not the 3x3 matrix the static read first assumed - the live
+     * dump settled that (m[0..2] came back unit-length, m[3..8] were
+     * unrelated neighbouring fields including a stray 104.0). So turning the
+     * camera is writing a normalized direction; there is no matrix
+     * convention, handedness or axis order left to guess.
+     *
+     * Why this matters beyond a free camera: 00-status lists "feed HMD yaw
+     * into the game camera" as Candidate 1 for the black void, marked
+     * unimplementable - which looks like it was judged when no way to set the
+     * camera's facing was known. Pulling the camera 4000 units back showed the
+     * engine culls and renders relative to the camera object we write, so if
+     * facing is writable too, the game should cull toward wherever the head is
+     * pointing and leave no unrendered region to fall into. Untested. */
+    } else if (_strnicmp(cmd, "camlook ", 8) == 0) {
+        if (sscanf(cmd + 8, "%f %f %f", &a, &b, &c) == 3) {
+            float len = (float)sqrt(a*a + b*b + c*c);
+            if (len < 1e-6f) {
+                LogLine("Auto: END   \"%s\" -> FAILED (zero-length direction)", cmd);
+            } else {
+                void *cam = AutoGetCamera();
+                if (cam) {
+                    float *d = (float *)((char *)cam + 0x20);
+                    d[0] = a / len; d[1] = b / len; d[2] = c / len;
+                    *((unsigned char *)cam + PSY_CAM_DIRTY_OFFSET) |= 1;
+                    g_lookHoldDir[0] = d[0]; g_lookHoldDir[1] = d[1]; g_lookHoldDir[2] = d[2];
+                    LogLine("Auto: END   \"%s\" -> dir = %.4f %.4f %.4f", cmd, d[0], d[1], d[2]);
+                } else {
+                    LogLine("Auto: END   \"%s\" -> FAILED (no camera)", cmd);
+                }
+            }
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: camlook <x> <y> <z>)", cmd);
+        }
+
     } else if (_stricmp(cmd, "orient") == 0) {
         void *cam = AutoGetCamera();
         if (cam) {
@@ -3083,6 +3127,14 @@ static void AutomationTick(void)
     /* Re-apply the held position every frame so the game's own camera update
      * cannot walk it back - this is what makes a free camera actually hold. */
     if (g_camHold) AutoWriteCameraPos(g_camHoldPos);
+    if (g_lookHold) {
+        void *cam = AutoGetCamera();
+        if (cam) {
+            float *d = (float *)((char *)cam + 0x20);
+            d[0] = g_lookHoldDir[0]; d[1] = g_lookHoldDir[1]; d[2] = g_lookHoldDir[2];
+            *((unsigned char *)cam + PSY_CAM_DIRTY_OFFSET) |= 1;
+        }
+    }
 
     if (now - g_autoLastPoll >= g_autoPollMs) {
         g_autoLastPoll = now;
