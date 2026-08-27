@@ -4567,13 +4567,32 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(IDirect3DDevice9 *This, ID
     return g_pRealSetVertexShader(This, pShader);
 }
 
+/* notes/67: identity of the texture bound to stage 0, as a bare pointer for
+ * comparison only (never dereferenced). §11 names "per-draw geometry/texture
+ * identity" as what UI-element separation needs that shader signature cannot
+ * give - two draws through the same UI shader are told apart by which texture
+ * (font atlas vs speech-bubble art) they sample. GetTexture AddRefs, so this
+ * releases immediately; the pointer stays valid for comparison because the
+ * texture is still bound. Only called while tracing. */
+static void *TraceBoundTex0(IDirect3DDevice9 *dev)
+{
+    IDirect3DBaseTexture9 *tex = NULL;
+    void *p = NULL;
+    if (dev && dev->lpVtbl->GetTexture(dev, 0, &tex) == D3D_OK && tex) {
+        p = (void *)tex;
+        tex->lpVtbl->Release(tex);
+    }
+    return p;
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT s, UINT c)
 {
     if (g_traceActive) {
-        InterlockedIncrement(&g_traceDrawCount);
+        LONG ord = InterlockedIncrement(&g_traceDrawCount);
         if (g_curShaderIsUI)
-            LogLine("TRACE-UI: DrawPrimitive sh=%ld type=%d start=%u prims=%u phase=%ld c50=(%.4f,%.4f)",
-                    g_curUIShaderIdx, (int)t, s, c, g_stereoPhase, g_lastC50[0], g_lastC50[1]);
+            LogLine("TRACE-UI: #%ld DrawPrimitive sh=%ld type=%d start=%u prims=%u phase=%ld c50=(%.4f,%.4f) tex0=%p",
+                    ord, g_curUIShaderIdx, (int)t, s, c, g_stereoPhase,
+                    g_lastC50[0], g_lastC50[1], TraceBoundTex0(This));
     }
     RegComboOnDraw();
     return g_pRealDrawPrimitive(This, t, s, c);
@@ -4582,10 +4601,11 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9 *Thi
                                                            INT b, UINT mi, UINT nv, UINT si, UINT pc)
 {
     if (g_traceActive) {
-        InterlockedIncrement(&g_traceDrawCount);
+        LONG ord = InterlockedIncrement(&g_traceDrawCount);
         if (g_curShaderIsUI)
-            LogLine("TRACE-UI: DrawIndexedPrimitive sh=%ld type=%d base=%d minIdx=%u nVerts=%u prims=%u phase=%ld c50=(%.4f,%.4f)",
-                    g_curUIShaderIdx, (int)t, b, mi, nv, pc, g_stereoPhase, g_lastC50[0], g_lastC50[1]);
+            LogLine("TRACE-UI: #%ld DrawIndexedPrimitive sh=%ld type=%d base=%d minIdx=%u nVerts=%u prims=%u phase=%ld c50=(%.4f,%.4f) tex0=%p",
+                    ord, g_curUIShaderIdx, (int)t, b, mi, nv, pc, g_stereoPhase,
+                    g_lastC50[0], g_lastC50[1], TraceBoundTex0(This));
     }
     RegComboOnDraw();
     return g_pRealDrawIndexedPrimitive(This, t, b, mi, nv, si, pc);
@@ -4673,19 +4693,28 @@ static void InstallPresentHook(IDirect3DDevice9 *pDevice)
     vtbl->CreateVertexShader = Hook_CreateVertexShader;
     g_pRealSetVertexShader = vtbl->SetVertexShader;
     vtbl->SetVertexShader = Hook_SetVertexShader;
-    if (g_traceFrames || g_dumpEyes || g_regHisto) { /* remaining trace hooks: diagnostics only */
+    /* notes/67: the Draw* hooks are now installed UNCONDITIONALLY. They used to
+     * be gated on the startup env vars below, which made the runtime "trace"
+     * command silently useless: it flips g_traceFrames long after the vtable was
+     * patched, so the hooks that do the logging were never in place and the
+     * trace produced zero draw lines. Cost of always hooking is one predictable
+     * branch per draw (the bodies early-out on !g_traceActive, and
+     * RegComboOnDraw returns immediately unless g_regHisto). Clear stays gated -
+     * nothing reads it at runtime. */
+    g_pRealDrawPrimitive = vtbl->DrawPrimitive;
+    vtbl->DrawPrimitive = Hook_DrawPrimitive;
+    g_pRealDrawIndexedPrimitive = vtbl->DrawIndexedPrimitive;
+    vtbl->DrawIndexedPrimitive = Hook_DrawIndexedPrimitive;
+    g_pRealDrawPrimitiveUP = vtbl->DrawPrimitiveUP;
+    vtbl->DrawPrimitiveUP = Hook_DrawPrimitiveUP;
+    g_pRealDrawIndexedPrimitiveUP = vtbl->DrawIndexedPrimitiveUP;
+    vtbl->DrawIndexedPrimitiveUP = Hook_DrawIndexedPrimitiveUP;
+    if (g_traceFrames || g_dumpEyes || g_regHisto) {
         g_pRealClear = vtbl->Clear;
         vtbl->Clear = Hook_Clear;
-        g_pRealDrawPrimitive = vtbl->DrawPrimitive;
-        vtbl->DrawPrimitive = Hook_DrawPrimitive;
-        g_pRealDrawIndexedPrimitive = vtbl->DrawIndexedPrimitive;
-        vtbl->DrawIndexedPrimitive = Hook_DrawIndexedPrimitive;
-        g_pRealDrawPrimitiveUP = vtbl->DrawPrimitiveUP;
-        vtbl->DrawPrimitiveUP = Hook_DrawPrimitiveUP;
-        g_pRealDrawIndexedPrimitiveUP = vtbl->DrawIndexedPrimitiveUP;
-        vtbl->DrawIndexedPrimitiveUP = Hook_DrawIndexedPrimitiveUP;
-        LogLine("Trace hooks installed (SetRenderTarget/Clear/Draw*)");
     }
+    LogLine("Draw* hooks installed (always); Clear hook %s",
+            (g_traceFrames || g_dumpEyes || g_regHisto) ? "installed" : "skipped");
 
     VirtualProtect(vtbl, sizeof(*vtbl), oldProtect, &oldProtect);
 
