@@ -2806,9 +2806,18 @@ void TraceFlushDrawsFwd(void); /* notes/35: defined with the trace hooks below *
 void UIShift_ReconcileFwd(void); /* notes/36: defined with the UI-depth machinery below */
 void UIVp_PhaseChangedFwd(void); /* notes/42: defined with the UI-viewport machinery below */
 
+/* notes/67: Candidate 1 - yaw the GAME camera so the engine culls toward where
+ * we are looking, instead of leaving an unrendered region behind the player.
+ * Defined further down (it needs AutoGetCamera); declared here because this
+ * hook site sits earlier in the file. Applied from BeforeEye1, i.e. BEFORE the
+ * engine renders/culls the frame - writing after the fact (as the automation
+ * tick does) is too late to change what gets drawn. */
+static void ApplyCameraYaw(void);
+
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
 {
+    ApplyCameraYaw();
     /* notes/35: one-full-cycle frame trace - armed here, disarmed at the NEXT BeforeEye1 so the
      * capture includes everything after the composite too (post-present UI drawing etc.). */
     if (g_traceFrames) {
@@ -2884,6 +2893,51 @@ static void *AutoGetCamera(void)
     return ((void *(__thiscall *)(void *))0x4FA5A0)(engine);
 }
 
+/* notes/67: the camera's WORLD matrix, found by dumping the camera object and
+ * diffing it across a camera turn (2026-08-27):
+ *
+ *   +0x50/0x60/0x70 rows, +0x80 translation -> VIEW matrix (world->camera);
+ *                                              its translation is the -R*p form
+ *   +0x90/0xA0/0xB0 rows, +0xC0 translation -> CAMERA WORLD matrix
+ *
+ * The two rotations are exact transposes of one another, which is precisely the
+ * view/world relationship. Rows are 4 floats (16-byte stride).
+ *
+ * World up is Z: row 0 of the world matrix (the camera's "right" vector) reads
+ * Z = 0.0000 exactly, which only holds for a right vector kept horizontal.
+ * So yaw is a rotation about world Z applied to each basis row.
+ *
+ * NOTE the decoy: camera+0x20 is what SetCameraOrientation writes, and the
+ * renderer ignores it - a reversed write there persisted in memory untouched
+ * while the view did not move at all. Do not go back to it. */
+#define PSY_CAM_WORLD_ROW0 0x90
+static float g_camYawDeg = 0.0f;   /* 0 = off */
+
+static void ApplyCameraYaw(void)
+{
+    void *cam;
+    float *m;
+    float s, c, x, y;
+    int r;
+
+    if (g_camYawDeg == 0.0f) return;
+    cam = AutoGetCamera();
+    if (!cam) return;
+
+    s = (float)sin(g_camYawDeg * 3.14159265358979f / 180.0f);
+    c = (float)cos(g_camYawDeg * 3.14159265358979f / 180.0f);
+    /* Rotate each basis row about world Z. Applied once per frame to the
+     * matrix the engine just computed, so it reads as a constant offset rather
+     * than accumulating into a spin. */
+    for (r = 0; r < 3; r++) {
+        m = (float *)((char *)cam + PSY_CAM_WORLD_ROW0 + r * 0x10);
+        x = m[0]; y = m[1];
+        m[0] = x * c - y * s;
+        m[1] = x * s + y * c;
+        /* m[2] (Z) unchanged by a yaw about Z */
+    }
+}
+
 static BOOL AutoReadCameraPos(float out[3])
 {
     void *cam = AutoGetCamera();
@@ -2941,6 +2995,18 @@ static void AutoRunCommand(const char *cmd)
                     pos[0], pos[1], pos[2]);
         } else {
             LogLine("Auto: END   \"%s\" -> FAILED (bad args or no camera)", cmd);
+        }
+
+    /* notes/67: THE void test. Yaws the game camera about world Z, applied
+     * before the engine renders, so its culling follows. If geometry appears
+     * when we look behind the player, Candidate 1 works and the void is
+     * curable rather than merely mitigable. */
+    } else if (_strnicmp(cmd, "camyaw ", 7) == 0) {
+        if (sscanf(cmd + 7, "%f", &a) == 1) {
+            g_camYawDeg = a;
+            LogLine("Auto: END   \"%s\" -> camera yaw = %.1f deg (0 = off)", cmd, a);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: camyaw <degrees>)", cmd);
         }
 
     } else if (_strnicmp(cmd, "lookhold ", 9) == 0) {
