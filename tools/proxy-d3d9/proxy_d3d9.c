@@ -614,6 +614,9 @@ static BOOL g_cullToggleKeyEnabled = FALSE;
  * from recon/2026-08-27-camera-control-without-lua. */
 #define PSY_CAM_POS_OFFSET    0x08
 #define PSY_CAM_DIRTY_OFFSET  0x530
+/* notes/67: DirectInput mouse-delta injection lives with the other hooks far
+ * below, but is installed from the env-var config function above it. */
+static void InstallMouseInject(void);
 static BOOL  g_automationEnabled = FALSE;
 static DWORD g_autoPollMs        = 200;
 static DWORD g_autoTelemetryMs   = 1000;
@@ -1069,6 +1072,12 @@ static void VRBridge_ReadEnableFlag(void)
                     "automation inert");
         }
     }
+
+    /* notes/67: mouse-delta injection for Candidate 1. Patched unconditionally
+     * -- with no delta queued the hook is a pure pass-through, and the import
+     * must be patched before the game calls DirectInput8Create (once, early),
+     * so there is no later opportunity to enable it on demand. */
+    InstallMouseInject();
 
     /* notes/62: NUMPAD9 Visibility Tree Culling flag toggle opt-in. */
     len = GetEnvironmentVariableA("PSYVR_CULL_TOGGLE_KEY", buf, sizeof(buf));
@@ -2813,6 +2822,9 @@ void UIVp_PhaseChangedFwd(void); /* notes/42: defined with the UI-viewport machi
  * engine renders/culls the frame - writing after the fact (as the automation
  * tick does) is too late to change what gets drawn. */
 static void ApplyCameraYaw(void);
+/* notes/67: defined with the DirectInput hooks further down; called from the
+ * env-var config function, which sits earlier in this file. */
+static void InstallMouseInject(void);
 
 void __cdecl CandB_BeforeEye1_asm(void) asm("CandB_BeforeEye1_asm");
 void __cdecl CandB_BeforeEye1_asm(void)
@@ -2938,6 +2950,113 @@ static void ApplyCameraYaw(void)
     }
 }
 
+/* ===================================================================== *
+ * notes/67: DirectInput mouse-delta injection — Candidate 1, done the way
+ * the engine already supports rather than by fighting it.
+ *
+ * Why this and not a matrix write: writing the camera world matrix at
+ * +0x90 from BeforeEye1 was measured to be OVERWRITTEN inside the same
+ * frame (dumps came back bit-for-bit identical with the yaw on and off) —
+ * CandB is the engine's own camera-update tick, so anything written around
+ * it loses to the update inside it. Rather than find a hook point inside
+ * CandB, feed the rotation in as INPUT: notes/60 established that this
+ * game's camera yaw is driven by mouse deltas and is decoupled from Raz's
+ * body facing, so the engine already knows how to turn a delta into a
+ * persistent camera rotation — including its own smoothing and clamping.
+ *
+ * The decisive advantage for the void: the engine rotates its OWN camera,
+ * so culling follows for free. No timing problem exists, because we never
+ * race the camera update — we are upstream of it.
+ *
+ * Chain: DirectInput8Create (exe IAT) -> IDirectInput8::CreateDevice
+ * (vtable slot 3) -> IDirectInputDevice8::GetDeviceState (slot 9) on the
+ * system mouse. GetDeviceState fills a DIMOUSESTATE (lX, lY, lZ, buttons);
+ * we call through to the real one for genuine hardware state, then add our
+ * synthetic delta, which is indistinguishable from a real mouse move.
+ * Technique credit: Vireio Perception's VRBoost, via the project's own
+ * -external-research topic 2026-08-24-directinput-mouse-injection.
+ * ===================================================================== */
+static volatile LONG g_injectMouseDX = 0;  /* one-shot, consumed on next poll */
+static volatile LONG g_injectMouseDY = 0;
+static const GUID kGuidSysMouse =
+    { 0x6F1D2B60, 0xD5A0, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+
+typedef HRESULT (WINAPI *DIGetDeviceState_t)(void *dev, DWORD cb, void *data);
+typedef HRESULT (WINAPI *DICreateDevice_t)(void *di, const GUID *rguid, void **dev, void *outer);
+typedef HRESULT (WINAPI *DI8Create_t)(HINSTANCE h, DWORD ver, const GUID *riid, void **out, void *outer);
+static DIGetDeviceState_t g_pRealGetDeviceState = NULL;
+static DICreateDevice_t   g_pRealDICreateDevice = NULL;
+static DI8Create_t        g_pRealDI8Create      = NULL;
+
+static HRESULT WINAPI Hook_DIGetDeviceState(void *dev, DWORD cb, void *data)
+{
+    HRESULT hr = g_pRealGetDeviceState(dev, cb, data);
+    /* DIMOUSESTATE starts with three LONG axes; anything smaller is not a
+     * mouse state buffer and must be left alone. */
+    if (SUCCEEDED(hr) && data && cb >= 3 * sizeof(LONG)) {
+        LONG dx = InterlockedExchange(&g_injectMouseDX, 0);
+        LONG dy = InterlockedExchange(&g_injectMouseDY, 0);
+        if (dx || dy) {
+            LONG *axes = (LONG *)data;
+            axes[0] += dx;
+            axes[1] += dy;
+        }
+    }
+    return hr;
+}
+
+static HRESULT WINAPI Hook_DICreateDevice(void *di, const GUID *rguid, void **dev, void *outer)
+{
+    HRESULT hr = g_pRealDICreateDevice(di, rguid, dev, outer);
+    if (SUCCEEDED(hr) && dev && *dev && rguid &&
+        memcmp(rguid, &kGuidSysMouse, sizeof(GUID)) == 0 && !g_pRealGetDeviceState) {
+        void **vtbl = *(void ***)(*dev);
+        DWORD oldProt;
+        g_pRealGetDeviceState = (DIGetDeviceState_t)vtbl[9];
+        if (VirtualProtect(&vtbl[9], sizeof(void *), PAGE_READWRITE, &oldProt)) {
+            vtbl[9] = (void *)Hook_DIGetDeviceState;
+            VirtualProtect(&vtbl[9], sizeof(void *), oldProt, &oldProt);
+            LogLine("MouseInject: hooked IDirectInputDevice8::GetDeviceState on the system mouse");
+        } else {
+            g_pRealGetDeviceState = NULL;
+            LogLine("MouseInject: VirtualProtect failed on the device vtable");
+        }
+    }
+    return hr;
+}
+
+static HRESULT WINAPI Hook_DirectInput8Create(HINSTANCE h, DWORD ver, const GUID *riid,
+                                              void **out, void *outer)
+{
+    HRESULT hr = g_pRealDI8Create(h, ver, riid, out, outer);
+    if (SUCCEEDED(hr) && out && *out && !g_pRealDICreateDevice) {
+        void **vtbl = *(void ***)(*out);
+        DWORD oldProt;
+        g_pRealDICreateDevice = (DICreateDevice_t)vtbl[3];
+        if (VirtualProtect(&vtbl[3], sizeof(void *), PAGE_READWRITE, &oldProt)) {
+            vtbl[3] = (void *)Hook_DICreateDevice;
+            VirtualProtect(&vtbl[3], sizeof(void *), oldProt, &oldProt);
+            LogLine("MouseInject: hooked IDirectInput8::CreateDevice");
+        } else {
+            g_pRealDICreateDevice = NULL;
+        }
+    }
+    return hr;
+}
+
+static void InstallMouseInject(void)
+{
+    HMODULE hDI = GetModuleHandleA("dinput8.dll");
+    if (!hDI) hDI = LoadLibraryA("dinput8.dll");
+    if (!hDI) { LogLine("MouseInject: dinput8.dll not loadable - injection unavailable"); return; }
+    g_pRealDI8Create = (DI8Create_t)GetProcAddress(hDI, "DirectInput8Create");
+    if (g_pRealDI8Create &&
+        PatchIATEntry("dinput8.dll", "DirectInput8Create", (void *)Hook_DirectInput8Create))
+        LogLine("MouseInject: DirectInput8Create IAT-patched (mouse yaw injection armed)");
+    else
+        LogLine("MouseInject: could not patch DirectInput8Create - injection unavailable");
+}
+
 static BOOL AutoReadCameraPos(float out[3])
 {
     void *cam = AutoGetCamera();
@@ -3001,6 +3120,29 @@ static void AutoRunCommand(const char *cmd)
      * before the engine renders, so its culling follows. If geometry appears
      * when we look behind the player, Candidate 1 works and the void is
      * curable rather than merely mitigable. */
+    /* notes/67: queue a synthetic mouse delta. Deltas are RELATIVE, so this is
+     * one-shot: the next GetDeviceState poll consumes it and the camera turns
+     * by that much, rather than spinning continuously. */
+    } else if (_strnicmp(cmd, "mousedx ", 8) == 0) {
+        int v = 0;
+        if (sscanf(cmd + 8, "%d", &v) == 1) {
+            InterlockedExchange(&g_injectMouseDX, (LONG)v);
+            LogLine("Auto: END   \"%s\" -> queued mouse dX=%d (hooked=%d)", cmd, v,
+                    g_pRealGetDeviceState != NULL);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: mousedx <delta>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "mousedy ", 8) == 0) {
+        int v = 0;
+        if (sscanf(cmd + 8, "%d", &v) == 1) {
+            InterlockedExchange(&g_injectMouseDY, (LONG)v);
+            LogLine("Auto: END   \"%s\" -> queued mouse dY=%d (hooked=%d)", cmd, v,
+                    g_pRealGetDeviceState != NULL);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: mousedy <delta>)", cmd);
+        }
+
     } else if (_strnicmp(cmd, "camyaw ", 7) == 0) {
         if (sscanf(cmd + 7, "%f", &a) == 1) {
             g_camYawDeg = a;
