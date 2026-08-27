@@ -2988,12 +2988,27 @@ static DIGetDeviceState_t g_pRealGetDeviceState = NULL;
 static DICreateDevice_t   g_pRealDICreateDevice = NULL;
 static DI8Create_t        g_pRealDI8Create      = NULL;
 
+static void *g_diMouseDevice = NULL;   /* the ONE device we may touch */
+
 static HRESULT WINAPI Hook_DIGetDeviceState(void *dev, DWORD cb, void *data)
 {
     HRESULT hr = g_pRealGetDeviceState(dev, cb, data);
-    /* DIMOUSESTATE starts with three LONG axes; anything smaller is not a
-     * mouse state buffer and must be left alone. */
-    if (SUCCEEDED(hr) && data && cb >= 3 * sizeof(LONG)) {
+    /* MUST match the exact device instance, not just the buffer size.
+     *
+     * Bug this guard exists for (found live 2026-08-27): DirectInput device
+     * objects of the same class SHARE ONE VTABLE, so patching slot 9 after
+     * checking the GUID at CreateDevice patches it for EVERY device - keyboard
+     * included. The first version only checked `cb >= 12`, which a 256-byte
+     * keyboard state buffer passes happily, so injected deltas were being
+     * added to the first bytes of the KEY-STATE array. DIK_ESCAPE is index 1,
+     * so the harness was synthesising Escape presses: the pause Journal kept
+     * opening by itself and silently invalidated three camera tests, while the
+     * mouse never saw the delta at all because the keyboard poll consumed it
+     * first.
+     *
+     * DIMOUSESTATE also starts with three LONG axes, so the size check stays
+     * as a second line of defence. */
+    if (SUCCEEDED(hr) && data && dev == g_diMouseDevice && cb >= 3 * sizeof(LONG)) {
         LONG dx = InterlockedExchange(&g_injectMouseDX, 0);
         LONG dy = InterlockedExchange(&g_injectMouseDY, 0);
         if (dx || dy) {
@@ -3009,17 +3024,24 @@ static HRESULT WINAPI Hook_DICreateDevice(void *di, const GUID *rguid, void **de
 {
     HRESULT hr = g_pRealDICreateDevice(di, rguid, dev, outer);
     if (SUCCEEDED(hr) && dev && *dev && rguid &&
-        memcmp(rguid, &kGuidSysMouse, sizeof(GUID)) == 0 && !g_pRealGetDeviceState) {
-        void **vtbl = *(void ***)(*dev);
-        DWORD oldProt;
-        g_pRealGetDeviceState = (DIGetDeviceState_t)vtbl[9];
-        if (VirtualProtect(&vtbl[9], sizeof(void *), PAGE_READWRITE, &oldProt)) {
-            vtbl[9] = (void *)Hook_DIGetDeviceState;
-            VirtualProtect(&vtbl[9], sizeof(void *), oldProt, &oldProt);
-            LogLine("MouseInject: hooked IDirectInputDevice8::GetDeviceState on the system mouse");
-        } else {
-            g_pRealGetDeviceState = NULL;
-            LogLine("MouseInject: VirtualProtect failed on the device vtable");
+        memcmp(rguid, &kGuidSysMouse, sizeof(GUID)) == 0) {
+        /* Remember WHICH instance is the mouse. The vtable patch below affects
+         * every device sharing this vtable (keyboard included), so the hook
+         * body filters on this pointer - see the comment there. */
+        g_diMouseDevice = *dev;
+        if (!g_pRealGetDeviceState) {
+            void **vtbl = *(void ***)(*dev);
+            DWORD oldProt;
+            g_pRealGetDeviceState = (DIGetDeviceState_t)vtbl[9];
+            if (VirtualProtect(&vtbl[9], sizeof(void *), PAGE_READWRITE, &oldProt)) {
+                vtbl[9] = (void *)Hook_DIGetDeviceState;
+                VirtualProtect(&vtbl[9], sizeof(void *), oldProt, &oldProt);
+                LogLine("MouseInject: hooked GetDeviceState; mouse device = %p "
+                        "(vtable is shared, so the hook filters on this pointer)", *dev);
+            } else {
+                g_pRealGetDeviceState = NULL;
+                LogLine("MouseInject: VirtualProtect failed on the device vtable");
+            }
         }
     }
     return hr;
