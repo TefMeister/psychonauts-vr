@@ -623,6 +623,19 @@ static char  g_autoCmdPath[MAX_PATH] = "";
 static LONG  g_autoInCommand     = 0;     /* re-entrancy guard */
 static BOOL  g_camHold           = FALSE; /* re-apply target every frame */
 static float g_camHoldPos[3]     = { 0.0f, 0.0f, 0.0f };
+
+/* notes/67: dialogue/menu UI at its own virtual depth, so conversation options
+ * stand out in front of the persistent HUD instead of sharing one plane.
+ *
+ * How dialogue draws are told apart, measured live 2026-08-27 by tracing UI
+ * draws with a conversation on screen and again with it dismissed: EVERY draw
+ * that disappeared was a TRIANGLELIST with more than one primitive, and every
+ * draw that remained was a single-quad TRIANGLESTRIP. So the test is the draw's
+ * SHAPE, deliberately not the shader index or texture pointer - those are
+ * registration order and heap addresses, which need not be stable between runs.
+ * 0 = off; dialogue then shares g_uiDepthWorld like everything else. */
+static float g_dlgDepthWorld     = 0.0f;
+static float g_uiDepthOverride   = 0.0f;  /* per-draw, set by the Draw* hooks */
 /* notes/64: NUMPAD8 one-shot "Render Wireframe" flag toggle - same direct-byte-write pattern as
  * notes/62's Visibility Tree Culling toggle above, same generic-ID registration path
  * (sub_628e60/sub_629410("Render Wireframe", "Display wireframe for rendered geometry", 21)
@@ -2956,6 +2969,15 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> FAILED (expected: uidepth <world units, 0 = off>)", cmd);
         }
 
+    } else if (_strnicmp(cmd, "dlgdepth ", 9) == 0) {
+        if (sscanf(cmd + 9, "%f", &a) == 1 && a >= 0.0f) {
+            g_dlgDepthWorld = a;
+            LogLine("Auto: END   \"%s\" -> dialogue UI depth = %.0f world units "
+                    "(0 = share the normal UI depth of %.0f)", cmd, a, g_uiDepthWorld);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: dlgdepth <world units, 0 = off>)", cmd);
+        }
+
     } else if (_strnicmp(cmd, "uiscale ", 8) == 0) {
         if (sscanf(cmd + 8, "%f", &a) == 1 && a > 0.0f) {
             g_uiVpScale = a;
@@ -3511,8 +3533,13 @@ static void SetupStereoSurfaces(IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS
 static float UIShift_Wanted(void)
 {
     float d;
+    float depth;
     int eyeIdx;
-    if (!g_curShaderIsUI || g_uiDepthWorld <= 0.0f || !g_projXScaleValid) return 0.0f;
+    /* notes/67: g_uiDepthOverride lets one class of UI draw sit at a different
+     * virtual depth from the rest (dialogue nearer than the persistent HUD).
+     * Set per-draw by the Draw* hooks and cleared straight after. */
+    depth = (g_uiDepthOverride > 0.0f) ? g_uiDepthOverride : g_uiDepthWorld;
+    if (!g_curShaderIsUI || depth <= 0.0f || !g_projXScaleValid) return 0.0f;
     if (g_stereoPhase == STEREO_PHASE_EYE1) eyeIdx = 0;
     else if (g_stereoPhase == STEREO_PHASE_EYE2) eyeIdx = 1;
     else return 0.0f;
@@ -3521,7 +3548,7 @@ static float UIShift_Wanted(void)
      * shrink (UIVp_Reconcile) then maps onto only a g_uiVpScale fraction of the frame - divide
      * by the shrink so the rendered parallax (and therefore the perceived UI depth) stays the
      * same as at FOV scale 1. g_uiVpScale is 1 when no shrink is active. */
-    return (-d) * (g_projXScale / g_uiVpScale) / g_uiDepthWorld;
+    return (-d) * (g_projXScale / g_uiVpScale) / depth;
 }
 
 static float g_uiShiftApplied = 0.0f; /* delta currently baked into the device's c50.x */
@@ -4585,8 +4612,39 @@ static void *TraceBoundTex0(IDirect3DDevice9 *dev)
     return p;
 }
 
+/* notes/67: is this the dialogue/menu class of UI draw? See g_dlgDepthWorld for
+ * how the shape test was established. Only meaningful while a UI shader is
+ * bound. */
+static int IsDialogueClassDraw(D3DPRIMITIVETYPE t, UINT prims)
+{
+    return g_curShaderIsUI && g_dlgDepthWorld > 0.0f &&
+           t == D3DPT_TRIANGLELIST && prims > 1;
+}
+
+/* Push the dialogue depth for one draw, then restore. Two extra constant
+ * uploads per dialogue draw; there are only a handful per eye, so the cost is
+ * irrelevant next to keeping the HUD and the conversation on separate planes. */
+static void UIDepth_PushDialogue(IDirect3DDevice9 *dev)
+{
+    g_uiDepthOverride = g_dlgDepthWorld;
+    UIShift_Reconcile(dev);
+}
+static void UIDepth_Pop(IDirect3DDevice9 *dev)
+{
+    g_uiDepthOverride = 0.0f;
+    UIShift_Reconcile(dev);
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t, UINT s, UINT c)
 {
+    if (IsDialogueClassDraw(t, c)) {
+        HRESULT hr;
+        UIDepth_PushDialogue(This);
+        hr = g_pRealDrawPrimitive(This, t, s, c);
+        UIDepth_Pop(This);
+        RegComboOnDraw();
+        return hr;
+    }
     if (g_traceActive) {
         LONG ord = InterlockedIncrement(&g_traceDrawCount);
         if (g_curShaderIsUI)
@@ -4600,6 +4658,14 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9 *This, D3DP
 static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9 *This, D3DPRIMITIVETYPE t,
                                                            INT b, UINT mi, UINT nv, UINT si, UINT pc)
 {
+    if (IsDialogueClassDraw(t, pc)) {
+        HRESULT hr;
+        UIDepth_PushDialogue(This);
+        hr = g_pRealDrawIndexedPrimitive(This, t, b, mi, nv, si, pc);
+        UIDepth_Pop(This);
+        RegComboOnDraw();
+        return hr;
+    }
     if (g_traceActive) {
         LONG ord = InterlockedIncrement(&g_traceDrawCount);
         if (g_curShaderIsUI)
