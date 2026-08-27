@@ -2994,6 +2994,35 @@ static void AutoRunCommand(const char *cmd)
         LogLine("Auto: END   \"%s\" -> one-frame trace %s", cmd,
                 g_traceFrames ? "ARMED (one frame every ~5s)" : "off");
 
+    /* notes/67: FOV scale, live. g_fovScaleAsm is read per call by the injected
+     * stub, so a change lands on the next frame. Runtime control turns the
+     * void A/B that 00-status lists as the top open item from "one relaunch per
+     * value" (and only the user can relaunch) into one session. */
+    } else if (_strnicmp(cmd, "fov ", 4) == 0) {
+        if (sscanf(cmd + 4, "%f", &a) == 1 && a >= 0.5f && a <= 4.0f) {
+            g_fovScaleAsm = a;
+            LogLine("Auto: END   \"%s\" -> FOV scale = %.2f", cmd, a);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: fov <0.5..4.0>)", cmd);
+        }
+
+    /* notes/67: READ-ONLY dump of the camera's orientation matrix at
+     * camera+0x20, decoded statically in recon/2026-08-27 but never yet
+     * exercised. Reading first: the matrix convention (row vs column major,
+     * axis order, handedness) is NOT known, and writing a rotation built on a
+     * guessed convention would just produce a confusing wrong result. Sampling
+     * it while the game turns the camera is how the convention gets settled. */
+    } else if (_stricmp(cmd, "orient") == 0) {
+        void *cam = AutoGetCamera();
+        if (cam) {
+            const float *m = (const float *)((char *)cam + 0x20);
+            LogLine("Auto: END   \"orient\" -> m[0..8] = "
+                    "%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f",
+                    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+        } else {
+            LogLine("Auto: END   \"orient\" -> no camera available right now");
+        }
+
     } else if (_stricmp(cmd, "status") == 0) {
         if (AutoReadCameraPos(pos))
             LogLine("Auto: END   \"status\" -> campos %.2f %.2f %.2f camhold=%d uidepth=%.0f "
