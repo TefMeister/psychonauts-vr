@@ -607,6 +607,22 @@ static char g_levelJumpCode[64] = "workresource\\levels\\CAJA.plb";
 static BOOL g_cullToggleKeyEnabled = FALSE;
 #define VISTREE_CULLING_ITEM_ID 117
 #define DEBUG_FLAGS_ARRAY_OFFSET 44
+
+/* notes/67: external automation harness state. Declared here (with the other
+ * globals) rather than beside its code near CandB_AfterBoth_asm, because the
+ * env-var config function below runs earlier in the file. Camera offsets come
+ * from recon/2026-08-27-camera-control-without-lua. */
+#define PSY_CAM_POS_OFFSET    0x08
+#define PSY_CAM_DIRTY_OFFSET  0x530
+static BOOL  g_automationEnabled = FALSE;
+static DWORD g_autoPollMs        = 200;
+static DWORD g_autoTelemetryMs   = 1000;
+static DWORD g_autoLastPoll      = 0;
+static DWORD g_autoLastTelemetry = 0;
+static char  g_autoCmdPath[MAX_PATH] = "";
+static LONG  g_autoInCommand     = 0;     /* re-entrancy guard */
+static BOOL  g_camHold           = FALSE; /* re-apply target every frame */
+static float g_camHoldPos[3]     = { 0.0f, 0.0f, 0.0f };
 /* notes/64: NUMPAD8 one-shot "Render Wireframe" flag toggle - same direct-byte-write pattern as
  * notes/62's Visibility Tree Culling toggle above, same generic-ID registration path
  * (sub_628e60/sub_629410("Render Wireframe", "Display wireframe for rendered geometry", 21)
@@ -992,6 +1008,49 @@ static void VRBridge_ReadEnableFlag(void)
             g_levelJumpCode[sizeof(g_levelJumpCode) - 1] = '\0';
         }
         LogLine("VRBridge: PSYVR_LEVEL_JUMP_KEY=1 - F12 will call SetPendingLevel(\"%s\")", g_levelJumpCode);
+    }
+
+    /* notes/67: external automation harness opt-in. Commands arrive in
+     * psyvr_automation_cmds.txt next to Psychonauts.exe; results and camera
+     * telemetry go to the normal proxy log. Default off - this drives real
+     * engine state and is not something to leave live by accident. */
+    len = GetEnvironmentVariableA("PSYVR_AUTOMATION", buf, sizeof(buf));
+    g_automationEnabled = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_automationEnabled) {
+        char exePath[MAX_PATH];
+        char *slash;
+        if (GetModuleFileNameA(NULL, exePath, sizeof(exePath))) {
+            slash = strrchr(exePath, '\\');
+            if (slash) {
+                *(slash + 1) = '\0';
+                _snprintf(g_autoCmdPath, sizeof(g_autoCmdPath), "%spsyvr_automation_cmds.txt",
+                          exePath);
+                g_autoCmdPath[sizeof(g_autoCmdPath) - 1] = '\0';
+            }
+        }
+        if (g_autoCmdPath[0]) {
+            FILE *cf = fopen(g_autoCmdPath, "wb");   /* clear stale commands */
+            if (cf) fclose(cf);
+            /* sscanf, not atoi: stdlib.h is not among this file's includes. */
+            len = GetEnvironmentVariableA("PSYVR_AUTOMATION_POLL_MS", buf, sizeof(buf));
+            if (len > 0 && len < sizeof(buf)) {
+                int v = 0;
+                if (sscanf(buf, "%d", &v) == 1 && v >= 0) g_autoPollMs = (DWORD)v;
+            }
+            len = GetEnvironmentVariableA("PSYVR_AUTOMATION_TELEM_MS", buf, sizeof(buf));
+            if (len > 0 && len < sizeof(buf)) {
+                int v = 0;
+                if (sscanf(buf, "%d", &v) == 1 && v >= 0) g_autoTelemetryMs = (DWORD)v;
+            }
+            LogLine("VRBridge: PSYVR_AUTOMATION=1 - commands from \"%s\" (poll=%lums telem=%lums). "
+                    "Try: status | level CAJA | campos <x> <y> <z> | cammove <dx> <dy> <dz> | "
+                    "camhold 0|1 | flag <id> <0|1>",
+                    g_autoCmdPath, g_autoPollMs, g_autoTelemetryMs);
+        } else {
+            g_automationEnabled = FALSE;
+            LogLine("VRBridge: PSYVR_AUTOMATION=1 but the command-file path could not be built - "
+                    "automation inert");
+        }
     }
 
     /* notes/62: NUMPAD9 Visibility Tree Culling flag toggle opt-in. */
@@ -2766,9 +2825,209 @@ void __cdecl CandB_BeforeEye2_asm(void)
     UIVp_PhaseChangedFwd(); /* notes/42 */
 }
 
+/* ===================================================================== *
+ * notes/67: external automation harness
+ *
+ * Lets commands be delivered from OUTSIDE the process: append a line to
+ * psyvr_automation_cmds.txt next to Psychonauts.exe, and this reads it,
+ * runs it, and truncates the file. No synthetic input, no hotkey, no
+ * rebuild to change a level code - so an unattended session can drive the
+ * game after the user has launched it.
+ *
+ * This is the XIII harness pattern ported over, including the two lessons
+ * that cost that project a crash and a debugging round:
+ *
+ *  1. NEVER dispatch a real engine COMMAND from a render-path hook. XIII
+ *     GPF'd doing exactly that (its queue drained from a camera hook that
+ *     turned out to be called from inside the engine's Draw). We are on
+ *     the render path here too - CandB_AfterBoth runs mid-frame - so this
+ *     harness deliberately only does work that is already proven safe from
+ *     this exact site: SetPendingLevel (stages an async request; the F12
+ *     path has done this since notes/59), debug-flag byte pokes (notes/62,
+ *     64), and plain field writes on the camera object. It does NOT call
+ *     into the Lua interpreter or any general command dispatcher. If that
+ *     is ever wanted, it needs a game-logic tick site found first.
+ *  2. Log BEFORE the call, not after. XIII's first version logged on
+ *     completion, so its crash left no record of which command died and it
+ *     had to be inferred. LogLine already opens/appends/closes per call,
+ *     so every line is on disk before the next one runs.
+ *
+ * Camera access is the recon/2026-08-27-camera-control-without-lua finding:
+ * the Lua bindings are a marshalling shim over plain engine work, so the
+ * camera is reachable with a guard + an accessor + three float stores.
+ * ===================================================================== */
+/* Guard + accessor on the engine singleton, both __thiscall. Returns NULL
+ * whenever the engine says there is no usable camera right now (loading,
+ * menus), so every caller fails soft rather than writing into nothing. */
+static void *AutoGetCamera(void)
+{
+    void *engine = *(void **)0x78BC20;
+    if (!engine) return NULL;
+    if (!((BOOL (__thiscall *)(void *))0x504220)(engine)) return NULL;
+    return ((void *(__thiscall *)(void *))0x4FA5A0)(engine);
+}
+
+static BOOL AutoReadCameraPos(float out[3])
+{
+    void *cam = AutoGetCamera();
+    if (!cam) return FALSE;
+    memcpy(out, (char *)cam + PSY_CAM_POS_OFFSET, sizeof(float) * 3);
+    return TRUE;
+}
+
+static BOOL AutoWriteCameraPos(const float p[3])
+{
+    void *cam = AutoGetCamera();
+    if (!cam) return FALSE;
+    memcpy((char *)cam + PSY_CAM_POS_OFFSET, p, sizeof(float) * 3);
+    *((unsigned char *)cam + PSY_CAM_DIRTY_OFFSET) |= 1;
+    return TRUE;
+}
+
+static void AutoRunCommand(const char *cmd)
+{
+    float pos[3];
+    char  codeBuf[64];
+    float a = 0.0f, b = 0.0f, c = 0.0f;
+    int   id = 0, val = 0;
+
+    LogLine("Auto: BEGIN \"%s\"", cmd);
+
+    if (_strnicmp(cmd, "level ", 6) == 0) {
+        void *engine = *(void **)0x78BC20;
+        if (sscanf(cmd + 6, "%31s", codeBuf) == 1 && engine) {
+            char path[128];
+            _snprintf(path, sizeof(path), "workresource\\levels\\%s.plb", codeBuf);
+            path[sizeof(path) - 1] = '\0';
+            ((void (__thiscall *)(void *, const char *, BOOL))0x4FFA40)(engine, path, TRUE);
+            LogLine("Auto: END   \"%s\" -> SetPendingLevel(\"%s\")", cmd, path);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (bad code or engine NULL)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "campos ", 7) == 0) {
+        if (sscanf(cmd + 7, "%f %f %f", &a, &b, &c) == 3) {
+            pos[0] = a; pos[1] = b; pos[2] = c;
+            g_camHoldPos[0] = a; g_camHoldPos[1] = b; g_camHoldPos[2] = c;
+            LogLine("Auto: END   \"%s\" -> %s", cmd,
+                    AutoWriteCameraPos(pos) ? "written" : "FAILED (no camera)");
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: campos <x> <y> <z>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "cammove ", 8) == 0) {
+        if (sscanf(cmd + 8, "%f %f %f", &a, &b, &c) == 3 && AutoReadCameraPos(pos)) {
+            pos[0] += a; pos[1] += b; pos[2] += c;
+            g_camHoldPos[0] = pos[0]; g_camHoldPos[1] = pos[1]; g_camHoldPos[2] = pos[2];
+            LogLine("Auto: END   \"%s\" -> %s, now %.1f %.1f %.1f", cmd,
+                    AutoWriteCameraPos(pos) ? "written" : "FAILED",
+                    pos[0], pos[1], pos[2]);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (bad args or no camera)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "camhold ", 8) == 0) {
+        g_camHold = (cmd[8] == '1');
+        if (g_camHold && !AutoReadCameraPos(g_camHoldPos))
+            LogLine("Auto: camhold on, but no camera yet - target stays as last set");
+        LogLine("Auto: END   \"%s\" -> camhold=%d target %.1f %.1f %.1f", cmd, (int)g_camHold,
+                g_camHoldPos[0], g_camHoldPos[1], g_camHoldPos[2]);
+
+    } else if (_strnicmp(cmd, "flag ", 5) == 0) {
+        void *engine = *(void **)0x78BC20;
+        if (sscanf(cmd + 5, "%d %d", &id, &val) == 2 && engine && id >= 0 && id < 256) {
+            unsigned char *flag = (unsigned char *)engine + DEBUG_FLAGS_ARRAY_OFFSET + id;
+            *flag = (unsigned char)(val ? 1 : 0);
+            LogLine("Auto: END   \"%s\" -> debug flag %d = %d", cmd, id, (int)*flag);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: flag <id 0-255> <0|1>)", cmd);
+        }
+
+    } else if (_stricmp(cmd, "status") == 0) {
+        if (AutoReadCameraPos(pos))
+            LogLine("Auto: END   \"status\" -> campos %.2f %.2f %.2f camhold=%d",
+                    pos[0], pos[1], pos[2], (int)g_camHold);
+        else
+            LogLine("Auto: END   \"status\" -> no camera available right now");
+
+    } else {
+        LogLine("Auto: END   \"%s\" -> UNKNOWN command", cmd);
+    }
+}
+
+/* Read the whole drop-file, truncate it, then run each line. Truncation
+ * happens BEFORE execution deliberately: a line still in the file proves it
+ * never ran, which is how XIII's crash was pinned down. */
+static void AutoDrainCommands(void)
+{
+    char  contents[4096];
+    size_t n = 0;
+    FILE *f;
+    char *line, *next;
+
+    f = fopen(g_autoCmdPath, "rb");
+    if (!f) return;
+    n = fread(contents, 1, sizeof(contents) - 1, f);
+    fclose(f);
+    if (n == 0) return;
+    contents[n] = '\0';
+
+    f = fopen(g_autoCmdPath, "wb");
+    if (f) fclose(f);
+
+    line = contents;
+    while (line && *line) {
+        char *end;
+        next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        /* trim */
+        while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+        end = line + strlen(line);
+        while (end > line && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) *--end = '\0';
+        if (*line && *line != '#' && !(line[0] == '/' && line[1] == '/'))
+            AutoRunCommand(line);
+        line = next;
+    }
+}
+
+static void AutomationTick(void)
+{
+    DWORD now;
+    float pos[3];
+
+    if (!g_automationEnabled) return;
+    now = GetTickCount();
+
+    /* Re-apply the held position every frame so the game's own camera update
+     * cannot walk it back - this is what makes a free camera actually hold. */
+    if (g_camHold) AutoWriteCameraPos(g_camHoldPos);
+
+    if (now - g_autoLastPoll >= g_autoPollMs) {
+        g_autoLastPoll = now;
+        if (InterlockedCompareExchange(&g_autoInCommand, 1, 0) == 0) {
+            AutoDrainCommands();
+            InterlockedExchange(&g_autoInCommand, 0);
+        }
+    }
+
+    if (g_autoTelemetryMs && now - g_autoLastTelemetry >= g_autoTelemetryMs) {
+        g_autoLastTelemetry = now;
+        if (AutoReadCameraPos(pos))
+            LogLine("AutoTelem: campos %.2f %.2f %.2f camhold=%d", pos[0], pos[1], pos[2],
+                    (int)g_camHold);
+        else
+            LogLine("AutoTelem: no camera (loading/menu?)");
+    }
+}
+
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
 void __cdecl CandB_AfterBoth_asm(void)
 {
+    /* notes/67: external command queue + camera telemetry. Gated behind
+     * PSYVR_AUTOMATION=1 (default off). See the block above for why this is
+     * safe from this render-path site and what it deliberately will not do. */
+    AutomationTick();
+
     /* notes/59 part 2: F12 - one-shot Lua-free level jump (notes/55's SetPendingLevel finding,
      * never live-tested before now). Opt-in (PSYVR_LEVEL_JUMP_KEY=1, default off) since this calls
      * real, non-diagnostic engine code with a hardcoded level - not something to leave live by
