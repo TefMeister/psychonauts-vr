@@ -3056,6 +3056,58 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> FAILED (expected: camlook <x> <y> <z>)", cmd);
         }
 
+    /* notes/67: dump raw floats from the camera object, to FIND the field the
+     * renderer actually uses for view direction.
+     *
+     * Measured 2026-08-27, and it rules out the obvious candidates:
+     *  - camera+0x08 (position) IS used: writes visibly move the view.
+     *  - camera+0x20 is NOT: a write survives in memory unread and unchanged
+     *    by the game, yet the rendered view does not move at all. It is what
+     *    SetCameraOrientation writes, but not what the renderer consumes.
+     *  - the camera is NOT a look-at rig: sliding it 2500 units sideways
+     *    translated the view and let Raz leave the frame entirely, instead of
+     *    rotating to keep a target centred.
+     * So facing lives in some other field. This dumps a window of the object
+     * as float and hex together, to spot another unit-length vec3 or a
+     * rotation matrix. Read-only.
+     *
+     * Usage: dump 0x0 64   (offset is bytes from the camera pointer) */
+    } else if (_strnicmp(cmd, "dump ", 5) == 0) {
+        unsigned int off = 0; int cnt = 0;
+        if (sscanf(cmd + 5, "%x %d", &off, &cnt) == 2 && cnt > 0 && cnt <= 64 &&
+            off < 0x2000) {
+            void *cam = AutoGetCamera();
+            if (cam) {
+                int i;
+                char line[512];
+                for (i = 0; i < cnt; i += 4) {
+                    const unsigned char *base = (const unsigned char *)cam + off + i * 4;
+                    const float *f = (const float *)base;
+                    const unsigned int *u = (const unsigned int *)base;
+                    int n = (cnt - i) < 4 ? (cnt - i) : 4;
+                    if (n == 4)
+                        _snprintf(line, sizeof(line),
+                                  "+0x%03X: %12.4f %12.4f %12.4f %12.4f | %08X %08X %08X %08X",
+                                  off + i * 4, f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]);
+                    else if (n == 3)
+                        _snprintf(line, sizeof(line), "+0x%03X: %12.4f %12.4f %12.4f | %08X %08X %08X",
+                                  off + i * 4, f[0], f[1], f[2], u[0], u[1], u[2]);
+                    else if (n == 2)
+                        _snprintf(line, sizeof(line), "+0x%03X: %12.4f %12.4f | %08X %08X",
+                                  off + i * 4, f[0], f[1], u[0], u[1]);
+                    else
+                        _snprintf(line, sizeof(line), "+0x%03X: %12.4f | %08X", off + i * 4, f[0], u[0]);
+                    line[sizeof(line) - 1] = '\0';
+                    LogLine("Auto: dump %s", line);
+                }
+                LogLine("Auto: END   \"%s\" -> dumped %d floats from camera+0x%X", cmd, cnt, off);
+            } else {
+                LogLine("Auto: END   \"%s\" -> FAILED (no camera)", cmd);
+            }
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: dump <hexOffset < 0x2000> <count 1..64>)", cmd);
+        }
+
     } else if (_stricmp(cmd, "orient") == 0) {
         void *cam = AutoGetCamera();
         if (cam) {
