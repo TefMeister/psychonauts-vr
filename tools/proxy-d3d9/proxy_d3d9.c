@@ -2990,6 +2990,12 @@ static DI8Create_t        g_pRealDI8Create      = NULL;
 
 static void *g_diMouseDevice = NULL;   /* the ONE device we may touch */
 
+/* notes/67: per-axis override of the gamepad's DIJOYSTATE. Index order matches
+ * the struct: 0=lX 1=lY 2=lZ 3=lRx 4=lRy 5=lRz. Off by default, so real stick
+ * input passes through untouched. */
+static int  g_padOverrideOn[6]  = { 0, 0, 0, 0, 0, 0 };
+static LONG g_padOverrideVal[6] = { 0, 0, 0, 0, 0, 0 };
+
 /* notes/67: GetDeviceState probe. Answers, with data instead of inference:
  *   - does the game poll DirectInput at all, and for WHICH devices
  *   - do real mouse movements actually arrive as non-zero lX/lY
@@ -3005,6 +3011,8 @@ typedef struct {
     DWORD  lastCb;
     LONG   maxAbsX, maxAbsY;
     LONG   lastX, lastY;
+    int    axisSeen;
+    LONG   axMin[6], axMax[6], axLast[6];
 } DIProbeDev;
 static DIProbeDev  g_diProbe[DIPROBE_MAX_DEV];
 static volatile LONG g_diProbeActive = 0;
@@ -3021,6 +3029,24 @@ static void DIProbeRecord(void *dev, DWORD cb, const void *data)
     if (slot < 0) return;
     g_diProbe[slot].calls++;
     g_diProbe[slot].lastCb = cb;
+    /* notes/67: a DIJOYSTATE is exactly 80 bytes and starts with six LONG axes
+     * (lX lY lZ lRx lRy lRz). Log their range so the resting centre and the
+     * axis scale are known BEFORE anything is injected - guessing a magnitude
+     * is how the mouse attempt wasted a session. */
+    if (cb == 80 && data) {
+        const LONG *ax = (const LONG *)data;
+        int a;
+        for (a = 0; a < 6; a++) {
+            if (!g_diProbe[slot].axisSeen) {
+                g_diProbe[slot].axMin[a] = ax[a]; g_diProbe[slot].axMax[a] = ax[a];
+            } else {
+                if (ax[a] < g_diProbe[slot].axMin[a]) g_diProbe[slot].axMin[a] = ax[a];
+                if (ax[a] > g_diProbe[slot].axMax[a]) g_diProbe[slot].axMax[a] = ax[a];
+            }
+            g_diProbe[slot].axLast[a] = ax[a];
+        }
+        g_diProbe[slot].axisSeen = 1;
+    }
     /* Only interpret the first two LONGs as axes for the known mouse device -
      * for anything else (a keyboard's byte array) that would be nonsense. */
     if (dev == g_diMouseDevice && data && cb >= 3 * sizeof(LONG)) {
@@ -3047,6 +3073,18 @@ static void DIProbeReport(void)
                 g_diProbe[i].calls, g_diProbe[i].lastCb, g_diProbe[i].nonzero,
                 g_diProbe[i].maxAbsX, g_diProbe[i].maxAbsY,
                 g_diProbe[i].lastX, g_diProbe[i].lastY);
+        if (g_diProbe[i].axisSeen) {
+            LogLine("MouseProbe:   axes min  X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld",
+                    g_diProbe[i].axMin[0], g_diProbe[i].axMin[1], g_diProbe[i].axMin[2],
+                    g_diProbe[i].axMin[3], g_diProbe[i].axMin[4], g_diProbe[i].axMin[5]);
+            LogLine("MouseProbe:   axes max  X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld",
+                    g_diProbe[i].axMax[0], g_diProbe[i].axMax[1], g_diProbe[i].axMax[2],
+                    g_diProbe[i].axMax[3], g_diProbe[i].axMax[4], g_diProbe[i].axMax[5]);
+            LogLine("MouseProbe:   axes rest X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld  "
+                    "(an axis whose min!=max is one you MOVED)",
+                    g_diProbe[i].axLast[0], g_diProbe[i].axLast[1], g_diProbe[i].axLast[2],
+                    g_diProbe[i].axLast[3], g_diProbe[i].axLast[4], g_diProbe[i].axLast[5]);
+        }
     }
     LogLine("MouseProbe: (no [MOUSE] row at all = the game never polled the mouse "
             "through GetDeviceState during the window)");
@@ -3078,6 +3116,23 @@ static HRESULT WINAPI Hook_DIGetDeviceState(void *dev, DWORD cb, void *data)
             DIProbeReport();
         } else if (SUCCEEDED(hr)) {
             DIProbeRecord(dev, cb, data);
+        }
+    }
+
+    /* notes/67: GAMEPAD axis override. The probe proved the game polls a
+     * DIJOYSTATE (cb == 80) every frame while never polling the mouse through
+     * this API at all - so this, not the mouse, is the injection path that can
+     * actually reach the camera. Identified by buffer size rather than by a
+     * stored device pointer, so it keeps working if the pad is re-created.
+     *
+     * Absolute, not additive: an analog axis is a position, so we SET it while
+     * an override is active and leave it alone otherwise (real stick input
+     * passes through untouched). */
+    if (SUCCEEDED(hr) && data && cb == 80) {
+        int a;
+        LONG *ax = (LONG *)data;
+        for (a = 0; a < 6; a++) {
+            if (g_padOverrideOn[a]) ax[a] = g_padOverrideVal[a];
         }
     }
 
@@ -3233,6 +3288,35 @@ static void AutoRunCommand(const char *cmd)
         } else {
             LogLine("Auto: END   \"%s\" -> FAILED (expected: mouseprobe <1..120 seconds>)", cmd);
         }
+
+    /* notes/67: drive a gamepad axis. THIS is the working injection path -
+     * the game polls the pad every frame and never polls the mouse through
+     * DirectInput. Index: 0=lX 1=lY 2=lZ 3=lRx 4=lRy 5=lRz.
+     *   padaxis 3 40000   hold axis lRx at 40000
+     *   padaxis 3 off     release it back to the real stick */
+    } else if (_strnicmp(cmd, "padaxis ", 8) == 0) {
+        int idx = 0; char valBuf[32];
+        if (sscanf(cmd + 8, "%d %31s", &idx, valBuf) == 2 && idx >= 0 && idx < 6) {
+            if (_stricmp(valBuf, "off") == 0) {
+                g_padOverrideOn[idx] = 0;
+                LogLine("Auto: END   \"%s\" -> axis %d released to real hardware", cmd, idx);
+            } else {
+                int v = 0;
+                if (sscanf(valBuf, "%d", &v) == 1) {
+                    g_padOverrideVal[idx] = (LONG)v;
+                    g_padOverrideOn[idx]  = 1;
+                    LogLine("Auto: END   \"%s\" -> axis %d held at %d", cmd, idx, v);
+                } else {
+                    LogLine("Auto: END   \"%s\" -> FAILED (value must be a number or 'off')", cmd);
+                }
+            }
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: padaxis <0..5> <value|off>)", cmd);
+        }
+
+    } else if (_stricmp(cmd, "padrelease") == 0) {
+        int a; for (a = 0; a < 6; a++) g_padOverrideOn[a] = 0;
+        LogLine("Auto: END   \"padrelease\" -> all gamepad axes released to real hardware");
 
     } else if (_strnicmp(cmd, "mousedx ", 8) == 0) {
         int v = 0;
