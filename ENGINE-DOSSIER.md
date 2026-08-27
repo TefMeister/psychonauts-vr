@@ -279,11 +279,27 @@ should reach any of the 1129 bindings whose real work is field writes or a
 is the obvious next target, since §11 records the FP/orientation work as blocked
 waiting for exactly that.
 
-**Static only — not live-verified.** Unconfirmed: the guard's exact meaning,
-matrix row/column order, euler order and units, and whether an orientation write
-also needs the dirty bit. Position is the safest first live test. Full
-derivation with disassembly in dev-archive
-`recon/2026-08-27-camera-control-without-lua/`.
+**✅ LIVE-VERIFIED 2026-08-27, first try, in a real level.** Reading returns
+plausible world coordinates; writing moves the camera; the new position holds;
+and the **rendered image visibly changes** (before/after captures). Full chain
+proven: text-file command → dispatch → memory write → holds → renders.
+Position went 277→577 in menu space, then a held camera in Sasha's Lab was
+flown a three-leg path (+400 Y, +500 X, +600 Z), each leg landing exactly.
+
+Still unverified: **orientation** (`camera+0x20`) was not exercised — matrix
+row/column order, euler order and units remain unknown, as does whether an
+orientation write needs the dirty bit. Only position has been tested.
+
+One nuance worth keeping: after `camhold 0` the camera **stayed where it was
+put** rather than snapping back. That does not prove the engine yielded
+control — the test was during a dialogue scene whose camera is static anyway.
+The camera *was* observed moving under engine control during the level-load
+intro, so it does drive it in some states. Whether a held camera fights the
+engine during normal gameplay movement is still an open question.
+
+Full derivation with disassembly in dev-archive
+`recon/2026-08-27-camera-control-without-lua/`; the harness that drives it is
+notes/67 (`PSYVR_AUTOMATION=1`).
 
 ## 10. Autonomous harness recipe (this game)
 
