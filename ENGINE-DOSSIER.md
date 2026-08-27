@@ -233,6 +233,58 @@ Non-Lua, engine-native (already in use): `FirstPersonCamera` mode is
 reported to exist in the engine (notes/44, from string/function evidence);
 not yet exercised.
 
+### ⚠️ Correction (2026-08-27): the camera bindings do NOT require Lua exec
+
+The table above frames these as "callable once in-process Lua execution
+exists". **For the camera bindings that is wrong**, and it has been gating the
+wrong work. Static disassembly of the shims (file only — game not launched)
+shows every binding is a **two-layer** construction:
+
+- **shim** (e.g. `SetCameraPosition` `0x00568FA0`) — `int f(lua_State* L)`,
+  does a stack switch via `0x0078CBCC`/`0x0078CBD0`, calls the impl.
+- **impl** (`0x00569000`) — pulls args off the Lua stack, then does **plain
+  engine work**.
+
+Strip the argument-marshalling half and `SetCameraPosition` is three float
+stores and a bit:
+
+```c
+void  *mgr = *(void **)0x0078BC20;      /* same singleton as SetPendingLevel */
+if (!Guard(mgr))  return;               /* __thiscall BOOL  @ 0x00504220 */
+void  *cam = GetCamera(mgr);            /* __thiscall void* @ 0x004FA5A0 */
+*(float *)((char *)cam + 0x08) = x;
+*(float *)((char *)cam + 0x0C) = y;
+*(float *)((char *)cam + 0x10) = z;
+*((unsigned char *)cam + 0x530) |= 1;   /* dirty flag */
+```
+
+| thing | address / offset |
+|---|---|
+| engine singleton | `*(void**)0x0078BC20` |
+| validity guard (bail if 0) | `0x00504220` — `__thiscall BOOL(mgr)` |
+| get camera | `0x004FA5A0` — `__thiscall void*(mgr)` |
+| camera position | `camera + 0x08` (3 × float) |
+| camera orientation | `camera + 0x20` (3×3 matrix) |
+| camera dirty flag | `camera + 0x530`, bit 0 |
+| euler → matrix helper | `0x0069F400` — `__thiscall(outMatrix, float* euler)` |
+| Lua arg-count check / get-number | `0x005AF750` / `0x005B0230` |
+
+`SetCameraOrientation` (`0x00569220`) is the same shape, writing a matrix to
+`camera+0x20` via the converter.
+
+**Consequence:** free camera movement — the project's stated North-Star-adjacent
+goal — needs **no Lua interpreter and no `0x6B0C00`**. The same two-layer trick
+should reach any of the 1129 bindings whose real work is field writes or a
+`__thiscall` on the singleton; `GetBoneWorldPosition` (`0x005B1630`/`0x005B1690`)
+is the obvious next target, since §11 records the FP/orientation work as blocked
+waiting for exactly that.
+
+**Static only — not live-verified.** Unconfirmed: the guard's exact meaning,
+matrix row/column order, euler order and units, and whether an orientation write
+also needs the dirty bit. Position is the safest first live test. Full
+derivation with disassembly in dev-archive
+`recon/2026-08-27-camera-control-without-lua/`.
+
 ## 10. Autonomous harness recipe (this game)
 
 - **Foreground-focus grab, FIXED session 54 (durable infrastructure, applies to ALL future input
