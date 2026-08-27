@@ -2990,6 +2990,68 @@ static DI8Create_t        g_pRealDI8Create      = NULL;
 
 static void *g_diMouseDevice = NULL;   /* the ONE device we may touch */
 
+/* notes/67: GetDeviceState probe. Answers, with data instead of inference:
+ *   - does the game poll DirectInput at all, and for WHICH devices
+ *   - do real mouse movements actually arrive as non-zero lX/lY
+ *   - what magnitudes look like, so injected deltas can be scaled sensibly
+ * Every distinct device pointer is tracked separately, which also reveals a
+ * gamepad if one is being polled - relevant when a controller is plugged in.
+ * Armed for a fixed window by the `mouseprobe <seconds>` command. */
+#define DIPROBE_MAX_DEV 6
+typedef struct {
+    void  *dev;
+    LONG   calls;
+    LONG   nonzero;
+    DWORD  lastCb;
+    LONG   maxAbsX, maxAbsY;
+    LONG   lastX, lastY;
+} DIProbeDev;
+static DIProbeDev  g_diProbe[DIPROBE_MAX_DEV];
+static volatile LONG g_diProbeActive = 0;
+static DWORD        g_diProbeUntil   = 0;
+
+static void DIProbeRecord(void *dev, DWORD cb, const void *data)
+{
+    int i, slot = -1;
+    LONG x = 0, y = 0;
+    for (i = 0; i < DIPROBE_MAX_DEV; i++) {
+        if (g_diProbe[i].dev == dev) { slot = i; break; }
+        if (g_diProbe[i].dev == NULL) { g_diProbe[i].dev = dev; slot = i; break; }
+    }
+    if (slot < 0) return;
+    g_diProbe[slot].calls++;
+    g_diProbe[slot].lastCb = cb;
+    /* Only interpret the first two LONGs as axes for the known mouse device -
+     * for anything else (a keyboard's byte array) that would be nonsense. */
+    if (dev == g_diMouseDevice && data && cb >= 3 * sizeof(LONG)) {
+        x = ((const LONG *)data)[0];
+        y = ((const LONG *)data)[1];
+        if (x || y) {
+            g_diProbe[slot].nonzero++;
+            g_diProbe[slot].lastX = x; g_diProbe[slot].lastY = y;
+            if (x < 0 ? -x : x > g_diProbe[slot].maxAbsX) g_diProbe[slot].maxAbsX = (x < 0 ? -x : x);
+            if (y < 0 ? -y : y > g_diProbe[slot].maxAbsY) g_diProbe[slot].maxAbsY = (y < 0 ? -y : y);
+        }
+    }
+}
+
+static void DIProbeReport(void)
+{
+    int i;
+    LogLine("MouseProbe: === results ===");
+    for (i = 0; i < DIPROBE_MAX_DEV; i++) {
+        if (!g_diProbe[i].dev) continue;
+        LogLine("MouseProbe: dev=%p %s calls=%ld cb=%lu nonzeroMotion=%ld maxAbs=(%ld,%ld) last=(%ld,%ld)",
+                g_diProbe[i].dev,
+                (g_diProbe[i].dev == g_diMouseDevice) ? "[MOUSE]" : "[other]",
+                g_diProbe[i].calls, g_diProbe[i].lastCb, g_diProbe[i].nonzero,
+                g_diProbe[i].maxAbsX, g_diProbe[i].maxAbsY,
+                g_diProbe[i].lastX, g_diProbe[i].lastY);
+    }
+    LogLine("MouseProbe: (no [MOUSE] row at all = the game never polled the mouse "
+            "through GetDeviceState during the window)");
+}
+
 static HRESULT WINAPI Hook_DIGetDeviceState(void *dev, DWORD cb, void *data)
 {
     HRESULT hr = g_pRealGetDeviceState(dev, cb, data);
@@ -3008,6 +3070,17 @@ static HRESULT WINAPI Hook_DIGetDeviceState(void *dev, DWORD cb, void *data)
      *
      * DIMOUSESTATE also starts with three LONG axes, so the size check stays
      * as a second line of defence. */
+    /* Probe first: record what the game ACTUALLY receives, before we add
+     * anything, so the numbers describe the game's own input not ours. */
+    if (g_diProbeActive) {
+        if ((LONG)(GetTickCount() - g_diProbeUntil) >= 0) {
+            InterlockedExchange(&g_diProbeActive, 0);
+            DIProbeReport();
+        } else if (SUCCEEDED(hr)) {
+            DIProbeRecord(dev, cb, data);
+        }
+    }
+
     if (SUCCEEDED(hr) && data && dev == g_diMouseDevice && cb >= 3 * sizeof(LONG)) {
         LONG dx = InterlockedExchange(&g_injectMouseDX, 0);
         LONG dy = InterlockedExchange(&g_injectMouseDY, 0);
@@ -3145,6 +3218,22 @@ static void AutoRunCommand(const char *cmd)
     /* notes/67: queue a synthetic mouse delta. Deltas are RELATIVE, so this is
      * one-shot: the next GetDeviceState poll consumes it and the camera turns
      * by that much, rather than spinning continuously. */
+    /* notes/67: arm the DirectInput probe for N seconds. Move the mouse (and
+     * the controller sticks) during the window; the report names every device
+     * the game polled, how often, and whether real motion arrived. */
+    } else if (_strnicmp(cmd, "mouseprobe ", 11) == 0) {
+        int secs = 0;
+        if (sscanf(cmd + 11, "%d", &secs) == 1 && secs > 0 && secs <= 120) {
+            memset(g_diProbe, 0, sizeof(g_diProbe));
+            g_diProbeUntil = GetTickCount() + (DWORD)(secs * 1000);
+            InterlockedExchange(&g_diProbeActive, 1);
+            LogLine("Auto: END   \"%s\" -> probe armed for %d s. MOVE THE MOUSE NOW. "
+                    "Hook installed=%d, known mouse device=%p",
+                    cmd, secs, g_pRealGetDeviceState != NULL, g_diMouseDevice);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: mouseprobe <1..120 seconds>)", cmd);
+        }
+
     } else if (_strnicmp(cmd, "mousedx ", 8) == 0) {
         int v = 0;
         if (sscanf(cmd + 8, "%d", &v) == 1) {
