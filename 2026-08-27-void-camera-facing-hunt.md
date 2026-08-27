@@ -92,6 +92,66 @@ it. Two corrections from the user during it, both worth recording: the doors are
 easy to misidentify from a stereo capture (I read blue as green), and the action
 key is **SPACE**, not ENTER — ENTER does nothing on the door prompt.
 
+## FOUND: the real camera matrices — and why writing them still does not work (yet)
+
+Dumped the camera object and diffed it across a camera turn. Two 4×4 matrices,
+both of which moved while everything around them stayed put:
+
+| offset | rows | translation | identification |
+| --- | --- | --- | --- |
+| `+0x50` | 0x50/0x60/0x70 | `+0x80` = (−4173, 21382, 24637) | **view matrix** (world→camera) |
+| `+0x90` | 0x90/0xA0/0xB0 | `+0xC0` = (17047, 8817, −26707) | **camera world matrix** |
+
+Three things confirm it rather than one suggestive number: the rotations are
+**exact transposes** of each other (the view/world relationship); `+0xC0` sits
+near the camera position while `+0x80` is in the `−R·p` form a view matrix
+takes; and both changed on a camera turn. Rows are 4 floats (16-byte stride).
+
+**World up is Z** — row 0 of the world matrix (the camera's *right* vector)
+reads `Z = 0.0000` exactly, which only holds for a right vector kept
+horizontal. Worth having on its own: session 51 lost time to a hardcoded +Y up
+that was wrong for some levels.
+
+Row identification, from the same dump: row0 = right, row1 = up
+(`0.1856 0.1552 0.9703`, mostly +Z), row2 = **forward**
+(`−0.7443 −0.6225 0.2419`).
+
+### ❌ `camyaw` does not work — overwritten, not mis-aimed
+
+Built `camyaw <deg>` (rotate the world matrix about Z) and applied it from
+`CandB_BeforeEye1`, i.e. before the engine renders and culls.
+
+- **Controlled A/B/A with the camera frozen:** yaw 0 → 9.95 % black, yaw 90 →
+  10.12 %, yaw 0 again → 10.00 %, with matching column profiles. No visible
+  change at all.
+- **Diagnostic:** dumped `+0x90` with yaw 0 and with yaw 90 applied. The rows
+  came back **bit-for-bit identical** (`3F2438D3 BF44629C …` both times).
+
+So the write is being **completely overwritten inside the same frame**. This is
+a *timing* failure, not a wrong-field failure — which is the opposite of the
+`+0x20` case, where the write survived untouched and was simply never read.
+Taken together those two results bracket the problem nicely.
+
+**Most likely cause:** `CandB` is the engine's own camera-update tick (notes/59
+established that, including its reentrancy guard). `BeforeEye1` runs *before*
+`CandB`, so the camera update inside `CandB` recomputes the matrix over our
+write. To land, the write has to happen **after** the camera update but
+**before** the draw traversal — i.e. inside `CandB`, not around it.
+
+### Live-scouting is limited by the same bug
+
+Tried to find the exit from Boyd's house by flying the free camera. It moves
+freely and passes through walls (position writes have no collision), but with
+rotation not working the camera can only *translate* — it always looks the same
+way. Scouting an unfamiliar interior while unable to turn is slow, and that
+limitation is exactly the unfixed bug. Walking Raz normally works better for
+now. **Did not reach the outdoor neighbourhood this session.**
+
+Incidental: the figment tutorial popup blocks input until dismissed, and
+`BACKSPACE` does not do it. One of `ESC`/`X`/`C` cleared it (not isolated
+which — ESC appears to open the Journal, so likely `X` or `C` closed that).
+Worth pinning down, since these popups will stall any unattended run.
+
 ## Next
 
 1. `dump` the camera object around the known fields, hunting a second
