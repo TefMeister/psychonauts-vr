@@ -227,6 +227,22 @@ we've exercised:
 | `SetEntityAlpha` / `SetEntityVisible` | `0x00593DA0` / `0x00593AA0` | Hide/fade an entity |
 | `SetShadowFixedDirection` etc. | (see §8) | Shadow control, untested |
 | `LoadNewLevel` | `0x005BBA90` (shim) / `0x005BBAF0` (impl) | **Fully mapped, session 55, NOT via Lua** — see the level-loader entry below and §11. Formats `name` into `workresource\levels\<name>.plb` (or uses `name` as-is if it already has an extension), then calls `SetPendingLevel`. |
+> **⚠️ LEVEL-CODE LABELS ARE FILENAME-DERIVED AND AT LEAST ONE IS WRONG
+> (2026-08-27).** `CAJA` is labelled "Sasha's Lab" below from the
+> `CAJA_sashalab_load.dds` string match. Live, that level's NPC is **Ford
+> Cruller** — the conversation is about raking leaves in disguise and the
+> equipment in his underground sanctuary, and a close-up confirms the old man
+> with the big nose and white hair, not Sasha Nein. **Content beats filename.**
+> Treat every notes/55 label as a hypothesis until seen in game; if one is
+> wrong on filename evidence, others may be.
+>
+> **Driving a conversation** (verified 2026-08-27): `tools/input/send_key.ps1`
+> works on the dialogue UI — DOWN (`0xD0` **extended**) moves the option
+> marker, ENTER (`0x1C`) selects, and picking the last ("I'd better go") option
+> ends the conversation and returns live gameplay. ESC opens the **Journal**,
+> it does not dismiss dialogue. Needs the window foreground, unlike the
+> focus-independent camera/level commands.
+
 | `SetPendingLevel` (not a Lua binding — internal, called BY `LoadNewLevel`'s impl) | `0x004FFA40` | `__thiscall void(void* levelMgr, const char* path, BOOL flag)` on the singleton at `*(void**)0x78BC20` — stages an async level-transition request. **Callable directly from our own DLL code, no Lua needed at all.** See notes/55 for the full 49-code level list and the confirmed `STMU`=menu / `CA*`=Campgrounds / `CAJA`=Sasha's Lab identifications.
 
 Non-Lua, engine-native (already in use): `FirstPersonCamera` mode is
