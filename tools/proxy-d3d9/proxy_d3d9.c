@@ -2943,10 +2943,41 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> FAILED (expected: flag <id 0-255> <0|1>)", cmd);
         }
 
+    /* notes/67: live-tunable UI knobs. These were env-var-only, so every
+     * experiment cost a relaunch (and a relaunch costs the user, since only
+     * they may start the game). They are plain floats consumed by existing
+     * per-draw code, so changing them mid-session is safe and takes effect on
+     * the next frame. */
+    } else if (_strnicmp(cmd, "uidepth ", 8) == 0) {
+        if (sscanf(cmd + 8, "%f", &a) == 1 && a >= 0.0f) {
+            g_uiDepthWorld = a;
+            LogLine("Auto: END   \"%s\" -> UI depth = %.0f world units (0 = infinity)", cmd, a);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: uidepth <world units, 0 = off>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "uiscale ", 8) == 0) {
+        if (sscanf(cmd + 8, "%f", &a) == 1 && a > 0.0f) {
+            g_uiVpScale = a;
+            LogLine("Auto: END   \"%s\" -> UI viewport scale = %.2f", cmd, a);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: uiscale <factor > 0>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "trace ", 6) == 0) {
+        /* Arms the notes/35 one-frame trace, which includes the TRACE-UI lines
+         * carrying each UI draw's shader index and vertex positions - the
+         * per-draw identity needed to tell one HUD element from another. */
+        g_traceFrames = (cmd[6] == '1');
+        LogLine("Auto: END   \"%s\" -> one-frame trace %s", cmd,
+                g_traceFrames ? "ARMED (one frame every ~5s)" : "off");
+
     } else if (_stricmp(cmd, "status") == 0) {
         if (AutoReadCameraPos(pos))
-            LogLine("Auto: END   \"status\" -> campos %.2f %.2f %.2f camhold=%d",
-                    pos[0], pos[1], pos[2], (int)g_camHold);
+            LogLine("Auto: END   \"status\" -> campos %.2f %.2f %.2f camhold=%d uidepth=%.0f "
+                    "uiscale=%.2f trace=%d",
+                    pos[0], pos[1], pos[2], (int)g_camHold, g_uiDepthWorld, g_uiVpScale,
+                    (int)g_traceFrames);
         else
             LogLine("Auto: END   \"status\" -> no camera available right now");
 
