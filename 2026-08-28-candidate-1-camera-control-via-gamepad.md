@@ -163,3 +163,71 @@ cannot follow.
 3. The **buffered mouse path** (`GetDeviceData`) is now known and is untested
    as an input route — worth checking whether it is subject to the same clamp,
    since it is a different code path into the same camera.
+
+---
+
+# The clamp is real and cannot be beaten from outside (2026-08-28)
+
+Three independent attempts, all negative, so this is now settled rather than
+suspected.
+
+## 1. Over-driving the axis does nothing
+
+The axis range is −1000…+1000. Feeding values far beyond it:
+
+| axis 5 | resulting yaw |
+| --- | --- |
+| 1,000 | −55.6° |
+| 5,000 | −55.6° |
+| 20,000 | −55.6° |
+| 100,000 | −55.6° |
+
+Identical to one decimal place. **The game clamps the axis value on input.**
+
+## 2. The yaw scalars are derived copies, not drivers
+
+`+0x154` and `+0x174` looked like the camera's yaw in radians, and moved by
+~30° when the camera swung 34.4°. But forcing either of them 180° round, held
+every frame:
+
+- the write **stuck** — reads back our value, unchanged by the engine
+- the camera **did not move at all**
+
+That is the `camera+0x20` signature again: **written, never read.** They are
+downstream copies of the camera's state, not inputs to it.
+
+**Tally of camera fields that hold camera data but do not drive the render:**
+`+0x20` (what `SetCameraOrientation` writes), `+0x154`, `+0x174`. And
+`+0x90` (the real world matrix) *is* read, but is recomputed inside the frame
+so a write cannot survive. Four fields, four different reasons it does not work.
+
+## Conclusion: Candidate 1 is a PARTIAL cure
+
+- **It genuinely works.** The camera turns, causally and repeatably, and the
+  engine's culling follows — which no FOV widen can achieve.
+- **It is bounded** by the game's own free-look clamp, ~100–150° of total range,
+  enforced on the input value and not reachable by memory writes.
+- **So a head turning fully behind cannot be followed.** Within the clamp there
+  is no void; beyond it the game camera stops while the headset view continues,
+  and the unrendered region returns.
+
+## What is left to try, in order of promise
+
+1. **Find the clamp constant in code, not data.** It is enforced somewhere in
+   the camera update; a comparison against a float or a `fclamp`-style call.
+   Static disassembly around the camera update is the honest next step — the
+   data-side search has now failed four times and should stop.
+2. **The buffered mouse path** (`GetDeviceData`) is known and untested as an
+   input route. It is a different code path into the same camera and may not
+   share the stick's clamp. Cheap to test, and the one remaining input avenue.
+3. **Accept the clamp and scale.** Map head yaw into the available range: no
+   void, but head and view disagree. A comfort trade-off that needs a headset to
+   judge, so it belongs to the user, not to a monitor here.
+
+## Also learned, from the user
+
+**The Milkman Conspiracy interior has no exit door until a gated sequence is
+done** — open the fridge, take the merit badge, use it, *then* the door appears.
+An earlier session spent a long stretch hunting for a door that did not yet
+exist. Recorded in the game profile so no future session repeats it: an exit
+that is absent until a trigger fires looks exactly like a navigation failure.
