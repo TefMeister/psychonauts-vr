@@ -160,3 +160,45 @@ widen belongs where VR is actually on, not globally.
    disassembly of the camera update is the honest next route.
 3. **Investigate the overhead residual specifically.** It may be a pitch-axis
    equivalent of the same clamp, in which case the same fix applies twice.
+
+---
+
+# ⚠️ CORRECTION (2026-08-28): the residual is NOT overhead — it is still behind
+
+The section above claims the remaining void after combining both fixes sits
+"**overhead**, not a surrounding abyss", and speculates it may be a pitch-axis
+clamp. **Both claims are withdrawn.**
+
+**The user, who watched the swing live, reported the void was still behind Raz.**
+Re-measuring with a vertical profile confirms them:
+
+```
+f00  columns L..R:   0.0  0.2  0.6  2.1 | 22.2 34.8 35.6 34.8   <- black on the RIGHT
+     rows    T..B:  27.9 44.5 51.0 26.5 |  2.9  0.6  4.4  2.3   <- above the ground line
+f01  columns L..R:  15.5 24.6 29.4 37.0 | 24.5  0.5  2.1  4.9   <- black on the LEFT
+     rows    T..B:  17.4 41.6 51.2 22.9 |  0.2  0.6  4.4  2.3
+```
+
+The black **migrates left↔right across frames**, tracking the swing. It is a
+horizontal band that happens to sit above the ground plane — because the ground
+is close to the camera and always renders, while everything beyond it in the
+swing direction does not. Vertically it is concentrated in rows 1–4 of 8 and
+essentially absent from the bottom half.
+
+So it is the **yaw void**, reduced but unchanged in character. **The fix target
+remains the yaw free-look clamp**; there is no evidence of a separate pitch
+problem, and chasing one would have been wasted effort.
+
+## Root cause of the wrong claim — a tooling gap, now fixed
+
+`analyze-capture.ps1` only produced a **column** profile. It had no vertical
+information whatsoever, so "the black is overhead" could not have come from the
+data — it came from eyeballing a single frame and generalising.
+
+The tool now reports a **row profile alongside the column profile**, so the
+shape of a region is read off both axes instead of inferred from one image. Had
+that existed, the wrong claim was not available to make.
+
+This is the same failure mode as earlier in the session: trusting an impression
+over a measurement. The difference is that here the measurement did not exist
+yet, which is the more insidious version.
