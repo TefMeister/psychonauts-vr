@@ -379,3 +379,80 @@ not happen"; without it, a fall and a turn produce identical yaw evidence.
 This level kills the character for leaving the path, which makes it a poor place
 to test movement. Any re-test should use an enclosed area with no fall hazard,
 verify position stability between samples, and confirm visually.
+
+---
+
+# ✅ RE-TESTED PROPERLY: body facing DOES beat the clamp — with one real limitation
+
+The withdrawn 317.7° claim has now been re-tested in a **fall-free area**
+(Campgrounds Main, the user's save slot 3, provided specifically because the
+character cannot fall off the map there), with **position logged alongside yaw**
+so a teleport cannot masquerade as rotation.
+
+## The clean result
+
+```
+step  yaw       moved
+ 0    176.7       0
+ 1   -177.3      30     <- wraps through 180
+ 2   -168.9     147
+ 3    -96.8     168
+ 4     13.5     548
+ 5     23.2     183
+ 6     25.3     122
+ 7     31.1      37
+ 8     47.4      42
+ 9     63.7     115
+```
+
+**Monotonic through the ±180° wrap, 247° of continuous rotation**, with position
+deltas of 30–548 units — consistent with *walking*. For contrast, a respawn in
+the earlier contaminated run moved **26,000 units**. No teleports here.
+
+So the original claim was right and its original evidence was worthless. Both
+things are true, and only the re-test establishes anything.
+
+**247° comfortably exceeds the 87.4° free-look clamp**, and it drives the same
+camera, so the engine's culling follows.
+
+## ⚠️ The limitation: rotation is COUPLED TO LOCOMOTION
+
+A second run stopped dead:
+
+```
+step 3:  yaw 168.0   moved  53 units
+step 4:  yaw 168.0   moved   1 unit
+step 5-11: yaw 168.0, moved 0     <- nothing at all
+```
+
+Raz had walked under a wooden structure and wedged. **Movement stopped, and
+rotation stopped with it.** The character turns to face the direction he is
+*moving*; blocked means no movement, which means no turning.
+
+**Consequence for the VR use case:** driving head yaw into body facing only
+rotates the view while the player is actually walking. Stand still — or walk
+into scenery — and the view stops following the head. That is a significant
+practical constraint, not a detail:
+
+- It rules out "turn in place to look around", which is the most natural VR
+  motion of all.
+- It means the void would reappear whenever the player stops moving, which is
+  precisely when someone is most likely to look around.
+
+## Honest status of the void fix
+
+| mechanism | coverage | limitation |
+| --- | --- | --- |
+| FOV widen | halves the void | **mathematical ceiling** at scale ~3.46 |
+| free-look (stick) | closes it within **87.4°** | hard clamp, five attempts to lift it failed |
+| **body facing** | **247°+ measured** | **only while walking** |
+
+None of the three is sufficient alone. Free-look plus FOV was measured at
+**18.5% peak void**. Whether body facing can be added on top — and how it feels
+when the view only follows the head while moving — is the open question.
+
+## Also worth keeping
+
+The earlier "camera-relative feedback loop causes oscillation" hypothesis was
+**wrong**. The oscillation in the contaminated run was falls and respawns, not a
+control loop. In a fall-free area the turn is clean and monotonic.
