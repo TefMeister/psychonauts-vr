@@ -353,6 +353,80 @@ Full derivation with disassembly in dev-archive
 `recon/2026-08-27-camera-control-without-lua/`; the harness that drives it is
 notes/67 (`PSYVR_AUTOMATION=1`).
 
+## 9b. Camera ORIENTATION control — SOLVED 2026-08-28 (and the void with it)
+
+`[verified-live 2026-08-28]` **The camera's real transform is a full 4x4 at
+`camera+0x150`.** Writing it rotates the view *before* the engine culls, so
+culling follows — which answers the black-void problem outright and, with the
+position write at `+0x08`, gives both halves of what first-person needs.
+
+### Layout
+
+Four rows at stride `0x10`; the **columns** are the interesting vectors:
+
+| | offsets | meaning |
+| --- | --- | --- |
+| c0 | `+0x150`, `+0x160`, `+0x170` | right axis, **scaled** (|c0| = 1.538) |
+| c1 | `+0x154`, `+0x164`, `+0x174` | up axis, **scaled** (|c1| = 2.052) |
+| c2 | `+0x158`, `+0x168`, `+0x178` | forward, unit |
+| c3 | `+0x15C`, `+0x16C`, `+0x17C` | forward again, unit (paired with c2) |
+| row 3 | `+0x180`..`+0x18C` | translation, one entry per column |
+
+`|c1|/|c0| = 1.334` — exactly the 4:3 aspect, so c0/c1 carry the projection
+scaling. Row 3 is `dot(O, c_i)` for a single origin **O = −camera position**,
+recovered by solving the 3x3 system rather than assumed (solved
+`(19853.09, −449.75, −17815.21)` against campos `(−19856.37, 451.40, 17824.51)`).
+It is a standard view-matrix translation in a negated space.
+
+### How to rotate it correctly — all three parts matter
+
+1. **Snapshot first, write absolute.** Rotating in place every frame compounds:
+   while the camera is stationary the engine does not rewrite this matrix, so a
+   15-degree hold became a spin (c0.z drifted 0.5160 → 0.1235 in 1.5 s). Take
+   the engine's basis once, then each frame write *snapshot rotated by theta*.
+2. **Rotate all four columns.** c2 and c3 are a matched pair; letting them
+   diverge breaks the render.
+3. **Recompute row 3 to match**: `row3[i] = dot(O, c_i_rotated)`. Leaving the
+   translation on the OLD axes is what wrecked every angle above ~5 degrees —
+   the inconsistency grows with the angle, which is exactly the symptom that was
+   observed and repeatedly misdiagnosed.
+
+Preserving each column's magnitude across the rotation is harmless but was **not**
+the fix — tested and made no difference.
+
+### Result
+
+`[measured 2026-08-28, outdoor camp area]` Black fraction by yaw, with the image
+visually confirmed clean at 5, 30 and 90 degrees:
+
+| yaw | 0 | 5 | 30 | 60 | 90 | 180 |
+| --- | --- | --- | --- | --- | --- | --- |
+| near-black | 3.80% | 2.89% | 2.83% | 2.61% | **2.58%** | 2.44% |
+
+**Turning 90 degrees yields LESS black than not turning at all.** Reversible
+(3.80 → 2.58 → 3.88) and bit-stable (three dumps 1.5 s apart identical). 180 deg
+points into terrain from a low chase-cam and looks degenerate for that reason,
+not from a transform error.
+
+Command: `cambasisyaw <deg>` (0 = off, re-snapshots on every re-arm).
+
+### Why every earlier attempt failed
+
+`[disproved 2026-08-28]` **Every matrix on the camera object is a derived output
+that nothing reads.** Held writes survive an entire frame — verified by dumping
+them back at each hook site — and the image never changes:
+
+- `+0x20` — what `SetCameraOrientation`'s impl writes.
+- `+0x50` — the view matrix. A held `0.0` in `[0][0]` read back as `0.0` at
+  end of frame with the picture unchanged.
+- `+0x90` — the camera world matrix.
+
+This also **corrects the 2026-08-27 diagnosis** that `+0x90` was "overwritten
+inside the same frame". It is not: probing at BeforeEye1 / BeforeEye2 /
+AfterBoth shows the write surviving all of them. The earlier dump was taken
+*before* the write in both the yaw-0 and yaw-90 runs, which shows the engine's
+value either way. Wrong field, not wrong timing.
+
 ## 10. Autonomous harness recipe (this game)
 
 - **Foreground-focus grab, FIXED session 54 (durable infrastructure, applies to ALL future input
