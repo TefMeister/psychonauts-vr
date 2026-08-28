@@ -1231,11 +1231,32 @@ static void VRBridge_ReadEnableFlag(void)
          * margin further) against the void-behind-player bug, per notes/40's mitigation #3 - this
          * is exploratory headroom for that specific test, not a claim that values this high are a
          * good shipping default (see notes/59 for the GPU-cost tradeoff and actual measured result). */
+        /* notes/67 (2026-08-28): ceiling lowered 4.0 -> 3.4 on measured evidence.
+         * A perspective projection is built from tan(fovy/2) and DEGENERATES at
+         * fovy = 180 deg, where the half-angle hits 90, tan goes infinite and
+         * then NEGATIVE - inverting the projection.
+         *
+         * This build's base fovy is 0.9076 rad (52 deg), read from the live BPM
+         * cache (rawFov=312 -> fovy=2.7227 at scale 3.0). So:
+         *     scale 3.0  -> 156 deg   extreme but valid, measured best
+         *     scale 3.46 -> 180 deg   SINGULARITY
+         *     scale 4.0  -> 208 deg   inverted; measured WORSE than 3.0
+         * The old 4.0 ceiling therefore let a user configure a mathematically
+         * broken projection, and the void measurement at 4.0 was recording that
+         * breakage rather than a real plateau. Capped at 3.4 (175 deg) to stay
+         * just under the wall. */
         len = GetEnvironmentVariableA("PSYVR_FOV_SCALE", dbuf, sizeof(dbuf));
         if (len > 0 && len < sizeof(dbuf)) {
             float v = 0.0f;
-            if (sscanf(dbuf, "%f", &v) == 1 && v >= 0.5f && v <= 4.0f)
-                g_fovScaleAsm = v;
+            if (sscanf(dbuf, "%f", &v) == 1) {
+                if (v >= 0.5f && v <= 3.4f) {
+                    g_fovScaleAsm = v;
+                } else if (v > 3.4f) {
+                    g_fovScaleAsm = 3.4f;
+                    LogLine("VRBridge: PSYVR_FOV_SCALE=%.2f exceeds the 3.4 ceiling and would push "
+                            "fovy past 180 deg (projection inverts) - clamped to 3.4", v);
+                }
+            }
         }
         LogLine("VRBridge: FOV scale = %.2f (PSYVR_FOV_SCALE, 0.5..4.0 - ceiling raised from 2.5 "
                 "for notes/59's void-test headroom; 1.0 = game default)", g_fovScaleAsm);
@@ -3480,7 +3501,8 @@ static void AutoRunCommand(const char *cmd)
      * void A/B that 00-status lists as the top open item from "one relaunch per
      * value" (and only the user can relaunch) into one session. */
     } else if (_strnicmp(cmd, "fov ", 4) == 0) {
-        if (sscanf(cmd + 4, "%f", &a) == 1 && a >= 0.5f && a <= 4.0f) {
+        /* Same 3.4 ceiling as the env var - past ~3.46 the projection inverts. */
+        if (sscanf(cmd + 4, "%f", &a) == 1 && a >= 0.5f && a <= 3.4f) {
             g_fovScaleAsm = a;
             LogLine("Auto: END   \"%s\" -> FOV scale = %.2f", cmd, a);
         } else {

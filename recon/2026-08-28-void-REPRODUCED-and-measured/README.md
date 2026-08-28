@@ -202,3 +202,63 @@ that existed, the wrong claim was not available to make.
 This is the same failure mode as earlier in the session: trusting an impression
 over a measurement. The difference is that here the measurement did not exist
 yet, which is the more insidious version.
+
+---
+
+# The FOV widen is at a MATHEMATICAL ceiling, not a tunable one (2026-08-28)
+
+Static disassembly of the game's `BuildProjectionMatrix` (`0x006924D0`),
+plus the live BPM cache, explains the measured plateau exactly — and closes this
+avenue off.
+
+## The function does not clamp
+
+```
+fld   dword [ebp+0x0C]        ; rawFov
+fdiv  qword [0x00703698]      ; = 2.0  -> HALF ANGLE
+fmul  dword [0x00793444]      ; runtime factor (deg->rad)
+rep movsd                     ; copy a 4x4 template
+call  006ECD00                ; build the matrix
+```
+
+No comparison, no clamp, no saturation. It converts units and delegates. So the
+plateau is not the game refusing a wider FOV.
+
+## It is `tan(fovy/2)` running out of road
+
+A perspective projection is built from `tan(fovy/2)`. At `fovy = 180°` the
+half-angle reaches 90°, `tan` goes to infinity and then **negative** — the
+projection inverts.
+
+Live values from the BPM cache: `rawFov=312.000  fovy=2.7227` at scale 3.0, so
+this build's base `fovy` is **0.9076 rad = 52°**. Therefore:
+
+| FOV scale | resulting fovy | state |
+| --- | --- | --- |
+| 1.0 | 52° | normal |
+| 2.0 | 104° | wide |
+| **3.0** | **156°** | extreme but valid — **measured best** |
+| **3.46** | **180°** | **SINGULARITY** |
+| 4.0 | 208° | inverted — **measured worse**, as predicted |
+
+**So the 4.0 measurement was not a plateau. It was recording a broken
+projection.** The widen improves monotonically right up to the wall, and the
+wall is at 3.46.
+
+## Consequence: this avenue is exhausted
+
+The FOV route cannot be pushed further. Not "not yet tuned" — *mathematically
+cannot*, without abandoning a single perspective frustum. 3.0 is already near
+the maximum, and the remaining ~18.5% void can only be reduced by the other
+mechanism: turning the game camera, which means lifting the free-look clamp.
+
+## Fixed: our own ceiling permitted a broken configuration
+
+`PSYVR_FOV_SCALE` accepted up to **4.0** — a value that inverts the
+projection. Lowered to **3.4** (175°, just under the wall) in both the env-var
+parser and the runtime `fov` command, with a log line when a larger value is
+clamped rather than silently accepted.
+
+That ceiling of 4.0 came from notes/59 raising it "for void-test headroom",
+which was reasonable at the time — but nobody had computed where the projection
+actually breaks, so the headroom extended past the edge of the cliff.
