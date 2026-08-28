@@ -98,3 +98,68 @@ to be formally withdrawn — see dev-archive
    experiment rather than an inference.
 3. **The mouse path is also now known** (`GetDeviceData`) if finer control than
    the stick's granularity is wanted later.
+
+---
+
+# Axis mapping and the CLAMP (2026-08-28, same session)
+
+## The mapping
+
+| axis | index | controls |
+| --- | --- | --- |
+| `lZ` | 2 | **pitch** — `+1000` drives the forward vector's Z to **+0.855**, i.e. looking steeply up |
+| `lRz` | 5 | **yaw** — sweeps roughly 97 degrees across `0 .. +1000` |
+| `lX` / `lY` | 0 / 1 | small jitter only (17..25, 33..41) — not the camera |
+| `lRx` / `lRy` | 3 / 4 | pinned at `-1000` — genuinely unmapped |
+
+Yaw sweep measured on axis 5 (world up is Z, so heading is `atan2(y, x)`):
+
+| axis 5 | yaw |
+| --- | --- |
+| −1000 / −500 / 0 | −148.2° (all identical — parked against a limit) |
+| +500 | −107.9° |
+| +1000 | −51.5° |
+
+## ⚠️ The axis is an ABSOLUTE CLAMPED OFFSET, not a rotation rate
+
+Held at `padaxis 5 1000` for **12 seconds**, sampled four times: the camera sat
+at **−82.2° the entire time, byte-identical**. A rate input would have kept
+orbiting; this does not.
+
+**This bounds what Candidate 1 can achieve.** Feeding head yaw into the stick
+rotates the game camera — with culling following, which is the whole point — but
+**only within the game's own free-look clamp**, measured at roughly 100–150° of
+total range depending on the axis combination. It cannot follow a head that
+turns fully behind the player.
+
+So the honest position on the void:
+
+- **Within the clamp**: the game camera genuinely turns and culls correctly.
+  This is real, and better than any FOV widen, which was measured on 2026-08-27
+  to be structurally incapable of closing the void.
+- **Beyond the clamp**: the game camera stops while the headset view keeps going,
+  so the unrendered region returns. Candidate 1 is a **partial** cure, not a
+  complete one, unless a way past the clamp is found.
+
+## No void found within reach
+
+At maximum yaw the frame renders normally — trees, buildings, scenery. Measured
+black went 0.72% → 4.0% → 6.37% across the sweep, but inspecting the captures
+shows that is **Raz's own body and shadowed scenery**, not unrendered space.
+**The void was not reproduced within the reachable range**, which is consistent
+with it living beyond the clamp, where the headset can look but the game camera
+cannot follow.
+
+## Next
+
+1. **Find whether the clamp can be lifted.** It is presumably a value the camera
+   code compares against; if it is a float in the camera object, the existing
+   `dump` command can hunt for it near the known fields. That would turn a
+   partial cure into a complete one.
+2. **Failing that, measure exactly where the clamp sits** in degrees, then decide
+   whether head yaw should be scaled into that range (comfortable, no void, but
+   head and view disagree) or mapped 1:1 (correct, but void beyond the clamp).
+   That is a design decision with a comfort trade-off and belongs to the user.
+3. The **buffered mouse path** (`GetDeviceData`) is now known and is untested
+   as an input route — worth checking whether it is subject to the same clamp,
+   since it is a different code path into the same camera.
