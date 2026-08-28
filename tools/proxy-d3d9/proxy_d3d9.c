@@ -907,6 +907,10 @@ static volatile LONG g_curUIShaderIdx = -1; /* notes/43: which registered UI sha
  * down (they need the projection-cache globals); these two flags are up here because
  * VRBridge_Shutdown (defined earlier) clears them. */
 static BOOL g_trackRefValid = FALSE;
+static float g_trackRefYaw = 0.0f;   /* notes/68: reference yaw, for the head-follow camera */
+static float g_headYawDeg  = 0.0f;   /* notes/68: head yaw relative to that reference, degrees */
+static int   g_camFollowHead  = 0;   /* notes/68: camera transform follows head yaw */
+static float g_camFollowScale = 1.0f;/* sign/gain, tunable live in the headset */
 static BOOL g_trackYValid = FALSE;
 /* notes/51: monitor-only first-person preview. When SteamVR is absent the pose pump is inert and
  * first person never renders. Setting this forces VRBridge_UpdateHeadTracking down its identity-head
@@ -2307,9 +2311,39 @@ static void VRBridge_UpdateHeadTracking(const HmdMatrix34_t *pose34)
         Mat4Identity(trn); trn[12] = -pose[12]; trn[13] = -pose[13]; trn[14] = -pose[14];
         Mat4Identity(ryi); ryi[0] = cyi; ryi[2] = -syi; ryi[8] = syi; ryi[10] = cyi;
         Mat4MulRow(g_trackRefInv, trn, ryi);
+        g_trackRefYaw = yaw;
         g_trackRefValid = TRUE;
         LogLine("HeadTrack: reference captured - pos=(%.3f,%.3f,%.3f)m yaw=%.1fdeg%s",
                 pose[12], pose[13], pose[14], yaw * 57.29578f, g_fakePose ? " (FAKE POSE MODE)" : "");
+    }
+
+    {
+        /* notes/68 part 3: publish head yaw RELATIVE to the reference, wrapped to
+         * +/-180, for the camera-transform follow mode. Computed here because
+         * this is where a validated pose exists. */
+        float yawNow = atan2f(pose[8], pose[10]) - g_trackRefYaw;
+        while (yawNow >  3.14159265f) yawNow -= 6.28318531f;
+        while (yawNow < -3.14159265f) yawNow += 6.28318531f;
+        g_headYawDeg = yawNow * 57.29578f;
+
+        /* ⚠️ AVOID DOUBLE ROTATION. The register-6 correction built below already
+         * rotates the RENDERED IMAGE by head yaw. When camfollow is on, the
+         * engine's own camera is being turned by the same yaw - so leaving yaw in
+         * here too would turn the view TWICE, which in a headset reads as the
+         * world swinging at double head speed. That is not a cosmetic bug; it is
+         * a fast route to motion sickness, so it must not reach a wearer.
+         *
+         * Split the work instead: camfollow owns YAW (it is the half that fixes
+         * culling, and it has no free-look clamp), and the register-6 path keeps
+         * pitch, roll and positional head motion. Cancel yaw out of the pose by
+         * pre-rotating it by -yawNow about the tracking up axis. */
+        if (g_camFollowHead) {
+            float cy = cosf(-yawNow), sy = sinf(-yawNow);
+            float ryi[16], tmp[16];
+            Mat4Identity(ryi); ryi[0] = cy; ryi[2] = -sy; ryi[8] = sy; ryi[10] = cy;
+            Mat4MulRow(tmp, ryi, pose);
+            memcpy(pose, tmp, sizeof(tmp));
+        }
     }
 
     {
@@ -3105,6 +3139,24 @@ static float g_basisOrigin[3];    /* the point row 3 is measured from */
 static int   g_basisOriginOk = 0;
 static int   g_basisSnapValid = 0;
 
+/* notes/68 part 3: drive the camera transform from LIVE HEAD YAW.
+ *
+ * This is the void fix as a player experiences it: turn your head and the game
+ * turns its own camera, so it culls and renders where you are looking. Unlike
+ * the gamepad route there is no 87.4-degree free-look clamp.
+ *
+ * Head yaw relative to the tracking reference, in degrees, published by
+ * VRBridge_UpdateHeadTracking. Sign and gain are runtime-tunable because the
+ * correct sign is a convention question best settled in a headset, not guessed
+ * (XIII needed its HMD yaw negated for the same reason). */
+
+/* What we wrote last frame, so a re-snapshot can tell "the engine updated the
+ * camera" from "this is still our own value". Without this the follow mode
+ * would read back its own write and compound it into a spin - the same bug that
+ * wrecked the first manual attempt. */
+static float g_basisLastWrite[4][3];
+static int   g_basisLastWriteValid = 0;
+
 /* ⚠️ THE TRANSLATION ROW MUST FOLLOW THE ROTATION - this is what broke every
  * larger angle.
  *
@@ -3163,9 +3215,27 @@ static void PsyBasisSnapshot(void *cam)
         g_basisSnapT[col] = *(const float *)(B + 3 * PSY_CAM_BASIS_RSTRIDE + col * 4);
     g_basisOriginOk = PsySolveOrigin();
     g_basisSnapValid = 1;
-    LogLine("CAMBASIS snapshot: origin %s (%.2f %.2f %.2f)",
-            g_basisOriginOk ? "solved" : "SINGULAR - translation will not be corrected",
-            g_basisOrigin[0], g_basisOrigin[1], g_basisOrigin[2]);
+    /* Log only when something a reader would care about changes. In follow mode
+     * the engine legitimately updates the camera EVERY frame, so an unconditional
+     * log here wrote ~60 lines/sec and put 13.6 MB into the proxy log during one
+     * short test - which also buries the lines that matter. */
+    {
+        static int  s_logged = 0;
+        static int  s_lastOk = -1;
+        static float s_lastO[3] = {0,0,0};
+        float d = 0.0f; int i;
+        for (i = 0; i < 3; i++) {
+            float e = g_basisOrigin[i] - s_lastO[i];
+            d += e < 0 ? -e : e;
+        }
+        if (!s_logged || g_basisOriginOk != s_lastOk || d > 500.0f) {
+            LogLine("CAMBASIS snapshot: origin %s (%.2f %.2f %.2f)",
+                    g_basisOriginOk ? "solved" : "SINGULAR - translation will not be corrected",
+                    g_basisOrigin[0], g_basisOrigin[1], g_basisOrigin[2]);
+            s_logged = 1; s_lastOk = g_basisOriginOk;
+            for (i = 0; i < 3; i++) s_lastO[i] = g_basisOrigin[i];
+        }
+    }
 }
 
 /* Write snapshot-rotated-by-deg. ALL FOUR columns, including c3: c2 and c3 are
@@ -3213,7 +3283,33 @@ static void PsyApplyBasisYaw(void *cam, float deg)
         if (g_basisOriginOk)
             *(float *)(B + 3 * PSY_CAM_BASIS_RSTRIDE + col * 4) =
                 g_basisOrigin[0] * nx + g_basisOrigin[1] * ny + g_basisOrigin[2] * nz;
+        g_basisLastWrite[col][0] = nx;
+        g_basisLastWrite[col][1] = ny;
+        g_basisLastWrite[col][2] = nz;
     }
+    g_basisLastWriteValid = 1;
+}
+
+/* Follow live head yaw. Re-snapshots only when the engine itself moved the
+ * camera, detected by comparing against our own last write - so a stationary
+ * camera does not compound, and a moving one still tracks. */
+static void PsyBasisFollowHead(void *cam)
+{
+    const char *B = (const char *)cam + PSY_CAM_BASIS_OFF;
+    int col, row, engineMoved = 0;
+    if (!g_basisLastWriteValid) {
+        engineMoved = 1;
+    } else {
+        for (col = 0; col < 4 && !engineMoved; col++)
+            for (row = 0; row < 3; row++) {
+                float cur = *(const float *)(B + row * PSY_CAM_BASIS_RSTRIDE + col * 4);
+                float d = cur - g_basisLastWrite[col][row];
+                if (d < 0) d = -d;
+                if (d > 1e-5f) { engineMoved = 1; break; }
+            }
+    }
+    if (engineMoved) PsyBasisSnapshot(cam);
+    PsyApplyBasisYaw(cam, g_headYawDeg * g_camFollowScale);
 }
 
 static float g_camYawDeg = 0.0f;   /* 0 = off */
@@ -3309,6 +3405,11 @@ static void ApplyCameraYaw(void)
         if (lc) PsySetLookDir(lc, g_lookHoldDir[0], g_lookHoldDir[1], g_lookHoldDir[2]);
     }
 
+    /* notes/68 part 3: head-follow takes precedence over the manual test yaw. */
+    if (g_camFollowHead) {
+        void *hc = AutoGetCamera();
+        if (hc) PsyBasisFollowHead(hc);
+    } else
     /* notes/68 part 2: rotate the whole basis, every frame, before culling. */
     if (g_camBasisYawOn && g_camBasisYawDeg != 0.0f) {
         void *bc = AutoGetCamera();
@@ -3759,6 +3860,25 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> camera yaw = %.1f deg (0 = off), site %d", cmd, a, g_camYawSite);
         } else {
             LogLine("Auto: END   \"%s\" -> FAILED (expected: camyaw <degrees>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "camfollow ", 10) == 0) {
+        /* notes/68 part 3: drive the game's own camera transform from live head
+         * yaw, before culling. This is the void fix as a player experiences it. */
+        g_camFollowHead = (cmd[10] == '1');
+        if (!g_camFollowHead) { g_basisSnapValid = 0; g_basisLastWriteValid = 0; }
+        LogLine("Auto: END   \"%s\" -> camera follows head = %d (scale %.2f, head yaw now %.1f deg)",
+                cmd, g_camFollowHead, g_camFollowScale, g_headYawDeg);
+
+    } else if (_strnicmp(cmd, "camfollowscale ", 15) == 0) {
+        /* Sign/gain, tunable live: the correct sign is a convention question and
+         * is best settled by looking through the headset rather than guessed.
+         * -1 mirrors, values <1 damp the turn, >1 amplify it. */
+        if (sscanf(cmd + 15, "%f", &a) == 1 && a >= -4.0f && a <= 4.0f) {
+            g_camFollowScale = a;
+            LogLine("Auto: END   \"%s\" -> follow scale = %.2f", cmd, a);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: camfollowscale <-4.0..4.0>)", cmd);
         }
 
     } else if (_strnicmp(cmd, "cambasisyaw ", 12) == 0) {
@@ -5172,8 +5292,15 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
          * with a frozen (identity) head orientation. The register-6 patch then renders first person
          * on the flat monitor (no headset), so the shoulder anchor can be seen + tuned. When the
          * bridge IS active the pump above already ran the real head-tracked FP, so this is skipped. */
-        if (g_firstPerson && !(g_vrSubmitEnabled && g_vrBridgeReady)) {
-            g_fpPreviewMode = TRUE;
+        /* notes/68 part 3: camfollow also needs the tracking path evaluated, or
+         * head yaw is never computed and the follow camera sits at 0 degrees
+         * forever. Without SteamVR this is the ONLY site that runs it, so a
+         * monitor test of the head-follow camera (PSYVR_FAKE_POSE supplying the
+         * sway) depends on this condition. g_fpPreviewMode stays OFF for the
+         * follow case - it is an FP-anchor flag, and setting it would drag the
+         * first-person build into a test that is not about first person. */
+        if ((g_firstPerson || g_camFollowHead) && !(g_vrSubmitEnabled && g_vrBridgeReady)) {
+            g_fpPreviewMode = g_firstPerson ? TRUE : FALSE;
             VRBridge_UpdateHeadTracking(NULL);
             g_fpPreviewMode = FALSE;
         }
