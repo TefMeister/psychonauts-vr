@@ -302,9 +302,45 @@ proven: text-file command → dispatch → memory write → holds → renders.
 Position went 277→577 in menu space, then a held camera in Sasha's Lab was
 flown a three-leg path (+400 Y, +500 X, +600 Z), each leg landing exactly.
 
-Still unverified: **orientation** (`camera+0x20`) was not exercised — matrix
-row/column order, euler order and units remain unknown, as does whether an
-orientation write needs the dirty bit. Only position has been tested.
+**⚠️ SUPERSEDED 2026-08-27 — orientation HAS since been exercised, and direct
+orientation control is REFUTED.** This paragraph previously read "orientation
+was not exercised… only position has been tested". True when written, actively
+misleading now: a session reading it would retry work already known to fail.
+Position control stands exactly as described above; the orientation half is
+closed. Evidence: `psychonauts-vr-modding-notes/2026-08-27-void-camera-facing-hunt.md`.
+
+| camera field | what it is | result |
+| --- | --- | --- |
+| `+0x08` | position (3 × float) | ✅ **works** — write persists, view moves, renders |
+| `+0x20` | a facing vector | ❌ `[verified-live 2026-08-27]` write **persists untouched but is never read by the renderer** — not the view direction, despite being exactly what `SetCameraOrientation`'s impl writes |
+| `+0x50`/`+0x60`/`+0x70`, `+0x80` | **view matrix** (world→camera) | — |
+| `+0x90`/`+0xA0`/`+0xB0`, `+0xC0` | **camera world matrix** | ❌ `[verified-live 2026-08-27]` write is **overwritten inside the same frame** |
+| `+0x154`, `+0x174` | yaw scalars, radians | derived copies — not inputs |
+| `+0x530` bit 0 | dirty flag | set after a position write |
+
+**The two failures bracket the problem, and that is the useful part.** `+0x20`
+is a *wrong-field* failure — the write survives, nothing reads it. `+0x90` is a
+*timing* failure — the right field, clobbered before use: dumped with yaw 0 and
+with yaw 90 applied, the rows came back **bit-for-bit identical**
+(`3F2438D3 BF44629C…` both times), and an A/B/A with the camera frozen measured
+9.95 % → 10.12 % → 10.00 % black. No visible change at all.
+
+**🎯 The live hypothesis, not yet tested.** `CandB` is the engine's own
+camera-update tick (notes/59, including its reentrancy guard). The `camyaw`
+write was applied from **`BeforeEye1`, which runs *before* `CandB`**, so
+`CandB`'s own camera update recomputes the matrix over it. To land, the write
+must happen **after the camera update but before the draw traversal — i.e.
+*inside* `CandB`, not around it.** `[hypothesis]` This matters more than it
+looks: a matrix write landing ahead of traversal makes the engine **cull against
+the new orientation**, which is the entire game for the black-void problem, and
+it carries **no free-look clamp** — unlike the input-injection route (Candidate
+1), which is hard-limited to 87.4°.
+
+**Why the per-draw register-6 route cannot substitute for it.** Patching the MVP
+at `SetVertexShaderConstantF` (§6) happens *after* culling, so it rotates the
+image but not the culled set — the void would simply rotate with the view. Any
+fix for the void must change what the engine decides to draw, not how the result
+is transformed.
 
 One nuance worth keeping: after `camhold 0` the camera **stayed where it was
 put** rather than snapping back. That does not prove the engine yielded
@@ -412,6 +448,32 @@ rather than memory-forged DirectInput state:
   path. `SendInput` at the window level (above) sidesteps the question.
 
 ## 11. Dead ends & false leads (save future time)
+
+- **Direct camera ORIENTATION control (2026-08-27)** — refuted two different
+  ways, and the pair is diagnostic. `camera+0x20` (what `SetCameraOrientation`'s
+  impl actually writes) is **never read by the renderer**: the write persists
+  untouched and the view does not move. `camera+0x90` (the real camera world
+  matrix) is **overwritten inside the same frame**: yaw 0 vs yaw 90 dumps came
+  back bit-for-bit identical, A/B/A measured 9.95/10.12/10.00 % black.
+  `[verified-live 2026-08-27]` **Position control is unaffected and still
+  works.** The remaining orientation route is a *timing* fix, not a field hunt —
+  land the write inside `CandB` after the camera update (§9).
+- **Patching the per-draw register-6 MVP to fix the void** — cannot work in
+  principle, so don't measure it: register 6 is consumed *after* culling, so
+  rotating there rotates the image and the void together. `[inferred-static]`
+  The void is a culling problem; only something upstream of draw traversal can
+  change it.
+- **Immediate-mode `GetDeviceState` mouse injection (2026-08-27)** — the hook
+  chain installs perfectly (IAT patch → `CreateDevice` → `GetDeviceState` on
+  `GUID_SysMouse`, all three confirmed in the log) but injecting
+  `mousedx 3000`/`4000` did **not** rotate the camera; the forward vector at
+  `+0xB0` showed only low-bit jitter. `[verified-live 2026-08-27]` A later
+  session found why: this game's mouse deltas arrive through **buffered
+  `GetDeviceData`** (3598 calls observed while the mouse moved, with
+  `WM_MOUSEMOVE` and `WM_INPUT` both at zero) — so the hook was on a real but
+  *unused* path. Hooking `GetDeviceData` is the untested continuation, not a
+  fresh idea. **Note the shape of this mistake:** "the hook installed" was read
+  as "the route works", when installation only proves the function exists.
 
 - **Forging keyboard input at the DirectInput-buffer or keyState level**
   (sessions 15–18): refuted twice over — the keyboard never uses buffered
