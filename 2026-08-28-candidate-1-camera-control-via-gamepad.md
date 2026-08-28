@@ -311,3 +311,71 @@ took until the fifth here.
    absolute — head yaw would need converting into a turn *rate* with a
    settling term, which is a different control problem from setting an angle.
 3. Then the headset judgement on whether body-follows-head feels right.
+
+---
+
+# ⚠️ WITHDRAWN: the 317.7° "body turn beats the clamp" result was CONTAMINATED
+
+The section above claims turning Raz sweeps the camera a full 360° and that the
+free-look clamp is therefore avoidable. **That claim is withdrawn. It is not
+disproved — it is unproven, and the evidence offered for it was invalid.**
+
+**The user reported seeing Raz fall down several times during the test.** In
+this level, leaving the path costs a life and respawns the character. A respawn
+teleports him, which reorients the follow camera arbitrarily — indistinguishable
+from "turning" if only yaw is logged, which is exactly what the original test
+did.
+
+## Re-run with position tracked
+
+```
+step 2: yaw -106.8   campos 52,547 -33,616 -4,823
+step 3: yaw  172.1   campos 52,548 -33,618 -4,832
+step 4: yaw -106.8   campos 52,547 -33,616 -4,823   <- identical to step 2
+step 5: yaw  175.7
+step 6: yaw -107.0
+step 7: yaw -172.3   campos 78,156 -29,282 +2,670   <- FALL, ~26,000 units away
+```
+
+Two independent problems with the original measurement:
+
+1. **The yaw OSCILLATES between ~−107° and ~+173°** rather than progressing.
+   That is not rotation. A controlled turn would be monotonic; the original
+   sequence was not, and that should have been questioned at the time.
+2. **Raz fell.** Step 7's position jump of ~26,000 units is a respawn, and the
+   original 8-sample run almost certainly contained one or more of these.
+
+## What the oscillation probably means (hypothesis, untested)
+
+Movement input is **camera-relative**, and the camera follows the body. Holding
+"left" turns Raz, which swings the camera, which changes what "left" means,
+which turns him back. A feedback loop that oscillates rather than rotating.
+
+If that is right, **body facing cannot be driven open-loop by holding a
+direction** — it would need closed-loop control against measured facing, which
+is a substantially harder problem than the write-up implied.
+
+## Status of the clamp question
+
+- Free-look is clamped to **87.4°** — that measurement stands; it was taken with
+  a stationary character and saturates cleanly at both ends.
+- Whether body facing can be driven to beat that clamp is **OPEN**. The
+  mechanism exists (the camera does follow the body) but no clean measurement of
+  controlled rotation has been obtained.
+
+## Process note — this is the second over-claim on the same question today
+
+Both had the same shape: a measurement taken without confirming its
+precondition, then written up as a result. Earlier it was camera tests run with
+a menu open; here it was a turn test run without checking the character was
+still on the path and alive.
+
+**Concrete fix applied to method: always log POSITION alongside orientation.** A
+position jump is the cheapest possible detector for "the thing under test did
+not happen"; without it, a fall and a turn produce identical yaw evidence.
+
+## A safer test rig is needed
+
+This level kills the character for leaving the path, which makes it a poor place
+to test movement. Any re-test should use an enclosed area with no fall hazard,
+verify position stability between samples, and confirm visually.
