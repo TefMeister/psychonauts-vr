@@ -2979,6 +2979,243 @@ static void *AutoGetCamera(void)
  * renderer ignores it - a reversed write there persisted in memory untouched
  * while the view did not move at all. Do not go back to it. */
 #define PSY_CAM_WORLD_ROW0 0x90
+
+/* ===================================================================== *
+ * notes/68: THE FIRST CAMERA ORIENTATION FIELD THE RENDERER ACTUALLY READS
+ * (2026-08-28). Read status: PROVEN. Exact meaning: NOT yet established - see
+ * "what is NOT proven" at the bottom before building on this.
+ *
+ * Every previous attempt to turn the camera wrote a MATRIX, and all of them
+ * failed, because every matrix on this object is a derived OUTPUT that nothing
+ * reads back:
+ *
+ *   +0x20  facing vector (what SetCameraOrientation writes) - write persists
+ *          untouched, renderer ignores it.
+ *   +0x50  view matrix   - a held write SURVIVES to end of frame (verified by
+ *          dumping it back) and the image still does not change.
+ *   +0x90  camera world matrix - same: survives the whole frame, ignored.
+ *
+ * (The 2026-08-27 note recorded +0x90 as "overwritten inside the same frame".
+ * That was wrong: probing at every hook site shows the write surviving from
+ * BeforeEye1 through AfterBoth. The earlier dump was almost certainly taken
+ * BEFORE the write in both the yaw-0 and yaw-90 runs, which shows the engine's
+ * value either way. Wrong-field, not wrong-timing.)
+ *
+ * The real input is a unit direction vector stored COLUMN-WISE with stride
+ * 0x10 - not three contiguous floats:
+ *
+ *   x at +0x158,  y at +0x168,  z at +0x178
+ *
+ * A second, near-identical vector sits one float later (+0x15C/+0x16C/+0x17C),
+ * which looks like the smoothed "current" against this "target".
+ *
+ * PROVEN by A/B/A with the camera otherwise untouched: pinning +0x158 to 0.0
+ * took the frame from 3.62% -> 0.61% near-black with a completely different
+ * view, and releasing it returned it to 3.61%. Reversible, repeatable.
+ *
+ * WHAT IS NOT PROVEN - do not state these as fact:
+ *  - That this is a "look direction". It is A field the renderer reads. A
+ *    sweep of the x component (0.724 -> 0.4 -> 0.0 -> -0.4 -> -0.724) did NOT
+ *    produce a clean rotation: every value except the original landed in a
+ *    similar washed-out, near-clipping view (0.60-0.72% black vs 3.62%), with
+ *    only small framing differences between them.
+ *  - HOWEVER, that sweep wrote ONE component of a THREE-component vector,
+ *    leaving it non-unit (length 0.688 at x=0). A degenerate view is exactly
+ *    what a non-unit direction would produce, so the sweep does not
+ *    distinguish "wrong field" from "right field, broken normalization".
+ *    Writing all three as a unit vector (camlook / lookhold, repointed here)
+ *    is the test that separates them, and it has NOT been run yet.
+ *  - Whether culling follows it. Black% went DOWN (3.62 -> 0.61), which is
+ *    consistent with culling following the camera, but a near-clipping view
+ *    fills the frame regardless, so it is not evidence either way yet.
+ *
+ * Why it is worth pursuing: every other orientation field on this object is a
+ * derived output that nothing reads, so this is the only orientation-adjacent
+ * input found so far. If it does steer the camera, it does so BEFORE culling -
+ * and unlike the gamepad route (Candidate 1) there is no 87.4-degree free-look
+ * clamp. */
+#define PSY_CAM_LOOKDIR_OFF    0x158
+#define PSY_CAM_LOOKDIR_STRIDE 0x10
+
+static void PsySetLookDir(void *cam, float x, float y, float z)
+{
+    char *b = (char *)cam + PSY_CAM_LOOKDIR_OFF;
+    *(float *)(b + 0 * PSY_CAM_LOOKDIR_STRIDE) = x;
+    *(float *)(b + 1 * PSY_CAM_LOOKDIR_STRIDE) = y;
+    *(float *)(b + 2 * PSY_CAM_LOOKDIR_STRIDE) = z;
+    *((unsigned char *)cam + PSY_CAM_DIRTY_OFFSET) |= 1;
+}
+
+static void PsyGetLookDir(void *cam, float *out)
+{
+    const char *b = (const char *)cam + PSY_CAM_LOOKDIR_OFF;
+    out[0] = *(const float *)(b + 0 * PSY_CAM_LOOKDIR_STRIDE);
+    out[1] = *(const float *)(b + 1 * PSY_CAM_LOOKDIR_STRIDE);
+    out[2] = *(const float *)(b + 2 * PSY_CAM_LOOKDIR_STRIDE);
+}
+
+/* ===================================================================== *
+ * notes/68 part 2: rotate the WHOLE camera basis, not just forward.
+ *
+ * The region at +0x150 is a matrix stored as 4 rows of 4 floats, rows at
+ * stride 0x10 - so its COLUMNS are the interesting vectors:
+ *
+ *   c0 = (+0x150, +0x160, +0x170)   right, scaled
+ *   c1 = (+0x154, +0x164, +0x174)   up,    scaled
+ *   c2 = (+0x158, +0x168, +0x178)   forward, UNIT
+ *   c3 = (+0x15C, +0x16C, +0x17C)   forward again, UNIT (smoothed/previous)
+ *
+ * Evidence it is a camera basis and not a projection: |c1|/|c0| = 2.052/1.538
+ * = 1.334, i.e. exactly the 4:3 aspect ratio, and the two scales are UNCHANGED
+ * by our own fov command (dumped at fov 1.0 and 2.5 - byte-identical), so they
+ * are not the projection scales.
+ *
+ * Why writing c2 alone produced a washed-out, degenerate image rather than a
+ * turn: rotating forward while leaving right and up where they were makes the
+ * basis non-orthogonal. That is a skew, not a rotation - so the picture breaks
+ * instead of turning. Rotating all three columns together is the actual test.
+ *
+ * Up axis is Y here: c1 is dominated by its Y component (1.9894 of 2.052).
+ * The dossier warns this engine's levels do NOT share one up axis, so the up
+ * axis is taken from c1 rather than hardcoded. */
+#define PSY_CAM_BASIS_OFF    0x150
+#define PSY_CAM_BASIS_RSTRIDE 0x10
+
+static int   g_camBasisYawOn  = 0;
+static float g_camBasisYawDeg = 0.0f;
+
+/* ⚠️ WHY THIS SNAPSHOTS INSTEAD OF ROTATING IN PLACE - a real bug, measured.
+ *
+ * The first version rotated whatever was in the basis, every frame, at
+ * BeforeEye1. While the camera is stationary the engine does NOT rewrite this
+ * matrix, so a 15-degree hold COMPOUNDED: dumps 1.5s apart showed c0.z drifting
+ * 0.5160 -> 0.1235 and c2.z -0.9292 -> -0.9832, while c3.z stayed at its
+ * original -0.9291 because it was deliberately left alone. So c2 and c3 - a
+ * matched pair - diverged, and the render broke.
+ *
+ * That invalidated the experiment: the washed-out frames were a runaway of our
+ * own making, NOT evidence about whether the basis is rotatable.
+ *
+ * Fix: snapshot the engine's own basis the first time the yaw is armed, then
+ * each frame WRITE snapshot-rotated-by-theta. Absolute, idempotent, cannot
+ * accumulate. Re-snapshot on re-arm so the camera can be moved between tests. */
+static float g_basisSnap[4][3];   /* [column][row] - c0,c1,c2,c3 */
+static float g_basisSnapT[4];     /* row 3 (+0x180): the translation row */
+static float g_basisOrigin[3];    /* the point row 3 is measured from */
+static int   g_basisOriginOk = 0;
+static int   g_basisSnapValid = 0;
+
+/* ⚠️ THE TRANSLATION ROW MUST FOLLOW THE ROTATION - this is what broke every
+ * larger angle.
+ *
+ * The block at +0x150 is a full 4x4: rows 0-2 hold the axes as COLUMNS, and row
+ * 3 (+0x180) is a translation. Measured live, row3[i] = dot(O, c_i) for a single
+ * origin O, recovered by solving the 3x3 system:
+ *
+ *     solved O   = (-19852.63, -449.93, 17814.91)
+ *     camera pos = (-19856.27,  451.41, 17824.46)
+ *
+ * X and Z agree to a few units (the camera drifts between the dump and the
+ * telemetry sample); Y comes back as the exact NEGATIVE. So this is a view-style
+ * transform in a Y-flipped space.
+ *
+ * Rotating the axes while leaving row 3 pinned to the OLD axes leaves the
+ * translation inconsistent, and the inconsistency grows with the rotation angle
+ * - which is exactly the symptom: clean at 2-5 degrees, sheared by 8-10,
+ * wrecked by 15+, and completely unaffected by preserving column magnitudes.
+ *
+ * O is SOLVED from the engine's own basis and row 3 rather than assumed from
+ * camera position, so no handedness or Y-flip convention has to be guessed. */
+static int PsySolveOrigin(void)
+{
+    /* Solve M O = t, where the rows of M are c0, c1, c2. */
+    double m[3][4], f;
+    int i, j, r, p;
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) m[i][j] = g_basisSnap[i][j];
+        m[i][3] = g_basisSnapT[i];
+    }
+    for (i = 0; i < 3; i++) {
+        p = i;
+        for (r = i + 1; r < 3; r++)
+            if ((m[r][i] < 0 ? -m[r][i] : m[r][i]) > (m[p][i] < 0 ? -m[p][i] : m[p][i])) p = r;
+        if ((m[p][i] < 0 ? -m[p][i] : m[p][i]) < 1e-9) return 0;   /* singular */
+        if (p != i) for (j = 0; j < 4; j++) { double t = m[i][j]; m[i][j] = m[p][j]; m[p][j] = t; }
+        for (r = 0; r < 3; r++) {
+            if (r == i) continue;
+            f = m[r][i] / m[i][i];
+            for (j = i; j < 4; j++) m[r][j] -= f * m[i][j];
+        }
+    }
+    for (i = 0; i < 3; i++) g_basisOrigin[i] = (float)(m[i][3] / m[i][i]);
+    return 1;
+}
+
+static void PsyBasisSnapshot(void *cam)
+{
+    const char *B = (const char *)cam + PSY_CAM_BASIS_OFF;
+    int col, row;
+    for (col = 0; col < 4; col++)
+        for (row = 0; row < 3; row++)
+            g_basisSnap[col][row] =
+                *(const float *)(B + row * PSY_CAM_BASIS_RSTRIDE + col * 4);
+    for (col = 0; col < 4; col++)
+        g_basisSnapT[col] = *(const float *)(B + 3 * PSY_CAM_BASIS_RSTRIDE + col * 4);
+    g_basisOriginOk = PsySolveOrigin();
+    g_basisSnapValid = 1;
+    LogLine("CAMBASIS snapshot: origin %s (%.2f %.2f %.2f)",
+            g_basisOriginOk ? "solved" : "SINGULAR - translation will not be corrected",
+            g_basisOrigin[0], g_basisOrigin[1], g_basisOrigin[2]);
+}
+
+/* Write snapshot-rotated-by-deg. ALL FOUR columns, including c3: c2 and c3 are
+ * a matched pair and letting them diverge was what broke the picture. */
+static void PsyApplyBasisYaw(void *cam, float deg)
+{
+    char *B = (char *)cam + PSY_CAM_BASIS_OFF;
+    float s = (float)sin(deg * 3.14159265358979f / 180.0f);
+    float c = (float)cos(deg * 3.14159265358979f / 180.0f);
+    int col, up = 1;
+    /* Up axis from the SNAPSHOT's c1 (the up column), not hardcoded - this
+     * engine's levels do not share one up axis. */
+    float ax = g_basisSnap[1][0] < 0 ? -g_basisSnap[1][0] : g_basisSnap[1][0];
+    float ay = g_basisSnap[1][1] < 0 ? -g_basisSnap[1][1] : g_basisSnap[1][1];
+    float az = g_basisSnap[1][2] < 0 ? -g_basisSnap[1][2] : g_basisSnap[1][2];
+    if (ax >= ay && ax >= az) up = 0;
+    else if (az >= ay && az >= ax) up = 2;
+
+    for (col = 0; col < 4; col++) {
+        float x = g_basisSnap[col][0], y = g_basisSnap[col][1], z = g_basisSnap[col][2];
+        float nx, ny, nz, mag;
+        /* ⚠️ PRESERVE EACH COLUMN'S MAGNITUDE.
+         * c0 and c1 are NOT unit - they carry the projection scaling: measured
+         * |c0| = 1.538, |c1| = 2.052, ratio 1.334 = the 4:3 aspect. Rotating
+         * them as though they were orthonormal axes MIXES those two scales,
+         * which shears the frustum instead of turning it. Measured live:
+         * clean at 2-5 degrees, visibly sheared by 8-10, wrecked by 15 - a
+         * progressive breakdown, which is the signature of a shear rather than
+         * a wrong field. So rotate the DIRECTION and restore the length. */
+        mag = (float)sqrt(x * x + y * y + z * z);
+        if (mag > 1e-8f) { x /= mag; y /= mag; z /= mag; } else { mag = 0.0f; }
+        if (up == 1) {        /* rotate in X-Z */
+            nx = x * c + z * s; ny = y; nz = -x * s + z * c;
+        } else if (up == 2) { /* rotate in X-Y */
+            nx = x * c - y * s; ny = x * s + y * c; nz = z;
+        } else {              /* up == 0: rotate in Y-Z */
+            nx = x; ny = y * c - z * s; nz = y * s + z * c;
+        }
+        nx *= mag; ny *= mag; nz *= mag;
+        *(float *)(B + 0 * PSY_CAM_BASIS_RSTRIDE + col * 4) = nx;
+        *(float *)(B + 1 * PSY_CAM_BASIS_RSTRIDE + col * 4) = ny;
+        *(float *)(B + 2 * PSY_CAM_BASIS_RSTRIDE + col * 4) = nz;
+        /* Row 3 must follow: row3[col] = dot(origin, rotated column). Leaving it
+         * on the OLD axes is what wrecked every angle above ~5 degrees. */
+        if (g_basisOriginOk)
+            *(float *)(B + 3 * PSY_CAM_BASIS_RSTRIDE + col * 4) =
+                g_basisOrigin[0] * nx + g_basisOrigin[1] * ny + g_basisOrigin[2] * nz;
+    }
+}
+
 static float g_camYawDeg = 0.0f;   /* 0 = off */
 
 /* notes/68: WHERE the yaw write lands, which is the whole ballgame.
@@ -3060,6 +3297,27 @@ static void ApplyCameraYaw(void)
         void *pc = AutoGetCamera();
         if (pc) *(float *)((char *)pc + g_pokeHoldOff) = g_pokeHoldVal;
     }
+
+    /* notes/68: the look-direction hold must be applied HERE, not only in the
+     * automation tick. AutomationTick runs from AfterBoth - after the frame has
+     * already been culled and drawn - so a direction written there only affects
+     * the next frame, and the engine recomputes it first. Applying at
+     * BeforeEye1 is what made the +0x158 experiment work, and turning the camera
+     * before culling is the entire point for the black void. */
+    if (g_lookHold) {
+        void *lc = AutoGetCamera();
+        if (lc) PsySetLookDir(lc, g_lookHoldDir[0], g_lookHoldDir[1], g_lookHoldDir[2]);
+    }
+
+    /* notes/68 part 2: rotate the whole basis, every frame, before culling. */
+    if (g_camBasisYawOn && g_camBasisYawDeg != 0.0f) {
+        void *bc = AutoGetCamera();
+        if (bc) {
+            if (!g_basisSnapValid) PsyBasisSnapshot(bc);
+            PsyApplyBasisYaw(bc, g_camBasisYawDeg);
+        }
+    }
+
     CamProbe("BeforeEye1");
     ApplyCameraYawAt(1);
     CamProbe("post-write-1");
@@ -3503,6 +3761,25 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> FAILED (expected: camyaw <degrees>)", cmd);
         }
 
+    } else if (_strnicmp(cmd, "cambasisyaw ", 12) == 0) {
+        /* notes/68 part 2: rotate the whole camera basis (right/up/forward)
+         * about world up, held every frame at BeforeEye1 so it lands before the
+         * engine culls. 0 = off. This is the orthogonal-preserving version of
+         * the c2-only write, which skewed the basis and broke the image. */
+        if (sscanf(cmd + 12, "%f", &a) == 1) {
+            g_camBasisYawDeg = a;
+            g_camBasisYawOn = (a != 0.0f);
+            /* Re-snapshot on every re-arm: the reference must be the engine's
+             * CURRENT basis, or a yaw issued after the player moved would be
+             * measured from a stale orientation. Clearing it on disarm also
+             * lets the engine's own value come back. */
+            g_basisSnapValid = 0;
+            LogLine("Auto: END   \"%s\" -> basis yaw = %.1f deg (%s, absolute from a fresh snapshot)", cmd, a,
+                    g_camBasisYawOn ? "ON" : "OFF");
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: cambasisyaw <degrees>)", cmd);
+        }
+
     } else if (_strnicmp(cmd, "camyawsite ", 11) == 0) {
         /* notes/68: WHERE the write lands is the open question, not the maths.
          * 1 = BeforeEye1 (already refuted 2026-08-27 - kept so the negative can
@@ -3635,11 +3912,13 @@ static void AutoRunCommand(const char *cmd)
             } else {
                 void *cam = AutoGetCamera();
                 if (cam) {
-                    float *d = (float *)((char *)cam + 0x20);
-                    d[0] = a / len; d[1] = b / len; d[2] = c / len;
-                    *((unsigned char *)cam + PSY_CAM_DIRTY_OFFSET) |= 1;
-                    g_lookHoldDir[0] = d[0]; g_lookHoldDir[1] = d[1]; g_lookHoldDir[2] = d[2];
-                    LogLine("Auto: END   \"%s\" -> dir = %.4f %.4f %.4f", cmd, d[0], d[1], d[2]);
+                    PsySetLookDir(cam, a / len, b / len, c / len);
+                    g_lookHoldDir[0] = a / len;
+                    g_lookHoldDir[1] = b / len;
+                    g_lookHoldDir[2] = c / len;
+                    LogLine("Auto: END   \"%s\" -> dir = %.4f %.4f %.4f (at +0x%03X stride 0x%X)",
+                            cmd, g_lookHoldDir[0], g_lookHoldDir[1], g_lookHoldDir[2],
+                            PSY_CAM_LOOKDIR_OFF, PSY_CAM_LOOKDIR_STRIDE);
                 } else {
                     LogLine("Auto: END   \"%s\" -> FAILED (no camera)", cmd);
                 }
@@ -3814,11 +4093,10 @@ static void AutomationTick(void)
     if (g_camHold) AutoWriteCameraPos(g_camHoldPos);
     if (g_lookHold) {
         void *cam = AutoGetCamera();
-        if (cam) {
-            float *d = (float *)((char *)cam + 0x20);
-            d[0] = g_lookHoldDir[0]; d[1] = g_lookHoldDir[1]; d[2] = g_lookHoldDir[2];
-            *((unsigned char *)cam + PSY_CAM_DIRTY_OFFSET) |= 1;
-        }
+        /* notes/68: repointed from the dead +0x20 to the real look-direction
+         * input (+0x158, stride 0x10). Writing +0x20 held a value the renderer
+         * never read, which is why lookhold appeared to do nothing. */
+        if (cam) PsySetLookDir(cam, g_lookHoldDir[0], g_lookHoldDir[1], g_lookHoldDir[2]);
     }
 
     if (now - g_autoLastPoll >= g_autoPollMs) {
