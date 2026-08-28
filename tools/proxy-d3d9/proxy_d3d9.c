@@ -638,6 +638,11 @@ static float g_camHoldPos[3]     = { 0.0f, 0.0f, 0.0f };
  * gameplay, so a one-shot direction write is overwritten before it is seen. */
 static BOOL  g_lookHold          = FALSE;
 static float g_lookHoldDir[3]    = { 0.0f, 0.0f, 1.0f };
+/* notes/67: hold a single float in the camera object every frame - for testing
+ * whether a scalar the engine recomputes can be pinned (see the pokef command). */
+static int          g_pokeHoldOn  = 0;
+static unsigned int g_pokeHoldOff = 0;
+static float        g_pokeHoldVal = 0.0f;
 
 /* notes/67: dialogue/menu UI at its own virtual depth, so conversation options
  * stand out in front of the persistent HUD instead of sharing one plane.
@@ -2946,6 +2951,14 @@ static void ApplyCameraYaw(void)
     float s, c, x, y;
     int r;
 
+    /* notes/67: pin a scalar before the engine renders, if one is held. Done
+     * here (BeforeEye1) as well as in the automation tick, so a value the
+     * engine recomputes per frame still stands a chance of being seen. */
+    if (g_pokeHoldOn) {
+        void *pc = AutoGetCamera();
+        if (pc) *(float *)((char *)pc + g_pokeHoldOff) = g_pokeHoldVal;
+    }
+
     if (g_camYawDeg == 0.0f) return;
     cam = AutoGetCamera();
     if (!cam) return;
@@ -3566,6 +3579,47 @@ static void AutoRunCommand(const char *cmd)
         } else {
             LogLine("Auto: END   \"%s\" -> FAILED (expected: dump <hexOffset < 0x2000> <count 1..64>)", cmd);
         }
+
+    /* notes/67: write a single float into the camera object, and optionally
+     * HOLD it every frame.
+     *
+     * Why: with a verified 34.4 deg camera swing, +0x154 and +0x174 moved by
+     * ~30 deg worth of RADIANS (-1.6869 -> -1.1550 and -0.9721 -> -1.5318),
+     * which makes them the camera's yaw as a scalar angle - plausibly a
+     * current/target pair. The stick is an ABSOLUTE CLAMPED offset, so it
+     * cannot reach behind the player; writing the angle directly is the way to
+     * test whether the clamp is in the input mapping or in the camera itself.
+     *
+     * Hold matters: the engine recomputes camera state every frame, and a
+     * one-shot write to camera+0x90 was measured coming back bit-for-bit
+     * identical. If a one-shot poke does nothing, try holding it. */
+    } else if (_strnicmp(cmd, "pokef ", 6) == 0) {
+        unsigned int off = 0; float fv = 0.0f; char holdBuf[16] = {0};
+        int n = sscanf(cmd + 6, "%x %f %15s", &off, &fv, holdBuf);
+        if (n >= 2 && off < 0x2000 && (off & 3) == 0) {
+            void *cam = AutoGetCamera();
+            if (cam) {
+                float *slot = (float *)((char *)cam + off);
+                float old = *slot;
+                *slot = fv;
+                if (n >= 3 && _stricmp(holdBuf, "hold") == 0) {
+                    g_pokeHoldOff = off; g_pokeHoldVal = fv; g_pokeHoldOn = 1;
+                    LogLine("Auto: END   \"%s\" -> +0x%X was %.4f now %.4f (HELD every frame)",
+                            cmd, off, old, fv);
+                } else {
+                    LogLine("Auto: END   \"%s\" -> +0x%X was %.4f now %.4f (one-shot)",
+                            cmd, off, old, fv);
+                }
+            } else {
+                LogLine("Auto: END   \"%s\" -> FAILED (no camera)", cmd);
+            }
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: pokef <hexOffset, 4-aligned> <float> [hold])", cmd);
+        }
+
+    } else if (_stricmp(cmd, "pokerelease") == 0) {
+        g_pokeHoldOn = 0;
+        LogLine("Auto: END   \"pokerelease\" -> float hold released");
 
     } else if (_stricmp(cmd, "orient") == 0) {
         void *cam = AutoGetCamera();
