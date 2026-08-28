@@ -1,0 +1,3 @@
+
+# build scratch output - the deployed artifact is tools/proxy-d3d9/d3d9.dll
+tools/proxy-d3d9/d3d9_new.dll
