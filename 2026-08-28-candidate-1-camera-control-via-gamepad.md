@@ -456,3 +456,48 @@ when the view only follows the head while moving — is the open question.
 The earlier "camera-relative feedback loop causes oscillation" hypothesis was
 **wrong**. The oscillation in the contaminated run was falls and respawns, not a
 control loop. In a fall-free area the turn is clean and monotonic.
+
+---
+
+# The locomotion coupling is largely SOLVABLE: pulse the input (2026-08-28)
+
+The limitation above — body-facing rotation only works while walking, so no
+turning in place — is much weaker than it first appeared. Games commonly turn a
+character *before* translating them, so short pulses buy rotation cheaply.
+
+Measured, same direction, same total key-down time:
+
+| input style | rotation | distance | **rotation per 100 units** |
+| --- | --- | --- | --- |
+| 8 × 90 ms taps | 7.7° | **13 units** | **60.2°** |
+| 1 × 720 ms hold | 14.6° | 190 units | 7.7° |
+
+**Pulsed input yields ~7.8× more rotation per unit of travel.**
+
+Extrapolating: a 180° turn costs roughly **300 units of drift when tapped**,
+against **~2,340 units when held**. Raz is a small character, so ~300 units is a
+short shuffle rather than a walk across the area — close enough to turning in
+place to be practical.
+
+## Why this matters for the implementation
+
+Head yaw should be fed in as a **pulse-width-modulated stream of short taps**,
+not a sustained hold. That is a different control design from the obvious one,
+and the obvious one would have produced a mod that drags the player across the
+level whenever they turn their head.
+
+It also means the three mechanisms can be layered sensibly:
+
+- **free-look** for small, precise, instant offsets (±43° or so, no locomotion)
+- **pulsed body turn** for the large rotations free-look cannot reach
+- **FOV widen** underneath both, covering whatever neither catches
+
+## Remaining unknowns
+
+- Whether the ~300-unit drift per 180° is acceptable **in a headset** — a
+  comfort judgement, and drift while turning is exactly the sort of thing that
+  causes discomfort.
+- Whether pulses can be made small enough to approach true turn-in-place, or
+  whether 90 ms is already near the engine's input granularity.
+- Whether free-look and body turn can be blended smoothly, or whether handing
+  over between them produces a visible hitch.
