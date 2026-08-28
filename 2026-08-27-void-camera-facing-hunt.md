@@ -152,6 +152,59 @@ Incidental: the figment tutorial popup blocks input until dismissed, and
 which — ESC appears to open the Journal, so likely `X` or `C` closed that).
 Worth pinning down, since these popups will stall any unattended run.
 
+## DirectInput mouse injection: hook works, premise UNTESTED (wrong location)
+
+After the matrix route died on timing, switched to the `-external-research`
+lead (2026-08-24, Vireio VRBoost technique): inject synthetic mouse deltas so
+the **engine turns its own camera** and culling follows for free, instead of
+racing the camera update for a matrix write.
+
+**The hook chain installs perfectly** — all three levels confirmed in the log:
+
+```
+MouseInject: DirectInput8Create IAT-patched (mouse yaw injection armed)
+MouseInject: hooked IDirectInput8::CreateDevice
+MouseInject: hooked IDirectInputDevice8::GetDeviceState on the system mouse
+```
+
+So the game *does* use immediate-mode `GetDeviceState` on `GUID_SysMouse` —
+the path notes/60 predicted, and the one this hooks.
+
+**But injecting `mousedx 3000`/`4000` in gameplay did not rotate the camera.**
+The forward vector at `+0xB0` came back with only low-bit jitter.
+
+**The result that keeps this alive: a real mouse does not rotate it either.**
+Sent 25 genuine `SendInput` `MOUSEEVENTF_MOVE` events with the window
+foreground — the forward vector came back **byte-identical**
+(`BF3E8A3A BF1F5BA9 3E77BA1D` both times). So in this location the camera is
+simply **not mouse-driven**; it is a follow camera without free look.
+
+**Conclusion: the test location was wrong, not (necessarily) the technique.**
+notes/60's observation — that mouse-look is decoupled from Raz's body — was
+made in normal outdoor gameplay, not in a scripted interior. `MMI1` is Boyd's
+house, which appears to have a scripted/follow camera. **The injection premise
+remains untested.**
+
+### Two process mistakes worth recording
+
+1. **`MMI1` is an interior.** The user's save 1 starts *outdoors* in the
+   Neighborhood, which is exactly the open area the void work needs. Using the
+   level-jump shortcut instead of loading save 1 teleported the session into a
+   house, then spent turns hunting for a door out of it. **Load save 1; do not
+   level-jump, for this game's void work.**
+2. **The Journal (ESC) toggles, and opens on its own after some popups.** Two
+   camera tests were silently invalidated by running while the Journal was up —
+   the camera does not respond to anything in a menu. **Verify gameplay
+   immediately before any camera test** (the black-fraction check works: ~9.9 %
+   in this spot's gameplay vs very different values in menus).
+
+### Also spotted, and probably the fastest route in future
+
+The in-game Journal has **CONTINUE / OPTIONS / LOAD / SAVE / QUIT TO TITLE /
+CREDITS**. So a save can be loaded — and made — from inside gameplay, without
+the brain-vault walk that has now cost two sessions. The user's suggestion to
+**save once while outdoors** would remove the navigation problem permanently.
+
 ## Next
 
 1. `dump` the camera object around the known fields, hunting a second
