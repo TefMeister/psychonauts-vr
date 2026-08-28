@@ -94,3 +94,69 @@ beyond the free-look clamp with the FOV widen as the only fallback there.
    so the next honest attempt is static disassembly of the camera update.
 4. **Then a headset check** — the monitor can measure void area, but only the
    user can judge whether the residual is comfortable.
+
+---
+
+# COMBINED RESULT (2026-08-28): the two fixes together cut the void by 80%
+
+Measured under identical conditions — same scene, same 170° synthetic sway, 14
+frames across a full cycle, peak and median of unrendered area:
+
+| configuration | peak void | median |
+| --- | --- | --- |
+| **A** — baseline (FOV 1.0, camera untouched) | **91.76%** | 52.26% |
+| **B** — FOV 3.0 only | 39.49% | 28.71% |
+| **C** — FOV 3.0 **+ game camera turned** | **18.46%** | **14.96%** |
+
+**Peak void falls from 91.8% to 18.5% — an 80% reduction. Median falls from 52%
+to 15%.**
+
+This confirms the two candidates are **complementary, not competing**, which was
+predicted from mechanism and is now measured:
+
+- The **FOV widen** enlarges the frustum the game renders, so there is simply
+  more image to look into.
+- **Turning the game camera** moves that frustum toward where the view is going,
+  so the engine culls for the new direction — coverage the widen cannot buy at
+  any scale.
+
+## What the residual looks like
+
+COMBINED-fov3-plus-camyaw-worst-frame-18pct.png is the **worst** frame of
+configuration C. The street, trees, buildings and sky all render; the remaining
+black is a patch **overhead**, not a surrounding abyss. Qualitatively this is a
+different experience from the baseline image in this folder, which is a
+near-total black field with only the HUD in it.
+
+That the residual sits **above** rather than behind is itself informative: the
+horizontal coverage is now largely handled, and what is left is vertical
+headroom — a smaller and probably more tractable problem.
+
+## Shipped change
+
+PSYVR_FOV_SCALE raised **1.8 → 3.0** in the VR launchers
+(Launch-Psychonauts-VR-FirstPerson.bat, Launch-Psychonauts-VR-Quest3.bat),
+with the measurement table recorded inline so the value is not mysterious later.
+
+**Deliberately NOT changed: the code default stays 1.0.** PSYVR_FOV_SCALE
+multiplies the game's own FOV argument, so 3.0 heavily distorts *flat* play. The
+widen belongs where VR is actually on, not globally.
+
+## Still true, and still the limit
+
+- Candidate 1 remains bounded by the **free-look clamp** (~100–150°); beyond it
+  the game camera stops and only the widen is left.
+- The widen **plateaus past 3.0** — 4.0 measured no better and worse on the
+  median.
+- So 18.5% is the floor for these two mechanisms as they stand. Getting below it
+  needs the clamp lifted.
+
+## Next
+
+1. **Headset check.** The monitor can measure void *area*; only the user can say
+   whether an overhead patch at this size is comfortable. This is the first
+   version genuinely worth putting on.
+2. **Lift the free-look clamp** — four data-side attempts failed, so static
+   disassembly of the camera update is the honest next route.
+3. **Investigate the overhead residual specifically.** It may be a pitch-axis
+   equivalent of the same clamp, in which case the same fix applies twice.

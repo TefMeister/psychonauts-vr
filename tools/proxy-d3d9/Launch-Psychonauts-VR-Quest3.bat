@@ -22,7 +22,13 @@ rem --- required for the VR path ---
 set PSYVR_ENABLE_SUBMIT=1
 
 rem --- Quest 3 tuning ---
-set PSYVR_FOV_SCALE=1.8
+rem notes/67 (2026-08-28): raised 1.8 -> 3.0 on MEASURED evidence. With the void
+rem reproduced via synthetic sway, peak unrendered area across a full swing was:
+rem   1.0 -> 91.8%   2.0 -> 83.4%   3.0 -> 42.1%   4.0 -> 44.6% (no better)
+rem 3.0 more than halves the void and is the practical optimum - past it the
+rem measurement plateaus and the median gets worse. It cannot CLOSE the void; a
+rem symmetric widen can never cover 180 degrees behind the player.
+set PSYVR_FOV_SCALE=3.0
 rem set PSYVR_FOV_SCALE=1.5
 set PSYVR_RENDER_SCALE=3
 
@@ -40,3 +46,4 @@ rem set PSYVR_DISABLE_TRACKING=1
 rem In-game: press F11 to re-center head tracking.
 
 start "" "%~dp0Psychonauts.exe"
+
