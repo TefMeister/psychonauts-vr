@@ -2862,6 +2862,12 @@ void UIVp_PhaseChangedFwd(void); /* notes/42: defined with the UI-viewport machi
  * engine renders/culls the frame - writing after the fact (as the automation
  * tick does) is too late to change what gets drawn. */
 static void ApplyCameraYaw(void);
+/* notes/68: the same write, applied at a SELECTABLE hook site so all three can
+ * be tested in one launch (see the definitions for why the site is the whole
+ * question). Declared here because BeforeEye2 sits earlier in the file than the
+ * definitions, which need AutoGetCamera. */
+static void ApplyCameraYawAt(int site);
+static void CamProbe(const char *where);
 /* notes/67: defined with the DirectInput hooks further down; called from the
  * env-var config function, which sits earlier in this file. */
 static void InstallMouseInject(void);
@@ -2901,6 +2907,16 @@ void __cdecl CandB_BeforeEye2_asm(void)
     SetEyeAndTarget(+1.0f, g_pEye2Surf, g_pEye2DepthStencil);
     UIShift_ReconcileFwd(); /* notes/36 */
     UIVp_PhaseChangedFwd(); /* notes/42 */
+
+    /* notes/68: the first real CandB has now RETURNED, so the engine's camera
+     * update for this frame is done. If notes/59 is right that the draw chain is
+     * a sibling of CandB rather than nested inside it, a write here lands after
+     * the update and before the draws - which is exactly what the BeforeEye1
+     * attempt could not do. Probe first, then write, so the log shows both the
+     * engine's value and ours. */
+    CamProbe("BeforeEye2");
+    ApplyCameraYawAt(2);
+    CamProbe("post-write-2");
 }
 
 /* ===================================================================== *
@@ -2965,13 +2981,78 @@ static void *AutoGetCamera(void)
 #define PSY_CAM_WORLD_ROW0 0x90
 static float g_camYawDeg = 0.0f;   /* 0 = off */
 
-static void ApplyCameraYaw(void)
+/* notes/68: WHERE the yaw write lands, which is the whole ballgame.
+ *
+ * 2026-08-27 applied it only at BeforeEye1 and it did nothing: dumps with yaw 0
+ * and yaw 90 came back bit-for-bit identical, so the write was being recomputed
+ * over, inside the same frame. That was read as "CandB overwrites it, so the
+ * write must go INSIDE CandB" - but notes/59 established something that makes
+ * this much cheaper: CandB is the camera's own update tick and is NOT the
+ * renderer; the real draw chain is a SIBLING of CandB under a higher per-frame
+ * dispatcher, not nested inside it.
+ *
+ * If that is right, the write does not need to be inside CandB at all - it only
+ * needs to land AFTER the camera update finishes and BEFORE the sibling draw
+ * chain runs. The trampoline already provides two such moments that have never
+ * been tried:
+ *
+ *   1 = BeforeEye1  - before the first real CandB   (the one already refuted)
+ *   2 = BeforeEye2  - AFTER the first real CandB returns
+ *   3 = AfterBoth   - after both CandB invocations
+ *
+ * Selectable at runtime so all three can be tested in ONE launch instead of
+ * three rebuilds. */
+static int   g_camYawSite = 1;     /* 1=BeforeEye1 (legacy), 2=BeforeEye2, 3=AfterBoth */
+
+/* Diagnostic: log camera world-matrix row 0 at every site in the same frame.
+ * This answers "WHEN does the engine rewrite the matrix" directly, instead of
+ * inferring it from whether the picture changed - the inference that made the
+ * 2026-08-27 result ambiguous for a whole session. Counts down in frames. */
+static int   g_camProbeFrames = 0;
+
+static void CamProbe(const char *where)
+{
+    void *cam;
+    float *m;
+    if (g_camProbeFrames <= 0) return;
+    cam = AutoGetCamera();
+    if (!cam) { LogLine("CAMPROBE %-11s (no camera)", where); return; }
+    m = (float *)((char *)cam + PSY_CAM_WORLD_ROW0);
+    /* Raw hex as well as float: bit-for-bit equality is the actual question,
+     * and printed floats can hide a low-bit difference. */
+    LogLine("CAMPROBE %-11s row0 = %.4f %.4f %.4f   [%08X %08X %08X]",
+            where, m[0], m[1], m[2],
+            *(unsigned *)&m[0], *(unsigned *)&m[1], *(unsigned *)&m[2]);
+}
+
+/* site: which hook point is calling. Applies the yaw only if it matches the
+ * selected site, so one launch can test all three. */
+static void ApplyCameraYawAt(int site)
 {
     void *cam;
     float *m;
     float s, c, x, y;
     int r;
 
+    if (g_camYawDeg == 0.0f) return;
+    if (site != g_camYawSite) return;
+    cam = AutoGetCamera();
+    if (!cam) return;
+
+    s = (float)sin(g_camYawDeg * 3.14159265358979f / 180.0f);
+    c = (float)cos(g_camYawDeg * 3.14159265358979f / 180.0f);
+    for (r = 0; r < 3; r++) {
+        m = (float *)((char *)cam + PSY_CAM_WORLD_ROW0 + r * 0x10);
+        x = m[0]; y = m[1];
+        m[0] = x * c - y * s;
+        m[1] = x * s + y * c;
+    }
+    if (g_camProbeFrames > 0) LogLine("CAMPROBE   applied yaw %.1f at site %d", g_camYawDeg, site);
+}
+
+/* BeforeEye1 entry: the held-scalar pin, plus the yaw if site 1 is selected. */
+static void ApplyCameraYaw(void)
+{
     /* notes/67: pin a scalar before the engine renders, if one is held. Done
      * here (BeforeEye1) as well as in the automation tick, so a value the
      * engine recomputes per frame still stands a chance of being seen. */
@@ -2979,23 +3060,9 @@ static void ApplyCameraYaw(void)
         void *pc = AutoGetCamera();
         if (pc) *(float *)((char *)pc + g_pokeHoldOff) = g_pokeHoldVal;
     }
-
-    if (g_camYawDeg == 0.0f) return;
-    cam = AutoGetCamera();
-    if (!cam) return;
-
-    s = (float)sin(g_camYawDeg * 3.14159265358979f / 180.0f);
-    c = (float)cos(g_camYawDeg * 3.14159265358979f / 180.0f);
-    /* Rotate each basis row about world Z. Applied once per frame to the
-     * matrix the engine just computed, so it reads as a constant offset rather
-     * than accumulating into a spin. */
-    for (r = 0; r < 3; r++) {
-        m = (float *)((char *)cam + PSY_CAM_WORLD_ROW0 + r * 0x10);
-        x = m[0]; y = m[1];
-        m[0] = x * c - y * s;
-        m[1] = x * s + y * c;
-        /* m[2] (Z) unchanged by a yaw about Z */
-    }
+    CamProbe("BeforeEye1");
+    ApplyCameraYawAt(1);
+    CamProbe("post-write-1");
 }
 
 /* ===================================================================== *
@@ -3431,9 +3498,40 @@ static void AutoRunCommand(const char *cmd)
     } else if (_strnicmp(cmd, "camyaw ", 7) == 0) {
         if (sscanf(cmd + 7, "%f", &a) == 1) {
             g_camYawDeg = a;
-            LogLine("Auto: END   \"%s\" -> camera yaw = %.1f deg (0 = off)", cmd, a);
+            LogLine("Auto: END   \"%s\" -> camera yaw = %.1f deg (0 = off), site %d", cmd, a, g_camYawSite);
         } else {
             LogLine("Auto: END   \"%s\" -> FAILED (expected: camyaw <degrees>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "camyawsite ", 11) == 0) {
+        /* notes/68: WHERE the write lands is the open question, not the maths.
+         * 1 = BeforeEye1 (already refuted 2026-08-27 - kept so the negative can
+         *     be reproduced deliberately rather than assumed)
+         * 2 = BeforeEye2 - after the first real CandB RETURNS
+         * 3 = AfterBoth  - after both CandB invocations */
+        int v = 0;
+        if (sscanf(cmd + 11, "%d", &v) == 1 && v >= 1 && v <= 3) {
+            g_camYawSite = v;
+            LogLine("Auto: END   \"%s\" -> yaw write site = %d (%s)", cmd, v,
+                    v == 1 ? "BeforeEye1 (known-refuted)" :
+                    v == 2 ? "BeforeEye2 (after 1st CandB returns)" :
+                             "AfterBoth (after both CandB calls)");
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: camyawsite <1|2|3>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "camprobe ", 9) == 0) {
+        /* Log camera world-matrix row 0 at every site for N frames. This is the
+         * measurement that makes the result unambiguous: it shows WHEN the
+         * engine rewrites the matrix, instead of leaving us to infer it from
+         * whether the picture changed. */
+        int v = 0;
+        if (sscanf(cmd + 9, "%d", &v) == 1 && v > 0 && v <= 240) {
+            g_camProbeFrames = v;
+            LogLine("Auto: END   \"%s\" -> camera probe armed for %d frames (yaw %.1f, site %d)",
+                    cmd, v, g_camYawDeg, g_camYawSite);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: camprobe <1..240>)", cmd);
         }
 
     } else if (_strnicmp(cmd, "lookhold ", 9) == 0) {
@@ -3744,6 +3842,18 @@ static void AutomationTick(void)
 void __cdecl CandB_AfterBoth_asm(void) asm("CandB_AfterBoth_asm");
 void __cdecl CandB_AfterBoth_asm(void)
 {
+    /* notes/68: third and last candidate site for the camera-matrix write, and
+     * the per-frame countdown for the probe. Probed BEFORE AutomationTick so the
+     * log shows the engine's own end-of-frame value, not one the harness just
+     * poked. */
+    CamProbe("AfterBoth");
+    ApplyCameraYawAt(3);
+    CamProbe("post-write-3");
+    if (g_camProbeFrames > 0) {
+        if (--g_camProbeFrames == 0) LogLine("CAMPROBE ==== probe window closed ====");
+        else LogLine("CAMPROBE ---- end of frame ----");
+    }
+
     /* notes/67: external command queue + camera telemetry. Gated behind
      * PSYVR_AUTOMATION=1 (default off). See the block above for why this is
      * safe from this render-path site and what it deliberately will not do. */
