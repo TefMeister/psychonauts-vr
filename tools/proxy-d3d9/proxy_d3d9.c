@@ -617,6 +617,14 @@ static BOOL g_cullToggleKeyEnabled = FALSE;
 /* notes/67: DirectInput mouse-delta injection lives with the other hooks far
  * below, but is installed from the env-var config function above it. */
 static void InstallMouseInject(void);
+
+/* notes/67: input-path probe state. Declared HERE rather than beside the probe
+ * code because the WndProc hook - which counts mouse window messages - sits
+ * earlier in this file than that code does. */
+static volatile LONG g_diProbeActive    = 0;
+static volatile LONG g_cntGetDeviceData = 0;
+static volatile LONG g_cntWmMouseMove   = 0;
+static volatile LONG g_cntWmInput       = 0;
 static BOOL  g_automationEnabled = FALSE;
 static DWORD g_autoPollMs        = 200;
 static DWORD g_autoTelemetryMs   = 1000;
@@ -739,6 +747,12 @@ static BOOL PatchIATEntry(const char *dllNameLower, const char *funcName, void *
 
 static LRESULT CALLBACK Hook_GameWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    /* notes/67: count mouse-bearing window messages while the input probe is
+     * open, to find which path this game actually reads the mouse through. */
+    if (g_diProbeActive) {
+        if (msg == 0x0200) InterlockedIncrement(&g_cntWmMouseMove);  /* WM_MOUSEMOVE */
+        else if (msg == 0x00FF) InterlockedIncrement(&g_cntWmInput); /* WM_INPUT (Raw Input) */
+    }
     if (msg == WM_ACTIVATEAPP || msg == WM_ACTIVATE || msg == WM_NCACTIVATE || msg == WM_KILLFOCUS) {
         static DWORD s_lastLog = 0;
         DWORD now = GetTickCount();
@@ -2996,6 +3010,17 @@ static void *g_diMouseDevice = NULL;   /* the ONE device we may touch */
 static int  g_padOverrideOn[6]  = { 0, 0, 0, 0, 0, 0 };
 static LONG g_padOverrideVal[6] = { 0, 0, 0, 0, 0, 0 };
 
+/* notes/67: counters for the OTHER input paths a game can read a mouse through.
+ * GetDeviceState (immediate DirectInput) is already covered and was proven not
+ * to be used for the mouse here, so the remaining candidates are:
+ *   - DirectInput BUFFERED reads .......... GetDeviceData, vtable slot 10
+ *   - Win32 window messages ............... WM_MOUSEMOVE
+ *   - Raw Input ........................... WM_INPUT
+ * Counted only while the probe window is open. Whichever is non-zero while the
+ * user moves the mouse is the path that must be injected into.
+ * (The counters themselves are declared near the top of this file, because the
+ * WndProc hook that increments two of them sits earlier than this code.) */
+
 /* notes/67: GetDeviceState probe. Answers, with data instead of inference:
  *   - does the game poll DirectInput at all, and for WHICH devices
  *   - do real mouse movements actually arrive as non-zero lX/lY
@@ -3015,7 +3040,8 @@ typedef struct {
     LONG   axMin[6], axMax[6], axLast[6];
 } DIProbeDev;
 static DIProbeDev  g_diProbe[DIPROBE_MAX_DEV];
-static volatile LONG g_diProbeActive = 0;
+/* g_diProbeActive is declared near the top of the file - the WndProc hook needs
+ * it and sits earlier than this. */
 static DWORD        g_diProbeUntil   = 0;
 
 static void DIProbeRecord(void *dev, DWORD cb, const void *data)
@@ -3088,6 +3114,11 @@ static void DIProbeReport(void)
     }
     LogLine("MouseProbe: (no [MOUSE] row at all = the game never polled the mouse "
             "through GetDeviceState during the window)");
+    LogLine("MouseProbe: other input paths -> GetDeviceData(buffered)=%ld  "
+            "WM_MOUSEMOVE=%ld  WM_INPUT(raw)=%ld",
+            g_cntGetDeviceData, g_cntWmMouseMove, g_cntWmInput);
+    LogLine("MouseProbe: whichever of those is non-zero while the mouse was moving "
+            "is the path that must be injected into.");
 }
 
 static HRESULT WINAPI Hook_DIGetDeviceState(void *dev, DWORD cb, void *data)
@@ -3148,6 +3179,21 @@ static HRESULT WINAPI Hook_DIGetDeviceState(void *dev, DWORD cb, void *data)
     return hr;
 }
 
+/* IDirectInputDevice8::GetDeviceData - the BUFFERED read path, vtable slot 10.
+ * Counted only; the same shared-vtable caveat applies, so this filters on the
+ * known mouse instance rather than trusting that only the mouse arrives here. */
+typedef HRESULT (WINAPI *DIGetDeviceData_t)(void *dev, DWORD cbObjData, void *rgdod,
+                                            DWORD *pdwInOut, DWORD dwFlags);
+static DIGetDeviceData_t g_pRealGetDeviceData = NULL;
+
+static HRESULT WINAPI Hook_DIGetDeviceData(void *dev, DWORD cbObjData, void *rgdod,
+                                           DWORD *pdwInOut, DWORD dwFlags)
+{
+    HRESULT hr = g_pRealGetDeviceData(dev, cbObjData, rgdod, pdwInOut, dwFlags);
+    if (g_diProbeActive && dev == g_diMouseDevice) InterlockedIncrement(&g_cntGetDeviceData);
+    return hr;
+}
+
 static HRESULT WINAPI Hook_DICreateDevice(void *di, const GUID *rguid, void **dev, void *outer)
 {
     HRESULT hr = g_pRealDICreateDevice(di, rguid, dev, outer);
@@ -3166,6 +3212,16 @@ static HRESULT WINAPI Hook_DICreateDevice(void *di, const GUID *rguid, void **de
                 VirtualProtect(&vtbl[9], sizeof(void *), oldProt, &oldProt);
                 LogLine("MouseInject: hooked GetDeviceState; mouse device = %p "
                         "(vtable is shared, so the hook filters on this pointer)", *dev);
+                /* Also take slot 10 (GetDeviceData) so the buffered path can be
+                 * counted - see the probe report. */
+                g_pRealGetDeviceData = (DIGetDeviceData_t)vtbl[10];
+                if (VirtualProtect(&vtbl[10], sizeof(void *), PAGE_READWRITE, &oldProt)) {
+                    vtbl[10] = (void *)Hook_DIGetDeviceData;
+                    VirtualProtect(&vtbl[10], sizeof(void *), oldProt, &oldProt);
+                    LogLine("MouseInject: also hooked GetDeviceData (buffered path, counted only)");
+                } else {
+                    g_pRealGetDeviceData = NULL;
+                }
             } else {
                 g_pRealGetDeviceState = NULL;
                 LogLine("MouseInject: VirtualProtect failed on the device vtable");
