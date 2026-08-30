@@ -1,0 +1,1600 @@
+# Psychonauts VR — Status
+
+Last updated: 2026-08-24 later still (session 66: settled the positive-control question notes/65
+raised. Fresh full decompile of the debug-menu registration function proved "Show Collision" isn't
+a real item at all (TCRF/notes/59 was wrong about this exe); tested its closest real equivalent
+"Collision Spheres" (id 17) plus, as a last attempt, the structurally-different "Show Skel" (id 23)
+— both confirmed writing to the correct memory address, both show ZERO visible effect against
+Raz's own body and clearly-visible terrain. Four debug-menu visual toggles now (Render Wireframe,
+Collision Wireframe, Collision Spheres, Show Skel), zero visible effect from any of them — the
+debug menu's visual/display system is convergently confirmed non-functional on this PC build,
+matching TCRF's own caveat. This avenue is exhausted; recommend the home-PC in-headset test as the
+strongest remaining path. Full detail in notes/66.
+
+## Prior header (session 65: auto-pause blocker fixed, Collision Wireframe inconclusive)
+
+Last updated: 2026-08-24 later still (session 65: fixed the auto-pause blocker for real via a
+`GetForegroundWindow` IAT patch; wired + tested Collision Wireframe (item 22) — clean negative
+result, with an honest caveat about whether the debug visualization even renders anything in this
+build. Full detail in notes/65.
+
+**Session 65 summary**: Session 64's auto-pause/focus blocker is now FIXED. Root cause: the pause
+is very likely a per-tick `GetForegroundWindow()` poll, not a reactive window message (a WndProc
+message-swallow fix worked once then failed, logging almost no suppressed messages — the tell).
+Real fix: `PatchIATEntry()`, a new general-purpose IAT-patching helper, redirects the exe's own
+`user32.dll!GetForegroundWindow` import to always return the game's own hwnd. Confirmed clean across
+two full relaunch cycles, 20-30+ seconds of continuous gameplay each, zero pause dialogs. Wired
+`COLLISION_WIREFRAME_ITEM_ID 22` (NUMPAD7, same pattern as notes/62/64, confirmed at `engine+66`)
+and ran the matched-phase A/B notes/64 called for: **the void stays completely black with Collision
+Wireframe on, no lines, no difference from the baseline.** But a sanity check on definitely-present
+geometry (fence/rocks/plants) ALSO showed no visible wireframe overlay either way — so this result
+is a clean negative, not a fully conclusive one; it's consistent with "no collision geometry there
+either" but equally consistent with "this debug option doesn't render anything in this build; TCRF
+flagged some options as broken on PC. Next step: find a debug-menu option with a CONFIRMED-working
+positive control (Show Collision was TCRF's specific "still works" call-out) before trusting any
+more of these visualizations. Full reasoning + 4 evidence screenshots in notes/65.
+
+## Prior header (session 64)
+
+(Last updated: 2026-08-24 later (session 64: built the "Render Wireframe" toggle notes/63 called
+for, but caught a methodology mistake before trusting a result from it — see below — and hit a
+severe, still-unresolved auto-pause/focus blocker that prevented any live comparison this session).
+
+**Session 64 summary**: Found + wired a second debug-menu flag toggle (NUMPAD8 = "Render
+Wireframe", item id 21, same direct-byte-write mechanism as notes/62's Visibility Tree Culling
+toggle) — confirmed working via the log. **But realized before drawing any conclusion from it that
+render-fill-mode wireframe can't actually distinguish "real geometry, just dark" from "genuinely
+absent"**, since it only changes how already-issued draw calls rasterize, not whether culled
+geometry gets submitted at all. The theoretically correct tool is **"Collision Wireframe" (item id
+22, found in the same decompile, not yet wired)** — collision queries typically run independent of
+render-time visibility culling, so it could actually show geometry the render pipeline culled. Full
+reasoning in notes/64.)
+
+**Also hit a much worse version of the auto-pause problem than notes/60 saw**: the "while you were
+away" dialog now reappears within single-digit seconds of nearly every level load, not after AFK
+time — got exactly one clean gameplay frame per attempt before it retriggered. **Five different
+focus/foreground techniques have now failed across two sessions** (SetForegroundWindow retry loop,
+AttachThreadInput, a screen-coordinate-verified direct mouse click, minimize/restore, Alt+Tab, and
+this session's new attempt — disabling the OS foreground-lock via `SystemParametersInfo`, which
+failed with ACCESS_DENIED). This looks like a real structural constraint (a persistent, protected
+foreground window elsewhere on the machine) rather than a technique gap, and it's now blocked 2 of
+the last 3 sessions' actual empirical goals — worth a dedicated session of its own rather than a
+retry each time. Full detail, including concrete untried ideas (pre-arm the toggle before F12
+instead of racing it live; check if the pause is specifically tied to the `SetPendingLevel`
+transition; or just have a human click once, which worked in notes/63), in notes/64.
+
+No save files touched, no code shipped beyond the new opt-in NUMPAD8 hotkey (default off), old DLL
+backed up as `d3d9.dll.pre-notes64-backup`.
+
+## Prior header (session 63: void-behind-player bug — **the live A/B test is done**.
+Disabling Visibility Tree Culling does NOT remove the black void. Clean negative result, with a
+serious caveat about what the void even is — see below).
+
+**Direct answer to the question this whole investigation has been chasing**: toggling the
+Visibility Tree Culling flag off (NUMPAD9, confirmed in the log) does **not** change the black
+region seen when looking behind the player via simulated head-yaw. Matched-phase screenshots with
+the flag ON vs. OFF are near pixel-identical (`notes/assets/63-void-ab-test/tp5...` vs `off1...`,
+and `tp4...` vs `off4...`). Full writeup, methodology, and images in notes/63.
+
+**Important caveat uncovered in the same session**: the smoother of the two black shapes closely
+matches the silhouette of a real, unlit rock/cliff face visible from other angles in the same test
+area (`off6_rockformation_context.png`) — a third-person camera swung ±170° by sway is very likely to
+point straight at nearby terrain the normal camera never aims at, which would render near-black in
+silhouette against bright sky for entirely mundane reasons (no missing geometry involved). **The
+octree/Visibility-Tree-Culling hypothesis this investigation has pursued since notes/59 may be
+chasing the wrong mechanism, or at least this specific flag isn't gating whatever the real cause is.**
+Next session's cleanest path: use the debug menu's other flags (notes/61) to try wireframe/unlit-flat
+rendering at the same test phase — that would distinguish "real gap" (stays black regardless) from
+"backlit terrain" (shows up as flat-shaded geometry) cleanly, without needing camera-angle guesswork.
+
+**Also found and fixed this session: a hidden gap in the test methodology itself.** Fake-pose head-yaw
+sway (`PSYVR_FAKE_POSE`) only actually renders on the monitor-preview path when `PSYVR_FIRST_PERSON=1`
+is ALSO set (`proxy_d3d9.c` ~line 3593 gates the call). This was never set in notes/59-62 — meaning
+**no session before this one was ever actually testing live head-tracking rotation**; apparent
+"camera differences" earlier were just normal third-person gameplay motion. The `BVM cache SET` log
+line's `right` vector (used in notes/62 as a rotation sanity-check) is *also* not valid for this
+purpose — it logs the game's unmodified base camera, not our per-draw overlay rotation, and stayed
+frozen even in captures that visibly did rotate on screen this session. Judge rotation from the
+actual rendered frame only, never that log line.
+
+**No save files were touched this session** (test used only F12, NUMPAD9, and one raw ENTER to
+dismiss an auto-pause dialog — no Journal/save-menu navigation at all, avoiding the notes/62 trap
+entirely). No new DLL build was needed — notes/62's toggle build was reused as-is.
+
+## Prior header (session 61: void-behind-player bug — following a parallel
+session's public-research lead, located Psychonauts' dormant developer debug menu in our own exe and
+found a major independent confirmation of the octree/visibility-tree culling hypothesis; the live
+Sphere-Camera/Show-Collision experiment itself was not reached this session).
+
+**"Visibility Tree Culling" is a real, named, toggleable debug option shipped in the game's own
+dormant developer menu — independently confirms notes/59's octree-culling hypothesis directly from
+the developers' own terminology.** Fully decompiled the debug-menu construction function
+(`exe+0x627590`) and confirmed every item TCRF/the research note listed is present intact in our
+exe: Fly Camera, Sphere Camera, Show Collision, Collision Wireframe/Spheres, Show Nav Path, and
+critically **"Visibility Tree Culling"** ("Enable/disable use of visibility tree for culling") plus
+**"Debug Visibility Tree"** (node visualization) — real shipped code, not speculation. This strongly
+supports the theory that five sessions centered on camera-matrix code never found an isolated
+frustum test because there isn't one: visibility is decided by walking a tree structure (very likely
+the same PLB octree Jill Crungus documented on the collision side), not a standalone plane compare.
+Traced one level into the item-registration helpers (found where the item's numeric ID, e.g. 117 for
+Visibility Tree Culling, gets stored) but ran out of time before reaching the actual flag storage or
+the menu's activation trigger — **the live disappears-vs-persists screenshot test the user asked for
+was not reached this session.** No memory or file writes were made — pure read-only recon, nothing to
+revert. Full detail in notes/61.
+
+**Next, in priority order:** (1) decompile `sub_629490` (the shared toggle/select handler) to find
+whether item ID 117 maps to a directly-flippable global flag — if so, a hotkey can toggle
+"Visibility Tree Culling" with zero menu UI needed, sidestepping session 60's still-unresolved
+window-focus blocker entirely; (2) if not, find `sub_627590`'s live caller via EBP-chain (angr's
+static call graph found none — likely an indirect/vtable call) to locate the menu-system object and
+either call `SelectMenu`/`SelectPage` directly or fall back to McDonald's original Journal-pointer
+repoint technique; (3) either path still needs `SetPendingLevel` (notes/60's F12 hotkey, proven
+working) to reach real gameplay first.
+
+## Prior header (session 60: void-behind-player bug — user reframed candidate 1
+around the mouse-camera/body-facing decoupling already visible in flat play; big win on the side
+quest, `SetPendingLevel` live-verified working for the first time; mouse-yaw hunt itself blocked
+mid-session on a window-focus issue).
+
+**`SetPendingLevel` (notes/55) is now proven live-working — first time ever invoked, zero crash,
+real world-space camera coords confirmed.** New opt-in F12 hotkey (`PSYVR_LEVEL_JUMP_KEY=1`,
+`PSYVR_LEVEL_JUMP_CODE` to pick a level) calls it directly from a cold title screen; jumped straight
+into Sasha's Lab (`CAJA`) twice, clean both times. **This is a real, reusable capability beyond this
+session** — a reliable scriptable path into real gameplay that sidesteps `enter_gameplay.ps1`'s
+long-flagged door-timing unreliability (session 54), which has blocked every real-scene void/FOV
+test so far (including notes/59's inconclusive title-screen-only FOV_SCALE result). Full detail in
+notes/60.
+
+**Mouse-camera-yaw hunt (the user's reframed, lower-risk candidate-1 injection point) did not land
+this session.** Confirmed Site A's containing function (`sub_5123d0`, called conditionally from
+`CandB`) has no mouse-input references and looks like a camera-follow/focus-distance helper, not
+where mouse-look lives — a real if partial answer, but it means the CandB-side chain (notes/59) was
+the wrong place to keep digging for this. Pivoted toward DirectInput's `GetDeviceState`, didn't
+complete the live capture before time ran out. **Separately, hit a real blocker**: once inside the
+freshly-loaded level, the game auto-pauses on window-focus-loss, and this session could not reliably
+force real OS foreground onto the game window to dismiss it or test mouse-look (multiple techniques
+tried, all failed except one Alt+Tab that changed focus to the wrong window). `GetAsyncKeyState`-based
+hotkeys (F12 above) work fine regardless of focus; anything needing genuine window activation
+doesn't, this session. Full detail in notes/60.
+
+**Next, in priority order:** (1) solve the foreground-focus problem (its own short, focused
+investigation — blocks mouse-look testing, in-gameplay FOV_SCALE testing, and further void
+reproduction alike); (2) resume the mouse-yaw hunt from the input side — catch `DirectInput8Create`'s
+return live, breakpoint the mouse device's `GetDeviceState` (vtable slot 9), walk its caller chain —
+a fresh entry point, not another pass over `BuildViewMatrix`'s callers; (3) once both are unblocked,
+rerun notes/59's FOV_SCALE A/B in the now-reachable real level instead of the title screen.
+
+## Prior header (session 59: void-behind-player bug — closed out the multi-session CPU-side
+cull-test hunt (live x64dbg + angr decompile) with a real, if partial, answer; then built + tested
+candidate 3, the FOV_SCALE widen stopgap, monitor-only).
+
+**Cull-test hunt closed (for now) with a real finding, not the target mechanism.** Traced both
+per-frame `BuildViewMatrix` call sites: "Site B" (`exe+0x67F296`) turns out to be the world-space
+icon/HUD-marker overlay renderer, not the main scene — a dead end two sessions were spent on before
+recognizing it. "Site A" (`exe+0x512C9B`) sits inside **`CandB`** (`exe+0x4FEDA0`), the very function
+this mod's own `Hook_CandB` already calls twice per frame for stereo — and decompiling it shows
+**CandB is the camera's own entity-update tick, not a renderer**, protected by a critical section +
+a reentrancy guard that makes the mod's second per-eye invocation take a harmless short-circuit path
+instead of re-running game logic. **This resolves notes/10 §5's long-open "does double-calling
+double-advance game logic" question** (answer: not for CandB specifically, thanks to its own guard —
+not a general engine guarantee). The actual cull/frustum test itself (or an alternative like a
+room/portal-active flag) is still **not located** after four sessions of RE effort; paused per user
+direction rather than continuing to sink RE time into it. Full detail in notes/59.
+
+**Candidate 3 (widen `PSYVR_FOV_SCALE`) implemented and built, but the monitor test was
+inconclusive** — not because the fix doesn't work, but because the only reachable test scene (the
+title/menu screen) is a densely enclosing decorative background that never shows the void at any
+tested scale (1.8 or 2.5). Real outdoor gameplay is needed to test this properly, and automated entry
+into it is still blocked by the same door-timing unreliability flagged in session 54. Code changes
+(FOV_SCALE ceiling raised 2.5→4.0, new `PSYVR_FAKE_POSE_YAW_DEG` test knob) are built and deployed to
+the game directory (old build backed up alongside, clearly labeled) as working infrastructure for
+whoever solves gameplay entry next, or for direct home-PC in-headset testing. **Shipped default left
+at 1.8** — no real evidence yet to justify changing it. Full detail in notes/59.
+
+**Next, in priority order:** (1) either fix automated gameplay entry (the untested `SetPendingLevel`
+Lua-free level-jump from notes/55 is the leading candidate — sidesteps the door-timing problem
+entirely) and rerun the FOV_SCALE A/B in a real level, or hand this straight to the user for a
+home-PC in-headset A/B, which trivially reproduces the bug; (2) if FOV_SCALE alone proves
+insufficient at a real void-baseline, resume the cull-test hunt with a different entry point than
+either BuildViewMatrix site (e.g. start from a live-resolved `DrawIndexedPrimitive` breakpoint on
+real world geometry, not the title screen, and walk upward from there).
+
+## Prior header (session 55-58: PURE STATIC RESEARCH per user request - "learn what you can without
+running the game" - zero game execution the whole session, only offline disassembly +
+filesystem/string inspection of the exe/data on disk).
+
+**BIGGEST FINDING: the Lua exec primitive appears to be a single function call, not a multi-session
+lift as notes/52 concluded.** `0x6B0C00(L, buf, len, chunkname_or_NULL)` was fully traced (notes/57)
+as a complete "compile + protected-call execute an arbitrary Lua string" primitive - no
+`lua_pushstring` needed at all (it takes a raw buffer directly). This substantially de-risks the
+"engine-native Lua" route for first-person (SetCameraPosition/GetBoneWorldPosition/
+DumpSkeletonInfo) that was deprioritized in notes/52. **Still needs live verification** (runtime
+`lua_State*` capture per notes/46, thread/reentrancy safety, and a trivial-payload test BEFORE
+anything camera-related) - that's the natural first experiment for the next live session.
+
+**Second major finding: a Lua-free level-load path.** `LoadNewLevel`/`SetPendingLevel` (notes/55)
+fully mapped - `((void(__thiscall*)(void*,const char*,BOOL))0x4FFA40)(*(void**)0x78BC20,
+"workresource\\levels\\<CODE>.plb", flag)` requests an async level transition directly, no Lua, no
+UI navigation. Could solve the notes/54 automation blocker (deterministic door-entry miss)
+entirely differently - worth trying before further walk-tuning. All 49 level codes catalogued;
+`STMU`=menu/brain screen (explains every capture's landing spot all project long), `CA*`=Campgrounds
+(confirmed via embedded strings), `CAJA`=Sasha's Lab (confirmed), several others inferred from
+animation-path evidence but unconfirmed (see notes/55 table). Not yet tested live.
+
+**Third: full 455-shader corpus disassembled offline** (notes/56, reusing dumps from session 52).
+Confirms register 50 appears in 100% of shaders (corrects the "UI-specific" belief from notes/36 -
+it's the standard D3D9 half-pixel offset). Exactly identifies the 10 UI shaders (indices 3,447-455)
+and reconfirms the 239-shader skinning cohort. Caught + corrected a false lead (naive "references
+register >=64" is NOT a reliable skinning-shader test - one rigid shader just uses a high-numbered
+material constant). Shadow-caster shaders NOT identifiable from vertex-shader text alone - needs a
+live render-target-correlated trace.
+
+**Fourth (partial): DumpSkeletonInfo traced** (notes/58) - entity struct offsets +0x54 (bone count,
+packed bitfield) and +0x5C (bone-pointer array) found; full 96-byte per-bone record layout NOT
+decoded (needs live cross-check, flagged for later, not attempted per tonight's no-execution rule).
+
+**Next live session, in priority order:** (1) capture runtime g_L + test the newly-mapped Lua exec
+primitive with a trivial payload; (2) if that works, try SetCameraPosition/GetBoneWorldPosition for
+FP, OR try the SetPendingLevel level-jump to solve automation; (3) decode the bone-record layout
+live if pursuing the render-level Raz-entity-offset shortcut. Prior status (session 54's RAZLOCK
+test still uncaptured) remains the FP-goal-specific open item if that thread is resumed instead.
+
+## Prior header (session 54: automation infrastructure fixed, but real-gameplay RAZLOCK
+test still NOT captured - stopped for the day, resume tomorrow. FOUND+FIXED a genuine, durable bug
+in tools/input/send_key.ps1: SetForegroundWindow's grant is single-use (consumed by the very next
+call, not durable across a sequence), and another process (the tool-harness's own powershell) is
+actively contending for foreground - so single-attempt focus grabs failed 3x in a row today. Fix:
+retry loop that re-grants AllowSetForegroundWindow fresh before every attempt (up to 5x). CONFIRMED
+durable - two full 13-key enter_gameplay.ps1 sequences completed cleanly after the fix (vs 3 prior
+failures). This should be treated as permanent project infrastructure going forward.
+STILL UNRESOLVED: enter_gameplay.ps1's blind walk-to-CONTINUE-door deterministically misses (lands
+at the identical wrong coordinates every time - not random, needs real tuning with a clean feedback
+loop, not the noisy throttled eye-dump timer used tonight). A manual-assist attempt ALSO stayed at
+menu-space coords for 103s/6221 frames - unclear if it actually reached gameplay. THE ACTUAL GOAL
+(capture g_razNearValid hit-rate during real walking, to test the notes/53 Raz-lock-flicker
+hypothesis) is STILL UNTESTED - blocked on reliably reaching real gameplay. Resume point: fix
+door-entry first (proper iterative tuning, or find an in-engine level-jump per playbook §2.1), THEN
+run PSYVR_RAZLOCK_STATS=1 (already built) during actual walking. Details in notes/54.)
+
+## Prior header (session 53: FP debugging resumed, composition math proven correct)
+
+Last updated: 2026-08-20 (session 53: RESUMED FP debugging per user request ("resume now that the
+convention's ruled out"). Built two isolated, fully-automated empirical tests (no gameplay needed -
+title screen alone suffices): (1) raw translation injected directly into head-tracking's T matrix,
+measured ~500-540wu back out for a 500wu input; (2) the FP-specific X1 construction (target-eye-
+minus-base-eye, projected onto camera axes) with a KNOWN forced razWorld offset (bypassing Raz
+detection), measured EXACTLY 500.0wu back out for a 500wu input, zero variance across 16 samples.
+**CONCLUSION: the entire render-level camera-move mechanism (X1 -> T -> Pinv*T*P sandwich ->
+transpose -> GPU) is mathematically proven correct, not just theorized.** Combined with session 52's
+shader-convention confirmation, the transform math is fully vindicated end-to-end. The original FP
+bug (eye stuck behind Raz, "fighting for a position") is real and STILL UNRESOLVED, but is now known
+NOT to be a math error. New leading suspect: g_razNearValid (the nearest-to-eye Raz lock) flickering
+during real-time gameplay - Raz's skinned draw isn't guaranteed every frame, and losing the lock
+falls back to a completely different, chase-cam-relative shift, which fits the "fighting"/"moves
+relative to terrain" symptom description (dynamic instability, not a static wrong offset). NOT YET
+TESTED - needs a real gameplay capture logging the lock's frame-by-frame hit rate while walking, not
+another title-screen-only isolated test. New diagnostic knobs (all default off): PSYVR_HT_TEST_SHIFT,
+PSYVR_HT_DEBUG, PSYVR_FP_FORCE_ACTIVE, PSYVR_FP_FORCE_RAZ. Two new capture scripts:
+tools/input/auto_ht_test.ps1, auto_x1_test.ps1. Details in notes/53.)
+
+## Prior header (session 52: playbook adoption)
+
+Last updated: 2026-08-20 (session 52: adopted the user-shared engine-agnostic VR RE PLAYBOOK.md;
+scaffolded `psychonauts-vr-engine-research` (5th repo, playbook + a full ENGINE-DOSSIER.md distilled
+from notes 1-51). Writing the dossier's camera section honestly flagged an unverified assumption:
+the register-6 row/column-vector convention the whole render-level camera model rests on had never
+been checked against the compiled vertex shader (playbook §3.3's explicit rule) — and was the
+leading suspect for session 51's FP-translation mystery. Closed it with real evidence: built a
+PSYVR_SHADER_DUMP diagnostic (reusing the pre-existing PSYVR_REG_HISTO all-shader dump), a NEW
+fully-automated capture script (`tools/input/auto_shader_dump.ps1`, built on request - "can we
+automate this" - chains silence-audio/launch-offscreen/enter_gameplay/poll-log/kill/restore), then
+disassembled the captured shader OFFLINE via Python ctypes calling D3DX9_40.dll directly (zero live
+game needed for the analysis step). RESULT: the convention is CONFIRMED CORRECT (`m4x4 r4, r11, c6`
+= 4x dp4, translation term = c[6+i].w = exactly our code's [3,7,11,15] extraction), cross-checked
+against 239/455 shaders. So notes/51's FP-translation bug is NOT a convention problem — that
+hypothesis is now closed, narrowing the real cause to the X1*T composition / Transpose(P^-1*T*P)
+premultiply pipeline. FP goal remains PAUSED per user's session-51 decision; this session only
+resolved the one flagged risk. Details in notes/52.)
+
+## Prior header (session 51: FP goal paused)
+
+Last updated: 2026-08-20 (session 51: FP GOAL PAUSED after render-level first-person hit a ceiling.
+WINS THIS SESSION: (1) Shoulder-anchor ROOT CAUSE found + fixed + monitor-validated — Raz is the
+c96 (32-bone) entity NEAREST the camera eye (rigid ~11.6 wu chase-cam offset, rock-stable); other
+32-bone NPCs sit 100s of wu away. notes/49's filter was INVERTED (rejected near-eye = rejected Raz,
+then centroid-averaged NPCs = the jitter). Now locks to the single nearest-to-eye c96 origin; the
+`ANCHOR:` probe confirmed it's stable standing + smooth walking, eyeDist 11.6. (2) F4 runtime toggle
+(FP off until pressed) — stops FP engaging on title/menu/brain screens (they have decorative
+skinned chars our detector latched as phantom Raz); user-confirmed menus clean until F4. (3) notes/50
+static Lua map corrected notes/46 (0x6AEF20=lua_gettop, 0x6C1A40=string-arg getter; luaB_dostring is
+an INLINED compile+run, not a callable lua_dobuffer — arbitrary-string exec is a multi-session lift).
+(4) New diagnostics: PSYVR_BONE_DUMP (per-draw origins + 32 bone translations), ANCHOR/RAZAXIS probes;
+monitor FP-preview path (g_fpPreviewMode, drives FP with identity head when SteamVR absent).
+THE CEILING (why paused): render-level eye-MOVE does NOT reposition the rendered view. Proof: at max
+forward the applied view-space translation is t=(-0.8,-12,212)wu yet Raz stays in front (a real 212wu
+move = eye 200wu past him, gone). Only the head ROTATION half of g_trackYt takes — which is why FP has
+been "close but broken" every session incl. the remembered "2.2". Also: Raz's ORIENTATION is
+non-recoverable at render level (RAZAXIS: perspective-inverse scrambles direction vectors — recovered
+axes are rank-collapsed, X·Y≈0.9 not 0). User also noted: A/D TURN Raz (no strafe), and the FP eye
+locks BEHIND Raz + "moves relative to terrain" when walking (smoothing lag). DECISION: user chose to
+PAUSE FP. Recommended resume path = ENGINE-NATIVE via Lua (engine has FirstPersonCamera + SetCamera
+Position/Orientation + GetBoneWorldPosition, notes/44) — the engine places the camera at Raz's real
+head, sidestepping all render-level matrix pain; gated on finishing the Lua exec primitive (notes/50).
+Alt resume = debug WHY the 212wu translation doesn't move the rendered eye (transpose/convention bug
+suspected in the g_trackYt application, though the math checks out on paper). Game-dir launchers I
+made: Launch-FP-Monitor-Diag.bat, Launch-FP-Monitor-Preview.bat, Launch-FP-SteamVR-DeskTest.bat.
+Details in notes/50, notes/51.)
+
+## Prior header (session 43: submit bounds zoom fix)
+
+Last updated: 2026-08-19 midday (session 43: THE ZOOM IS FIXED FOR REAL — tangent-matched
+VRTextureBounds at Submit make the compositor's angular mapping exactly 1:1 at any FOV scale.
+PSYVR_FOV_SCALE now only controls culling margin/lens coverage (Quest 3 full coverage = 1.8,
+new launcher default). The notes/42 "HUD invisible" bug dissolves with it. The notes/42 UI
+viewport shrink was built first, failed live (the game's fullscreen fades/backdrops share the
+UI shader signature — "everything dark"), and is demoted to an experimental opt-in. The
+notes/40 missing suggested-FOV log line is root-caused and fixed. v0.1.7-alpha RELEASED
+(user go-ahead, 2026-08-19 midday); Quest 3 flight is the next event. Details in notes/43)
+
+## Session 43 (2026-08-19): submit bounds = real zoom fix; UI-shrink post-mortem
+
+- `VRBridge_SubmitBounds`: per-eye crop of the submitted texture to the headset's real
+  GetProjectionRaw frustum, in tangent space. 1:1 angular mapping at any FOV scale; bounds
+  clamp to the full texture when the frame is smaller than the lens (= exactly the old
+  behavior at FOV 1.0, so defaults are unchanged). `PSYVR_SUBMIT_BOUNDS=0` reverts.
+- FOV semantics change: scale = rendered margin around the visible window, not zoom.
+  Log suggests the full-coverage value (Quest 3: 1.77 -> launcher ships 1.8).
+- UI viewport shrink (notes/42 plan): fullscreen overlays share the UI shader signature, so
+  shrinking every UI draw crushed the presented scene ("everything dark", user-verified, then
+  user-verified fixed after demotion). Now opt-in via PSYVR_UI_SCALE; classifier work queued.
+- notes/40 Issue 1 fixed: suggested-FOV log deferred to first BPM cache (guard could never
+  pass at init time); live-verified on the null driver.
+- Full detail in `43-submit-bounds-zoom-fix-ui-shrink-postmortem.md`.
+
+## Sessions 40-42 (2026-08-18 evening, test PC): first head-tracked playtests
+
+- notes/40 (v0.1.4, Quest 3): head tracking works in real gameplay, clean exits, both eyes
+  solid. Found: FOV zoom (expected), over-the-shoulder culling void, LOD-billboard stereo
+  mismatch, missing suggested-FOV log line.
+- notes/41: v0.1.5-alpha config-only release (Quest 3 launcher, FOV 1.5 + 3x) from the test PC.
+- notes/42 (FOV 1.5 + 3x flight): zoom improved, ~72Hz holds at 2400x1800/eye on the RTX 5080
+  (~9ms readback vs 13.9ms budget), NEW: HUD invisible at FOV > ~1.2 (v0.1.6 backed launcher
+  off to 1.2). Culling void upgraded to a comfort issue ("staring into nothingness").
+- Full detail in notes 40/41/42.
+
+## Prior header (session 39)
+
+(Last updated: 2026-08-18 late afternoon #2 (session 39: AUTONOMOUS GAMEPLAY ENTRY VERIFIED
+end-to-end — synthetic input drove the game from cold title screen through the menu's blue
+CONTINUE door into real Whispering Rock gameplay (world-space camera coords + HUD visible in
+the eye dump), zero human keypresses. Door trigger = jump while on/over the card, via
+micro-step+jump loop. Script: tools/input/enter_gameplay.ps1. The full test loop is now
+scriptable. Tonight's headset test (v0.1.4-alpha) is the next event. Details in notes/39))
+
+## Session 39 (2026-08-18): autonomous gameplay entry verified
+
+- Route: SPACE at title -> UP x3, LEFT x1 -> blue CONTINUE card (middle of three) ->
+  micro-steps with a jump after each -> save loads -> gameplay. Verified via BVM camera
+  coords jumping to the notes/22 world-space region + eye-dump showing Raz + HUD in-level.
+- Full detail in `notes/39-autonomous-gameplay-entry-verified.md`.
+
+## Prior header (session 38)
+
+(Last updated: 2026-08-18 late afternoon (session 38: the notes/15-18 INPUT BLOCKER IS SOLVED —
+plain SendInput with scan codes + genuinely-foreground game window advances the title screen
+and navigates the menu, verified twice via eye-dump diffs. Autonomous gameplay testing is now
+possible (menu-item selection deliberately deferred pending user guidance on save slots).
+Also: v0.1.4-alpha released with the PSYVR_FOV_SCALE knob + launcher bat asset; notes/37
+housekeeping cleared. Tonight's headset test should use v0.1.4. Full detail in notes/38)
+
+## Session 38 (2026-08-18 late afternoon): input blocker solved, v0.1.4 shipped
+
+- SendInput(SCANCODE) + SetForegroundWindow (verified, abort-on-fail) + hands-off protocol =
+  working synthetic input. SPACE advanced title->menu; RIGHT walked Raz across the brain.
+  Old debugger-based buffer forgery (notes/15-18) bypassed the real input stack - that was the
+  whole problem. Helper: tools/input/send_key.ps1.
+- v0.1.4-alpha: PSYVR_FOV_SCALE knob + suggested-value logging + Launch-Psychonauts-VR.bat.
+- Full detail in `notes/38-input-blocker-solved-sendinput.md`.
+
+## Prior header (session 37)
+
+(Last updated: 2026-08-18 afternoon #3 (session 37: PSYVR_FOV_SCALE knob implemented and
+numerically verified — the compositor maps eye textures onto the headset's ~80°+ frustum, so
+the game's ~52° fovy reads as zoomed-in; the knob scales rawFov in place at the BPM hook and
+the log now prints a suggested value from the real HMD tangents. PSYVR_RENDER_SCALE=3 validated
+live (1920x1440/eye, readback 3.7ms/eye on the dev GTX 1660). Shipping as v0.1.4-alpha.
+Tonight's headset test is the next event. Full detail in notes/37)
+
+## Session 37 (2026-08-18 afternoon #3): FOV knob + 3x validation
+
+- `PSYVR_FOV_SCALE` (0.5..2.5, default 1.0 = exact no-op): three x87 instructions patch rawFov
+  on the stack at Hook_BuildProjectionMatrix entry; observer cache, game projection, culling,
+  and stereo correction all follow automatically. Verified at 1.3 against analytic prediction.
+- `VRBridge_QueryRealGeometry` logs `suggested PSYVR_FOV_SCALE` computed from real HMD tangents.
+- 3x render scale validated with live bridge; combined regression at defaults healthy.
+- Full detail in `notes/37-fov-scale-knob-and-3x-scale-validation.md`.
+
+## Prior header (session 36)
+
+(Last updated: 2026-08-18 afternoon #2 (session 36: audited ALL 455 of the game's vertex
+shaders — every 3D shader (including all 403 skinned/bone-palette ones) transforms through the
+already-corrected c6 matrix, REFUTING the long-standing "skinned geometry uncorrected"
+limitation; the 10 remaining shaders are pure screen-space UI, which DID bypass correction (HUD
+at infinity in VR) — fixed with a new UI-depth feature (default 2m, PSYVR_UI_DEPTH), verified
+quantitatively via eye-dump cross-correlation with a clean control run. Full detail in notes/36)
+
+## Session 36 (2026-08-18 afternoon #2): shader audit + UI depth
+
+- 455/455 vertex shaders dumped (PSYVR_REG_HISTO=1) and analyzed (tools/proxy-d3d9/vs_analyze.py):
+  445 end position math with m4x4 vs c6 (already stereo+tracking corrected — skinned INCLUDED),
+  10 are screen-space UI (oPos = input + c50, zero parallax).
+- UI-depth: UI shaders identified by bytecode signature at CreateVertexShader, binds tracked,
+  per-draw c50.x shifted per eye by -d*xScale/depth. Text band measured 16px between eyes
+  (15.5 predicted), 3D bands unchanged, depth=0 control restores 0px.
+- Not yet released (would be v0.1.3-alpha). USAGE.md's skinned limitation needs removing.
+- Full detail in `notes/36-shader-audit-skinned-refuted-and-ui-depth.md`.
+
+## Prior header (session 35)
+
+(session 35: the notes/23 BLACK-LEFT-EYE BUG is root-caused
+and FIXED, user-verified — the engine re-binds the real backbuffer mid-eye-pass on the
+brain/title screen; fixed with three eye-phase redirects (RT bind, StretchRect read, DS bind).
+Also: VR eye buffers now render at 2x game resolution by default (PSYVR_RENDER_SCALE 1-4),
+F11 recenters head tracking, and new PSYVR_DUMP_EYES / PSYVR_TRACE_FRAME diagnostics. All
+verified live at 1x and 2x with the full bridge running. Full detail in notes/35)
+
+## Session 35 (2026-08-18 afternoon): black-left-eye FIXED, 2x eye resolution
+
+- **notes/23 bug root cause** (live-traced, old frustum hypothesis wrong): on the brain screen
+  the engine records "the screen" RT while the real backbuffer is bound, restores it mid-pass-1
+  and draws everything there; EYE1 keeps its cleared black. Reproduced the user's in-headset
+  black left eye from last night. Fix: during eye passes redirect backbuffer RT binds, backbuffer
+  StretchRect reads, and real-DS binds to the active eye's private surfaces. Eye parity verified
+  by pixel measurement and by the user; gameplay regression-checked.
+- **2x eye resolution** (default with submit; PSYVR_RENDER_SCALE overrides): 1280x960/eye
+  verified submitting here; 1600x1200/eye expected on the gaming PC. Readback ~1.4ms/eye.
+- Full detail in `notes/35-black-left-eye-root-cause-fixed-and-2x-eye-resolution.md`.
+
+## Session 34 (2026-08-18 morning): shutdown-zombie fix, quit events, HEAD TRACKING
+
+- **Head tracking (6DOF)**: `renderPoses[0]` from the existing `WaitGetPoses` call now drives a
+  dense per-frame `Y_track = P^-1*T*P` premultiplied onto every register-6 upload before the
+  per-eye patch (combined `WVP*Y_track*Y_eye`). Reference = first valid pose's position+yaw
+  (horizon stays level). Math validated numerically (6 checks,
+  `tools/proxy-d3d9/validate_headtrack.py`) BEFORE building; live sway test via new
+  `PSYVR_FAKE_POSE=1` confirmed visually by the user ("whoa did you just get head tracking
+  working?!"); null-driver static-pose regression clean (T stays identity, no NaNs).
+  `PSYVR_DISABLE_TRACKING=1` opts out.
+- **Zombie fix (notes/33 §4)**: `DllMain` DETACH now does NOTHING when `lpvReserved != NULL`
+  (process terminating - every other thread already dead; any teardown wait deadlocks under
+  loader lock, per the documented DllMain contract). Did not repro locally (clean exits even
+  with vrserver force-killed mid-game) but the fix removes the exact code path the gaming-PC
+  log showed hanging.
+- **VREvent_Quit handled**: polled per-frame (IVRSystem slot 30); on quit-class events,
+  acknowledge (slot 47) + immediate full bridge teardown at a safe moment; game continues in
+  monitor mode. Live-verified end-to-end with a real SteamVR exit. HMD identity
+  (trackingSystem/model) now logged at init (slot 28).
+- Release repo NOT touched; a v0.1.1-alpha with all three changes is the obvious next release,
+  pending user go-ahead. Full detail in
+  `notes/34-shutdown-zombie-fix-quit-events-and-head-tracking.md`.
+
+## Prior status header (session 13/32, 2026-08-17, kept as background)
+
+(session 13: the hardcoded STEREO_HALF_IPD=3.25 constant and the
+estimated focus-distance shear term are now driven by REAL OpenVR-queried data whenever it's
+available (IVRSystem::GetFloatTrackedDeviceProperty/GetEyeToHeadTransform/GetProjectionRaw),
+falling back transparently to the pre-existing hardcoded behavior when it isn't (e.g. no
+PSYVR_ENABLE_SUBMIT / no SteamVR). Real numbers confirmed via the live null-driver runtime: IPD =
+63.00mm exactly (only ~3% below the old 3.25-unit guess), eye offsets exactly symmetric (±31.5mm),
+GetProjectionRaw exactly symmetric ([-1,1,-1,1] both eyes - no real off-axis data from this
+driver), GetRecommendedRenderTargetSize = 1656x1840/eye. Submit re-verified working after the
+change. Higher-resolution VR-only rendering investigated and found to be a genuinely separate,
+larger undertaking - documented, not attempted. Menu black-left-eye bug: bounded-effort hypothesis
+update only, no new lead — full detail in notes/32)
+
+## Real OpenVR-queried IPD/projection data replaces hardcoded stereo constants (2026-08-17, session 13)
+
+**Task 1: `IVRSystem::GetFloatTrackedDeviceProperty(Prop_UserIpdMeters_Float)`,
+`GetEyeToHeadTransform`, and `GetProjectionRaw` now drive the stereo correction's `d`/`k` terms
+whenever OpenVR is initialized, replacing notes/24's hardcoded `STEREO_HALF_IPD=3.25`/estimated
+focus-distance shear with real runtime data — confirmed working end-to-end, not just wired up.**
+Full detail in `notes/32-real-openvr-ipd-projection-data-and-menu-bug-revisit.md`. Headline
+findings:
+
+- **Real numbers confirmed twice** (standalone POC `tools/vr-bridge/poc_ipd_query`, then live
+  in-game): IPD = 0.063000m exactly (63mm, the standard OpenVR default — only ~3% below the old
+  hardcoded 3.25-world-unit half-IPD guess, a genuine cross-validation of that earlier estimate);
+  `GetEyeToHeadTransform` = exactly ±0.0315m, perfectly symmetric; `GetProjectionRaw` = exactly
+  `[-1,1,-1,1]` for both eyes (this null driver reports NO real off-axis asymmetry — confirmed,
+  not assumed); `GetRecommendedRenderTargetSize` = 1656x1840/eye.
+- **A real derivation, not a guess**: `GetProjectionRaw`'s `(l+r)/2` maps directly onto the
+  existing shear coefficient `k` via the standard "shift-lens" stereo-camera equivalence (a
+  same-width asymmetric frustum is mathematically identical to a symmetric frustum sheared by its
+  center offset) — used automatically whenever a driver reports genuine asymmetry, with the
+  existing focus-distance estimate as fallback (the only path this null driver actually exercises).
+- **A new ABI wrinkle handled correctly**: `GetEyeToHeadTransform` returns a 48-byte struct BY
+  VALUE — the MSVC x86 hidden-return-pointer convention was implemented explicitly (not left to
+  the cross-compiler's own struct-return codegen), confirmed working via the standalone POC before
+  touching the live-tested integration code.
+- **Fully backward-compatible by design**: the real-data path only activates when
+  `g_vrGeomValid` is TRUE (OpenVR successfully initialized) — anyone without `PSYVR_ENABLE_SUBMIT=1`
+  set and SteamVR installed (the default for most users of this mod) gets byte-for-byte identical
+  behavior to before this session.
+- **Submit re-verified working**: live proxy log shows `Submit(eye=N) OK` climbing continuously
+  for both eyes (frame 3 through 700+), and `SVSCF stereo-correct` log lines confirm the real
+  values are actually consumed (`d=-3.150`/`d=3.150`, `dSrc=openvr`), not just logged and unused.
+- **Task 1 item 4 (higher internal VR render resolution)**: investigated, found to require
+  decoupling the VR-submit path's render target from the monitor-composite path's shared
+  `g_pEye1Surf`/`g_pEye2Surf` — a real, separate, riskier undertaking. Documented with a concrete
+  recommended approach (prototype standalone first, mirroring how the whole VR bridge itself was
+  built) rather than attempted this session, per the task's own explicit permission to do so.
+- **Task 2 (menu black-left-eye bug)**: bounded-effort check only, per the task's own scoping.
+  The real `GetProjectionRaw` data doesn't change the notes/23 hypothesis (this driver reports no
+  real asymmetry to test against); the real IPD being slightly smaller than the old hardcoded
+  value (3.15 vs 3.25) very slightly reduces rather than increases the hypothesized frustum-
+  boundary risk. No new lead — reproducing the bug still needs either working synthetic input past
+  the title screen (unsolved since notes/15-18) or the user hitting it live.
+- **Deployed**: the new build was deployed into the game directory (additive, off by default
+  without `PSYVR_ENABLE_SUBMIT=1` — the notes/31 build was backed up first). Not pushed to the mod
+  repo (this session's own instruction: modding-notes/dev-archive only).
+
+## Prior milestone (real per-span timing settles WaitGetPoses vs. GetRenderTargetData; two methodology bugs found, session 12, still valid as background)
+
+**notes/30 flagged an open question (does WaitGetPoses or the GetRenderTargetData/readback chain
+dominate the VR-bridge's measured performance cost?) and specified exactly the fix: per-span
+QueryPerformanceCounter timing. This session implemented that, then chased the result through real
+A/B experiments (not just logging) to a settled, well-evidenced answer.** Full detail in
+`notes/31-waitgetposes-is-the-real-cost-present-double-pacing-fixed.md`. Headline findings:
+
+- **`GetRenderTargetData`/readback chain definitively ruled out**: measured at <1ms/frame combined
+  for both eyes (GetRenderTargetData ~0.01ms, the LockRect+memcpy+UpdateSurface chain ~0.4ms/eye) —
+  notes/28's own hypothesis does not hold up against real data.
+- **`IVRCompositor::WaitGetPoses` confirmed as the real, dominant cost: ~25-27ms/call, every call**,
+  and confirmed REQUIRED (not misused) via a direct A/B test — skipping it restores full baseline
+  framerate but breaks every `Submit` call (`VRCompositorError_DoNotHaveFocus`). Two independent,
+  correct architecture fixes (removing a redundant double-vsync stack against the game's own device;
+  repositioning the call to the OpenVR-standard "right after Present" call site) were implemented,
+  verified not to break Submit, but honestly measured to have ~zero fps effect this session — the
+  cost is an external floor imposed by SteamVR's own compositor, not fixable from this project's code.
+- **A real testing-methodology bug found**: this project's "offscreen" test convention
+  (`move-window-offscreen.ps1`) triggers Windows DWM occlusion-throttling, independently capping real
+  `Present()` at ~30fps regardless of VR-bridge state — this would have invalidated any fps
+  comparison done under it. All future timing-sensitive tests must use a visible window.
+- **A retroactive correction to notes/28/29/30's own fps numbers**: their shared frame-counter method
+  double-counts (CandB's per-eye internal Present() hook calls both increment the counter, but only
+  one per frame is real) — true baseline is **~60fps** (not ~119fps), true pre-this-session VR-bridge
+  rate **~28-30fps** (not ~57-60fps). The *relative* ~2x regression finding stays valid; only the
+  absolute numbers were inflated. ~60fps baseline matches the user's own stated expectation for 2x
+  (stereo) rendering on this hardware.
+- **Honestly unresolved**: whether the ~25-27ms WaitGetPoses cost is specific to SteamVR's null
+  driver (no physical HMD to derive real vsync timing from — plausible, doesn't match the null
+  driver's own declared 90Hz setting) or would also occur against a real headset — this project has
+  no physical VR hardware to test either way.
+- **Submit re-verified working** after all changes, same evidence method as notes/29/30 (proxy log
+  `Submit(eye=N) OK` lines climbing continuously, both eyes) in every configuration tested.
+- **Deployed**: the final instrumented+fixed build was deployed into the game directory (additive,
+  off by default without `PSYVR_ENABLE_SUBMIT=1` — the prior notes/29 build was backed up first).
+  Not pushed to the mod repo (this session's own instruction: modding-notes/dev-archive only).
+
+## Prior milestone (Submit fix live-verified working; VR-bridge performance cost measured with real evidence, session 11, still valid as background)
+
+**notes/29's deadlock fix was deployed into the user's live game (PID 18284,
+`PSYVR_ENABLE_SUBMIT=1`) and is now confirmed, with hard evidence, to actually work.** Full detail in
+`notes/30-submit-live-confirmed-and-performance-cost-measured.md`. Headline findings:
+
+- **Submit confirmed firing every frame, two independent ways**: the live proxy log shows
+  `"VRBridge: Submit(eye=N) OK (frame=N)"` for both eyes continuously (100+ lines, frame counter
+  climbing steadily to 1637+ and counting), and SteamVR's own compositor log
+  (`vrclient_Psychonauts.txt`) shows `"Loading shaders"`/`"Created shared texture ... 640x480"` (6
+  lines, matching both eyes) appearing 23ms after `"Capturing Scene Focus"` — landing within 1ms of
+  the proxy log's own first `"Submit(eye=0) OK"` timestamp. The two independently-logged systems
+  agree to the millisecond; this is the same signature the notes/27 working POC showed and the
+  notes/29 broken session never reached.
+- **The user's "noticeably laggier" report investigated with real evidence, not dismissed.** Using
+  the pre-existing throttled `Present() hit - total frame #N` log line as a precise per-second fps
+  sample, six pre-VR-bridge sessions earlier in the same log file (~1.7 hours of real play) average a
+  stable ~119fps (8.4ms/frame); both the broken (notes/29) and fixed (this session) VR-bridge
+  sessions average ~57-60fps (16.8-17.6ms/frame) — a real, reproducible ~2x frame-time regression
+  (+8-9ms/frame), same machine, same log format.
+- **A genuinely useful negative result**: the broken session (Submit never succeeds, ever) and the
+  fixed session (Submit succeeds every frame) cost almost exactly the same — which rules OUT
+  `IVRCompositor::Submit` itself as the dominant cost, since it barely executes at all in the broken
+  session yet the frame-time hit is identical. The real cost is in code that runs unconditionally
+  every frame regardless of Submit's outcome: `WaitGetPoses` (once/frame) and the
+  `GetRenderTargetData`+`LockRect`+`memcpy`+`UpdateSurface` readback chain (twice/frame, one per eye).
+- **Honestly flagged, not overclaimed**: the available data cannot cleanly separate `WaitGetPoses`'s
+  cost from the readback chain's cost — both run unconditionally in both sessions equally, so
+  notes/28's "GetRenderTargetData is the likely culprit" hypothesis is partially supported, not
+  proven. A concrete, cheap next step (per-span `QueryPerformanceCounter` timing around each
+  candidate, guarded behind the existing flag) is specified in notes/30 §4 but not implemented —
+  needs a redeploy+relaunch this session deliberately didn't risk against the just-verified working
+  Submit path.
+- **No code changes this session** — `proxy_d3d9.c` unchanged from notes/29. A safe optimization
+  (e.g. every-other-frame readback) was considered but documented for a future session rather than
+  implemented, since it couldn't be verified without touching the live process again.
+- **Not pushed to the mod repo** — per this session's explicit instruction, the user must personally
+  test and approve before anything goes to `psychonauts-vr`.
+
+## Prior milestone (Submit deadlock bug found and fixed — real bug, not a missing log line, session 10, still valid as background)
+
+**notes/28's VR submission integration was deployed into the user's real, running game (PID 23696,
+`PSYVR_ENABLE_SUBMIT=1`) for the first time — init succeeded cleanly (D3D9Ex/D3D11 devices, OpenVR,
+IVRCompositor, eye buffers, `g_vrBridgeReady=TRUE`) but across 1763+ frames there was zero log
+evidence the per-frame `Submit` call was ever reached.** Investigated and found a real, reproducible
+deadlock, not just a missing log statement. Full detail in
+`notes/29-submit-never-fired-frame-counter-deadlock-fix.md`. Headline findings:
+
+- **Root cause, found by reading the code**: `VRBridge_PumpEye`'s double-buffer slot selector
+  (`bCur`) was computed from `eye->hop1Count % 2` — but `hop1Count` only advances once a promotion
+  fully succeeds, which itself requires the OTHER buffer slot to already hold valid data, which
+  requires `bCur` to have alternated to it first, which requires `hop1Count` to have advanced first.
+  A closed circular dependency: `bCur` is permanently stuck at 0, `sysmemB[1]` is never written,
+  `hop1Count` never leaves 0, and the `Submit` gate (`hop1Count >= 2`) is never satisfied — Submit is
+  never even attempted, not just failing silently.
+- **Independently confirmed via SteamVR's own compositor-side log**, read-only, without touching the
+  live process: `D:\Program Files (x86)\Steam\logs\vrclient_Psychonauts.txt` ends at `"Capturing
+  Scene Focus"` with nothing after it, while the same log for the notes/27 POC that DID successfully
+  call Submit (`vrclient_submit_test_poc.txt`) shows `"Loading shaders"`/`"Created shared texture"`
+  appearing within 15ms of its own `"Capturing Scene Focus"` line — hard, compositor-side proof no
+  frame was ever received from the Psychonauts process, matching the code-level diagnosis exactly.
+- **This settles the task's own core ambiguity precisely**: NOT "Submit is probably working but
+  unverifiable" — a real bug prevented Submit from ever being reached at all. A genuinely missing
+  success-path log statement was also real and separately fixed (throttled ~1/sec per eye, matching
+  this codebase's existing convention), but it was not the cause of the silence — the deadlock was.
+- **Fixed**: added a proper per-call `frameCount` field to `VRBridgeEyeState`, incremented
+  unconditionally once per `VRBridge_PumpEye` call, and switched `bCur`/`bPrev` to derive from it
+  instead of `hop1Count` (which stays correctly used only for `aCur`/`aConsume`, Device A's own
+  buffer index) — matching the proven standalone POC's design exactly, where the loop's own external
+  iteration counter and `hop1Count` were always two separate variables. Build clean (same two
+  pre-existing, unrelated warnings as notes/28), `d3d9.dll`/`openvr_api.dll` rebuilt.
+- **NOT yet live-tested**: the user's live session (PID 23696) was still running the OLD buggy DLL
+  the entire time (no kill, no attach, no write to the loaded DLL) — **the user needs to close the
+  current session so the fixed DLL can be deployed and relaunched**, then check the live proxy log
+  for the new `"VRBridge: Submit(eye=%d) OK"` lines and cross-check
+  `vrclient_Psychonauts.txt` for the same shader/texture-creation signature the working POC showed.
+- **Not pushed to the mod repo this session, per explicit instruction** — unverified fix, needs a
+  real relaunch first; the same "don't push what hasn't been live-tested" practice this project has
+  followed since notes/22/23.
+
+## Prior milestone (non-blocking sync mechanism + real proxy_d3d9.c VR submission integration, still valid as background, 2026-08-17)
+
+**Picked up exactly where notes/27 left off — its own explicitly-flagged "this sync mechanism is a
+blocking stall, wrong for a per-frame hot path" caveat is now fixed and measured (1000-6000x faster),
+and the real `proxy_d3d9.c` integration (previously fully out of scope) now has real, additive,
+off-by-default code wired into every needed hook, though not yet live-tested.** Full detail in
+`notes/28-nonblocking-sync-and-vr-submit-integration.md`. Headline findings:
+
+- **Sync mechanism fix, measured**: replaced the synchronous GPU-flush-and-wait helper
+  (`while(GetData()!=S_OK) Sleep(1)`) with a proven non-blocking, double-buffered technique in
+  `tools/vr-bridge/poc_submit_test/`. Real repeated measurements: OLD blocking helper stalls
+  ~15-16ms/call (dominated by `Sleep(1)`'s ~15.6ms Windows timer-granularity rounding); NEW
+  non-blocking poll costs 1.2-16.7 **microseconds** — 4/4 clean runs, zero pixel mismatches, zero
+  dropped frames.
+- **A real, load-bearing architectural finding, discovered empirically, not assumed**: Psychonauts'
+  own D3D9 device is a PLAIN (non-Ex) device (confirmed: this file only ever hooks
+  `IDirect3D9::CreateDevice`, never `CreateDeviceEx`) — and a plain device CANNOT open a shared
+  handle a separate D3D9Ex device originated (`hr=0x8876086C`/`D3DERR_INVALIDCALL`, tried two ways,
+  both failed identically). This rules out any zero-copy shared-surface design and forces a
+  CPU-visible round trip (`GetRenderTargetData` + `UpdateSurface`) — a real, concrete constraint
+  found via a new standalone POC (`tools/vr-bridge/poc_dual_device_shared/`), not discovered by
+  reading docs alone.
+- **That round trip needed a SECOND non-blocking fence, also found empirically**: an initial
+  one-fence version produced a real, reproducible pixel mismatch; root-caused with a diagnostic
+  blocking-flush test (confirmed the hypothesis before writing the real fix) to the destination
+  device's `UpdateSurface` being itself an async GPU upload needing its own completion fence,
+  independent of the first hop's fence. The fully-fixed two-hop, double-buffered, fully
+  non-blocking pipeline: 3/3 clean runs, zero mismatches, zero waits anywhere, and
+  `GetRenderTargetData` itself confirmed NOT to be a stall on this hardware (a real answer to a
+  well-known historical D3D9 performance question, measured not assumed).
+- **This validated design is now real code in `tools/proxy-d3d9/proxy_d3d9.c`** ("Milestone 8"),
+  fully additive (every new symbol prefixed `VRBridge_`/`g_vr`, touches none of the existing
+  eye-surface/depth-stencil/composite code) and gated behind a runtime flag
+  (`PSYVR_ENABLE_SUBMIT=1`, default OFF — with it unset, behavior is byte-for-byte identical to
+  before this session). Wires a private D3D9Ex "Device A" + D3D11 device + OpenVR/`IVRCompositor`
+  init (lazily, from the existing `SetupStereoSurfaces`), a per-eye two-hop non-blocking pump
+  (`VRBridge_PumpEye`, a direct port of the proven POC loop) called once per real frame from
+  `CandB_AfterBoth_asm` right after both eyes finish rendering into the UNCHANGED
+  `g_pEye1Surf`/`g_pEye2Surf`, and clean shutdown. Build updated to link d3d11/dxgi/the vendored
+  OpenVR import lib and deploy `openvr_api.dll` alongside the built `d3d9.dll`. **Build is clean.**
+- **Not yet live-tested, and a clear reason why, not just "ran out of time"**: this DLL's
+  pre-existing inline-hook mechanism (from notes/13 onward, untouched this session) hardcodes
+  absolute addresses that only exist inside `Psychonauts.exe`'s own address space (confirmed via
+  `VirtualQuery` returning failure/unmapped when checked from any other process) — it has always
+  required the real game process to test past `DllMain`, which is exactly why `validate.ps1`
+  launches the actual game. A standalone loader-only sanity check (deliberately never touching the
+  real game) confirmed the DLL's new imports (d3d9/d3d11/dxgi/openvr_api) all resolve correctly
+  (a `DLL_INIT_FAILED` error from the pre-existing hook code executing in the wrong process, not a
+  missing-import error) before hitting that pre-existing, unrelated limitation.
+  `validate.ps1` itself was deliberately NOT run (its cleanup kills any process named `Psychonauts`
+  by force, which would have killed the user's live session).
+- **The user's game (PID 7052) ran the entire session, untouched** (no attach/kill/write) — all work
+  stayed in `tools/vr-bridge/` standalone POCs plus editing (not deploying) `proxy_d3d9.c`.
+- **Concrete next step, and it needs the user**: close the current Psychonauts session so the
+  orchestrating session can copy `tools/proxy-d3d9/d3d9.dll` + `openvr_api.dll` into the game
+  directory, set `PSYVR_ENABLE_SUBMIT=1`, relaunch, and read the live proxy log for
+  `VRBridge_Init`/`Submit` results — SteamVR's null driver is already confirmed enabled and running
+  from notes/27, no further SteamVR setup needed.
+
+## Prior milestone (VR runtime bridge — OpenVR init + IVRCompositor::Submit PROVEN end-to-end via null driver, still valid as background, 2026-08-17)
+
+**The user installed SteamVR, unblocking everything notes/25 left gated on it — and this session
+completed the full "does the VR bridge concept actually work" milestone: null driver enabled,
+OpenVR init succeeds, and a real D3D9Ex-rendered surface bridged through a shared D3D11 texture was
+successfully submitted to the OpenVR compositor (`VRCompositorError_None`, both eyes, 4/4 clean
+runs) — all without any physical VR headset.** Full detail in
+`notes/27-null-driver-openvr-init-and-compositor-submit.md`. Headline findings:
+
+- **Null driver enabled** per notes/25 §5's researched plan, executed now that SteamVR exists: both
+  `default.vrsettings` files (`driver_null.enable=true`; `steamvr.requireHmd=false`,
+  `forcedDriver="null"`, `activateMultipleDrivers=true`) plus a newly-created durable per-user
+  override (`<Steam>\config\steamvr.vrsettings`, since SteamVR had never run before). SteamVR's full
+  process stack (`vrserver`/`vrcompositor`/`vrdashboard`/`vrmonitor`/`vrwebhelper`) now runs
+  headlessly, confirmed via `Get-Process` and live log lines (`Using existing HMD null.Null Serial
+  Number`).
+- **A second real config bug found and fixed**: distinct from notes/25's already-known stale
+  *runtime* path, the SteamVR installer left `openvrpaths.vrpath`'s `config`/`log` paths pointing at
+  a nonexistent `C:\Program Files (x86)\Steam` — fixed with the official `vrpathreg.exe setconfig`/
+  `setlog`/`setruntime` commands, not hand-editing the JSON.
+- **`poc_openvr_init.exe` rerun: `VR_InitInternal2` now returns `error=0`** (previously 100,
+  `InstallationNotFound`, with SteamVR absent) — but then crashed on the very next standard-pattern
+  call. **Real, fully-diagnosed root cause** (vectored exception handler + `VirtualQuery`, not
+  guessed): this installed SteamVR build's `VR_GetGenericInterface()` returns a genuine C++ object
+  pointer (`vrclient.dll` `this`-ptr), not the "flat FnTable" struct `openvr_capi.h` documents and
+  many C bindings assume — calling through it as a flat table reads the vtable pointer as if it were
+  function-pointer slot 0 and jumps into a non-executable `.rdata` page (confirmed
+  `PAGE_READONLY` via `VirtualQuery`). **Fix, confirmed working**: dereference the real vtable
+  (`*(void**)ptr`) and dispatch via `__thiscall` (matching `openvr.h`'s unattributed-virtual C++ ABI)
+  — `GetRecommendedRenderTargetSize` then returns real values (1656×1840/eye) and shutdown is clean.
+  This is a genuine, environment-specific ABI finding that will matter again for the real
+  `proxy_d3d9.c` integration, not a one-off POC quirk.
+- **New POC (`tools/vr-bridge/poc_submit_test/`) combines the proven D3D9Ex shared-surface mechanism
+  (notes/25) with the vtable-dispatch fix above to reach the actual task success criterion**: creates
+  a D3D9Ex device, clears a shared render target to a distinct test color, opens it from a separate
+  `ID3D11Device` (same proven mechanism as notes/25's `poc_shared_surface`), inits OpenVR against the
+  null driver, calls `WaitGetPoses` then `IVRCompositor::Submit` for both eyes with the bridged D3D11
+  texture. **Result: `VRCompositorError_None` for both eyes, 4/4 consecutive clean runs, zero
+  crashes, no leftover processes.** This is the full intended bridge mechanism (D3D9Ex render →
+  shared D3D11 surface → OpenVR compositor) proven end-to-end on real hardware (GTX 1660 SUPER) with
+  zero physical VR headset involved — the single riskiest open question from notes/24's original VR
+  scoping is now closed.
+- **User's game (PID 7052) ran the entire session, untouched** (no attach/kill/write) — this task
+  never needed the game; all work stayed in `tools/vr-bridge/` standalone POCs, per this session's
+  explicit scope.
+- **Concrete next steps**: (1) extend the shared-surface bridge from one solid-color clear to a real
+  per-frame pipeline with non-stalling GPU synchronization (the current `flush_d3d9` helper is a
+  synchronous stall, fine for a POC, wrong for a 60-90fps hot path); (2) carry the vtable/`__thiscall`
+  dispatch fix into whatever OpenVR-calling code eventually goes into `proxy_d3d9.c` — the flat
+  FnTable pattern the header documents does NOT work against this installed runtime; (3) actual
+  `proxy_d3d9.c` integration (create the second D3D9Ex+D3D11 device pair alongside the game's own
+  device, wire the existing per-eye render targets to shared surfaces, call `Submit` from the real
+  per-frame hook) remains explicitly out of scope until this groundwork is fully solid — not
+  attempted this session per the task's own instruction.
+
+## Prior milestone (off-axis fix live-verified correct, still valid as background)
+
+**The user played real gameplay against the notes/24 off-axis build and reported "no difference at
+all" versus the old correction — this was investigated with real evidence (live log + independent
+math re-derivation), not assumption, and found NOT to be a bug.** Full detail in
+`notes/26-off-axis-fix-live-verified-no-visible-difference-explained.md`. Headline findings:
+
+**The user played real gameplay against the notes/24 off-axis build and reported "no difference at
+all" versus the old correction — this was investigated with real evidence (live log + independent
+math re-derivation), not assumption, and found NOT to be a bug.** Full detail in
+`notes/26-off-axis-fix-live-verified-no-visible-difference-explained.md`. Headline findings:
+
+- **Deployed DLL confirmed correct and current**: byte-identical to the tools-folder notes/24 build,
+  and the game process (PID 21588) started 19 minutes after that DLL was written — not a stale/wrong
+  DLL.
+- **The off-axis code path is confirmed executing every frame, on ~70-78 draw calls per eye per
+  frame (matched exactly between eyes)** via the live `SVSCF stereo-correct` log line: non-zero
+  `Y20`/`Y30` (the new shear term notes/18's old code never had), `xScale`/`d` matching established
+  ground truth, and `focus` cross-validated against the independently-logged live `BVM cache SET
+  eye/at` data (computed |at-eye| ≈196.6 vs. logged `focus`≈193-199 in the same window) — the exact
+  check notes/24 §1g called for.
+- **A second, from-scratch hand re-derivation of the `Y = Proj⁻¹·X·Proj` matrix math** (independent
+  of notes/24's own three verification scripts) confirms the C code's `Y20`/`Y30` formulas are
+  exactly correct, and derives the physical meaning of the new term: `Δx_clip = k·xScale·eye_z` per
+  vertex — a real, correct, but genuinely small perturbation (single-digit-percent at the session's
+  live `k` values) on top of an unchanged overall stereo-separation magnitude (`STEREO_HALF_IPD`
+  untouched). This is why "looks about the same on a monitor" is the expected, correct outcome, not
+  evidence of a bug — the old and new code differ mainly in *where along the depth axis* disparity
+  crosses zero, a subtle cue on a flat 2D screen without a controlled comparison or headset.
+- **One correction to the general toe-in-vs-off-axis framing**: this codebase has never implemented
+  toe-in (the CPU-side re-aim in `SetEyeAndTarget` has been dead code since notes/20) — both the old
+  and new correction are purely horizontal. The classic "vertical parallax/keystoning" distinction
+  doesn't apply to this specific before/after comparison.
+- **No code changes this session** — the fix is confirmed correct as-is. Per this project's own
+  standing practice (push once live-verified, see notes/22/23), this satisfies notes/24's own
+  condition for a mod-repo push ("once live-tested... push if it holds up"), but per this session's
+  own scope (no bug was fixed) no push was made — left as a clear next step.
+- **Concrete next step for an obviously-legible demo** (not done this session): temporarily
+  exaggerate `k` (mirroring the existing 60-unit/18x `STEREO_HALF_IPD` diagnostic) or force a short
+  fixed `g_focusDistance` so near/far objects show a clear, oppositely-signed disparity crossover
+  within one frame — directly distinguishing the new off-axis signature from the old code's
+  never-crosses-zero behavior in a single screenshot comparison.
+
+## Prior milestone (VR runtime bridge scaffolding — crux shared-surface interop PROVEN, SteamVR install still needed, still valid as background)
+
+**The single riskiest open technical question from the prior session's VR-runtime scoping — can a
+D3D9Ex shared surface actually be opened and read correctly from a separate D3D11 device — is now
+answered YES, with real, repeated, live evidence on this machine's actual GPU (NVIDIA GTX 1660
+SUPER).** A standalone, fully game-free proof-of-concept (`tools/vr-bridge/poc_shared_surface/`)
+creates a D3D9Ex shared render target, clears it to two different known colors in sequence, and
+reads back byte-exact pixel data from a completely separate `ID3D11Device` both times — 4/4 clean
+runs, zero mismatches, proving genuine live GPU-memory sharing rather than a one-shot copy. This is
+the specific mechanism the prior session identified as "the realistic bridging path" for getting
+Psychonauts' D3D9 rendering into OpenVR's D3D11-only `IVRCompositor::Submit` — now proven to
+actually work here, not just plausible on paper. Full detail in
+`notes/25-vr-runtime-bridge-scaffolding.md`.
+
+- **SteamVR is confirmed NOT installed on this machine** (checked three independent ways: running
+  processes, Steam library manifests, and a filesystem search across all local drives) — this is a
+  real blocker, flagged per this session's task rules as needing **the user's explicit go-ahead**
+  before installing, rather than installed unilaterally. A stale `openvrpaths.vrpath` registration
+  pointing at a since-removed `C:` drive Steam install was found and is a red herring, not evidence
+  of a usable install.
+- **OpenVR SDK vendored** (headers + win32 import lib + DLL only, ~13.6MB, via sparse shallow git
+  clone with the nested `.git` stripped afterward — plain vendored files, not a submodule) into
+  `tools/vr-bridge/openvr-sdk/`. A second small proof-of-concept
+  (`tools/vr-bridge/poc_openvr_init/`) confirms it links and calls correctly into the real
+  `openvr_api.dll` — `VR_InitInternal2` returns a clean, correct `VRInitError_Init_
+  InstallationNotFound` (error 100), exactly the expected result with SteamVR absent, and becomes a
+  ready-made smoke test for once SteamVR is installed. Two real header quirks in the upstream SDK
+  were found and worked around (dead/outdated `#if 0`-wrapped prototypes in `openvr_capi.h`; a
+  `bool`-typedef collision with `<stdbool.h>`) — documented in the POC source for future reuse in
+  the real integration.
+- **Null-driver (headset-free testing) configuration researched and documented in full**, refining
+  the prior session's writeup with exact, cross-checked file paths/keys and one durability fix not
+  previously known: the two `default.vrsettings` files get overwritten on every SteamVR update, but
+  a per-user override file (`<Steam>\userdata\<SteamID>\config\steamvr.vrsettings`) persists across
+  updates and is the right durable place for these settings. Still not executable this session
+  (needs SteamVR installed first).
+- **Honest scope boundary, by design**: this session deliberately proved the riskiest piece
+  standalone (no game, no debugger, no SteamVR) rather than jumping to game integration — wiring any
+  of this into `tools/proxy-d3d9/proxy_d3d9.c` is explicitly a separate, later piece of work. The
+  user's own game (PID 16672, later PID 21588 — apparently restarted by the user mid-session) was
+  running throughout and was never touched (no attach, no kill, no file write), consistent with this
+  project's standing safety rule.
+- **Concrete next steps**: (1) user decides whether to install SteamVR (~1-2GB, free, via Steam) —
+  once done, rerun `poc_openvr_init.exe` as a smoke test and follow §5 of notes/25 to enable the null
+  driver; (2) extend the shared-surface POC from one solid-color clear to a real per-frame pipeline
+  with non-stalling synchronization; (3) once both of those are solid, begin the actual
+  `proxy_d3d9.c` integration (create a second D3D9Ex+D3D11 device pair alongside the game's own
+  device, wire the existing per-eye render targets to shared surfaces, call `IVRCompositor::Submit`)
+  — still gated on the still-outstanding notes/24 in-game live-test of the off-axis projection
+  upgrade below, which remains the higher-priority correctness item for whenever the user's current
+  game session ends.
+
+## Off-axis (asymmetric frustum) projection upgrade — implemented, math-verified, not yet live-tested (2026-08-17)
+
+**The stereo correction was upgraded from a parallel-axis offset with a symmetric (shared) projection
+frustum — correct only for zero disparity at infinite distance — to a genuine off-axis/asymmetric
+frustum with zero disparity at a chosen finite convergence distance, the technique real VR SDKs use
+internally.** The user's own game (PID 9188) was running for the entire session, so the usual isolated
+in-game screenshot self-test could not be performed; instead the math was verified three independent
+ways with standalone (game-free) scripts, one of which caught and drove the fix of a real bug (a naive
+single-matrix-entry patch that only worked for a trivial axis-aligned-at-origin test camera) before it
+ever reached compiled code. Build is clean; **not pushed to the mod repo** (unverified in-game, per this
+project's own standing practice — see notes/22 for precedent). Full derivation, the bug, and the fix are
+in `notes/24-off-axis-projection-upgrade-and-vr-runtime-scoping.md`.
+
+- **Next step for a future session**: once the user closes the current game session, copy the new DLL
+  in, relaunch, and re-run the same 0/3.25/60-unit controlled screenshot comparison notes/14/18 used,
+  plus an off-axis-specific check (log-compare the new `Y20`/`Y30`/`focus` fields against the live
+  `BVM cache SET` eye/at data). If it holds up, push to the mod repo then.
+- **VR runtime integration (OpenVR/OpenXR) scoped, not implemented**, per this session's task: confirmed
+  (via research, not assumption) that modern OpenVR has **no D3D9 support at all** in
+  `IVRCompositor::Submit` — a real, concrete obstacle, not a hypothetical one. The realistic path is a
+  D3D9Ex shared-surface bridge into a second, minimal D3D11 device purely for compositor submission.
+  SteamVR's null driver is confirmed to support genuinely headset-free frame-submission-path testing.
+  Full writeup in notes/24 §2.
+
+## Prior milestone (real-gameplay stereo rendering confirmed working, user-verified, 2026-08-17)
+
+**The user played real, player-controlled gameplay against the notes/22 (shared-depth-stencil-fix)
+build and confirmed, in their own words: "the game is running absolutely fine on both sides."** This
+is the first time in the project's history that real gameplay — not just the title screen's scripted
+attract-mode camera — has been confirmed working in stereo on both eyes, by the person actually
+looking at the screen. The frozen-left/dark-right bug that survived two prior rounds of targeted fixes
+(notes/20, notes/21) before notes/22 found and fixed the actual root cause (both eyes sharing one
+physical depth-stencil surface) is resolved. Full arc and write-up in
+`notes/23-gameplay-stereo-working-milestone.md`. This project has gone from "can we hook D3D9 at all"
+to "working stereo rendering in real gameplay, user-confirmed" — the biggest working milestone so far.
+
+- **One small remaining cosmetic issue, diagnosed but not yet fixed**: the main pause/menu UI screen's
+  left eye renders completely black (distinct from the title screen and real gameplay, both of which
+  work correctly). Ruled out via the full live log: not a draw-call omission (every logged eye1/eye2
+  pair is exactly matched or both zero, never asymmetric) and not a `StretchRect` failure (always
+  `S_OK`). Leading, unconfirmed hypothesis: the fixed-world-unit parallax correction may push the
+  menu's likely close-up camera framing outside one eye's frustum. Not blind-fixed — reproducing it
+  safely requires the user to be at that specific screen with the log capturing the moment, which
+  wasn't available this session (the user's own game was already running live and was not
+  interfered with). See notes/23 §5 for the full diagnosis and the concrete cheap next step.
+- **No code changes this session** — `proxy_d3d9.c` is unchanged from notes/22's fix.
+- **Mod repo updated**: `USAGE.md`/README now describe gameplay stereo rendering as working
+  (user-confirmed), not "title-screen-only, experimental."
+
+## Prior milestone (eye-parity refutes culling, shared-depth-stencil fix shipped, still valid as background)
+
+**The eye1:eye2 draw-call asymmetry that drove notes/20 and notes/21 was proven NOT REAL — a hard
+per-frame count from the user's own live gameplay session showed 206/206 exact matches (16960:16960)
+— and a genuinely new, well-evidenced structural bug was found and fixed instead: both eyes shared the
+device's single depth-stencil surface the entire time.** This fix is now confirmed working (see the
+MILESTONE section above) — at the time notes/22 shipped it was NOT YET LIVE-TESTED (the user's game was
+already running mid-level for the whole session; per this project's standing safety rule it was never
+touched). Full detail in `notes/22-eye-parity-refutes-culling-shared-depth-stencil-fix.md`. Headline
+findings:
+
+- **The frustum-culling-cache hypothesis is refuted, with hard numbers.** notes/21's exact per-frame
+  `g_svscfCountEye1`/`g_svscfCountEye2` counters (shipped but never actually read from a live session
+  until now) were read from the user's own already-running gameplay session (real level traversal,
+  camera moved from `(-371,457,17)` to `(52198,-32867,-3980)`) — every single one of 206 composite log
+  lines showed eye1 exactly equal to eye2 (sum 16960:16960, ratio 1.000). There is no draw-call
+  asymmetry to explain via culling or any other mechanism.
+- **Root-caused why the OLD metric (167:13, then 109:15) looked skewed**: the "SVSCF stereo-correct:
+  phase=X" log line's print-throttle uses one `static DWORD s_lastLog` shared across both eyes' calls;
+  since eye 1's whole per-frame burst always fires before eye 2's, the 2-second throttle reopening
+  almost always gets claimed by phase=1, systematically starving phase=2's log line regardless of real
+  relative work. A logging artifact, not an engine-state signal — explains why two rounds of unrelated
+  fixes never moved that ratio.
+- **Found and fixed a real bug instead**: both offscreen eye render targets have always rendered against
+  the device's single shared auto depth-stencil surface (`SetDepthStencilSurface` was never called
+  anywhere in `proxy_d3d9.c`), and only eye 2 ever explicitly cleared it. This exactly matches a clue
+  notes/14 recorded but never fully connected ("clearing BOTH eyes flipped which eye's background was
+  missing") — the signature of two passes contending for one physical depth buffer, where whichever eye
+  clears last each frame gets a clean depth buffer and the other inherits stale depth data (causing
+  depth-test rejections that read as missing/stale = "frozen"; the eye that clears to black last shows
+  through as "dark" wherever its own draws get rejected in turn). **Fixed by giving each eye its own
+  private depth-stencil surface** (created/released alongside the existing per-eye color render
+  targets, same `Reset`-hook lifecycle) and clearing both eyes unconditionally every frame — safe now
+  that there's no shared resource left to contaminate.
+- **Build clean, DLL rebuilt. Not live-tested** — the user's game (PID 2340) was already running,
+  mid-level, for this entire session; per the task's own explicit safety rule ("ask via task end rather
+  than killing it" if already running) it was never touched (no kill, no debugger attach, no write to
+  the game directory's `d3d9.dll`, which that live process has loaded). **The user needs to close the
+  current game session; the orchestrating session can then copy the new DLL in and relaunch** to test
+  whether the shared-depth-stencil fix resolves the dark/frozen symptoms.
+
+## Prior milestone (second-cause diagnosis session, still valid as background — asymmetry finding above supersedes its unresolved §3)
+
+**Follow-up live-log session confirms notes/20's fix works exactly as designed, but proves both
+reported symptoms (frozen left, dark right) have a SECOND, still-only-partially-understood cause —
+three more low-risk fixes shipped, still NOT YET LIVE-TESTED.** Full detail in
+`notes/21-second-cause-frozen-left-dark-right-post-notes20.md`. Headline findings:
+
+- Read the live proxy log from the user's actual running gameplay session (PID 7188, already running
+  WITH notes/20's fix deployed) — confirmed **zero** premature/duplicate internal-Present hits reach
+  the real Present passthrough (331/331 logged hits are `phase=2`), i.e. notes/20's `g_eye2Presented`
+  guard genuinely works. But the eye1:eye2 register-6 draw-call skew notes/20 used as supporting
+  evidence (167:13) is **essentially unchanged after the fix (109:15)** — proof that skew was never
+  caused by the bug notes/20 fixed, and the dark-right/frozen-left symptoms need a different
+  explanation notes/20 didn't find.
+- **Three new fixes shipped in `proxy_d3d9.c`**: (1) `Hook_Present` now forces the real hardware
+  Present to always blit the full backbuffer (`NULL` src/dest/dirty rect) instead of passing the
+  game's own Present args through — our composite always redraws 100% of the backbuffer, so a
+  partial-rect optimization based on the game's own non-stereo dirty-tracking could otherwise leave
+  stale pixels on screen, i.e. look exactly like "one half frozen"; (2) a new
+  `IDirect3DDevice9::Reset` hook (previously completely unhandled) releases and recreates all three
+  `D3DPOOL_DEFAULT` surfaces around real `Reset` calls — a genuine, general D3D9 correctness gap,
+  newly relevant because this is the first session the user has been alt-tabbing during live testing;
+  (3) exact (non-throttle-sampled) per-real-frame eye1/eye2 draw-call counters logged every composite,
+  replacing race-based sampling with hard numbers for the next live-log read.
+- **Root cause of the eye1:eye2 draw-call asymmetry itself is still NOT found** — flagged honestly as
+  an open question (leading, unconfirmed hypothesis: an internal "already did per-frame setup" engine
+  flag that CandB's first invocation sets and the second never gets reset before, consistent with
+  notes/13's original "second invocation missing background" finding) rather than papered over with a
+  speculative rewrite of the double-invoke mechanism.
+- **Build clean, DLL rebuilt. Isolated self-test deliberately skipped** (not just failed) —
+  `validate.ps1`'s cleanup kills processes by name (`Psychonauts`) indiscriminately, which would risk
+  the user's own live process; its own safety-abort would prevent harm here but was judged too fragile
+  to lean on deliberately. **Not live-tested. The user needs to close the current game session; the
+  orchestrating session will then copy the new DLL in and relaunch.**
+
+## Prior milestone (first real-gameplay stereo test: frozen-left/dark-right diagnosis session, still valid)
+
+**First-ever real-gameplay test of the stereo hook (previously only exercised on the title screen)
+found two bugs — left half frozen, right half dark/corrupted — both diagnosed with real live-log
+evidence and fixed in code, initially believed sufficient but notes/21 (above) found a second cause
+was still needed for both.** Full detail in
+`notes/20-real-gameplay-stereo-frozen-left-dark-right.md`. Headline findings:
+
+- **Root cause 1 (frozen left, likely contributor)**: `BuildViewMatrix`'s output-buffer pointer,
+  previously confirmed stable (always the same address) only against the title screen's single
+  attract-mode camera, was found — via the live proxy log from the user's actual running gameplay
+  session — to **alternate between at least two distinct addresses in real gameplay** (182/188
+  samples one address, 6/188 a second one). This is the same class of dangling-caller-stack-pointer
+  bug notes/14 already found and fixed once for `BuildProjectionMatrix`; it had just never been
+  exercised for `BuildViewMatrix` before because the title screen's camera was too simple to expose
+  it. `SetEyeAndTarget()` was re-invoking `BuildViewMatrix`'s real body through this cached pointer a
+  second/third time (once per eye) from deep inside `CandB`'s nested call tree — a real risk of
+  writing into stack memory unrelated gameplay code has since reused. **Fixed by disabling this
+  CPU-side rewrite outright** (already established in notes/14 as not load-bearing for the actual
+  visible correction, which comes from the independent `SetVertexShaderConstantF` register-6 patch).
+- **Root cause 2 (dark/corrupted right, likely contributor)**: the Present-suppression phase logic
+  assumed `CandB`'s internally-nested `Present` call fires exactly once per eye (true at the title
+  screen, per notes/13) — nothing guarded against it firing more than once during eye 2's pass in
+  gameplay's richer multi-pass rendering. Log evidence (register-6 correction counts heavily skewed
+  167:13 between eye1:eye2 phases despite structurally symmetric code paths) is consistent with eye
+  2's pass being cut short by a premature internal `Present`. **Fixed with a strict
+  once-per-`CandB`-double-invoke guard** (`g_eye2Presented` flag) — any extra internal `Present` hits
+  during eye 2 beyond the first are now suppressed like eye 1's, instead of re-compositing/re-flipping
+  partial content.
+- **Both fixes are in `tools/proxy-d3d9/proxy_d3d9.c`, build clean, DLL rebuilt — but NOT yet copied
+  into the game directory or live-tested.** Both the process kill and the DLL file copy were denied
+  by the Claude Code auto-mode safety classifier this session (the exact "drop payload DLL then
+  kill+relaunch" risk pattern the project has hit before) — **the user needs to manually close the
+  game, copy `tools\proxy-d3d9\d3d9.dll` into the game directory, and relaunch** to pick up the fix.
+  See notes/20 §5 for exact steps. Not pushed to the mod repo (untested).
+
+## Prior milestone (stereo-correction index-bug fix + action-slot-4 ruled-out session, still valid)
+
+**Two leads worked this session, picking up exactly where notes/17 left off — a fix for a real
+mathematical bug in the stereo correction (Lead 2), and a live direct-write test that rules out a
+strong input-blocker candidate (Lead 1).** Full detail in
+`notes/18-stereo-index-bug-fix-and-input-slot4-ruled-out.md`. Headline findings:
+
+- **Lead 2: a real, confirmed bug found and fixed in the stereo correction, re-verified with full
+  notes/14-grade rigor, and pushed to the mod repo.** notes/17 confirmed the register-6 upload is
+  `Transpose(WVP)`, computed in-place before `SetVertexShaderConstantF` is ever called. Re-deriving
+  notes/14's correction against that confirmed structure found the derivation itself was sound, but
+  the code was patching the wrong flat index — `floats[12]` (which in the transposed upload buffer is
+  `WVP[0][3]`, an unrelated element that distorts the perspective divide as a function of each vertex's
+  own object-space X) instead of `floats[3]` (`WVP[3][0]`, the actual translation-row element that
+  produces a clean uniform clip-space shift). Fixed with a one-line index change in
+  `tools/proxy-d3d9/proxy_d3d9.c`. Re-verified via the same controlled 0/3.25/60-unit screenshot
+  comparison notes/14 used (all three landed on the same deterministic attract-mode camera shot,
+  confirmed via matching logged eye/at values): matches at zero, diverges reproducibly at 3.25 with a
+  now more coherent signature (same shapes, differing brightness/prominence, rather than the old bug's
+  differing pattern character), and the logged correction delta scales exactly with magnitude
+  (4.9976→92.2637, ratio 18.458 = 60/3.25 exactly) at the 60-unit diagnostic. Pushed to the public mod
+  repo this session.
+- **Lead 1: real further narrowing, still not behavior-changing.** Fully disassembled the next
+  consumer layer down from notes/17's stopping point: `IsActionJustPressed(actionSlot)` (loops the 3
+  keybinding categories for a given abstracted slot) and a top-level "confirm"/"cancel" UI dispatcher
+  that ORs `RETURN`/`SPACE`/a virtual gamepad-code/`actionSlot==4` for confirm. Live-confirmed
+  `actionSlot==4` is actively polled every frame at the idle title screen with real keybindings
+  (`SPACE` plus DIK `0x19`). **Directly forced its return value to `TRUE` 35 times over an 18-second
+  window (essentially every poll) at its own `ret` instruction** — the exact "write into the
+  consumption point" technique the task called for — and the title screen did not move (screenshots
+  identical before/during/after). This is a clean negative result that rules out this specific
+  consumer (distinct from notes/17's null-callback finding, which was about a different mechanism
+  entirely). A follow-up attempt to test the top-level dispatcher directly was inconclusive, honestly
+  flagged as confounded by accumulated live-session state (several stray debugger/python processes
+  from rapid attach/detach cycles) rather than a real finding either way — stopped rather than chased
+  further, per the task's own methodological-discipline guidance. Three concrete next steps identified
+  in notes/18 §2d.
+- **Mod repo: pushed this session** (Lead 2's confirmed fix only — Lead 1 did not reach a behavior
+  change). Workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (keystate-mechanism trace + register-6 transpose confirmation session, still valid)
+
+**Two leads worked this session — a deep live trace of the real keyboard-input mechanism (Lead 1),
+and a decisive live stack trace settling the register-6 transpose mystery (Lead 2).** Full detail in
+`notes/17-keystate-mechanism-trace-and-reg6-transpose-confirmation.md`. Headline findings:
+
+- **Lead 1: notes/16's buffered-`GetDeviceData` hypothesis REFUTED with hard evidence, then the real
+  keyboard-input mechanism fully traced live.** A device-identity check (capturing both keyboard AND
+  mouse device pointers, then classifying every `GetDeviceData`/`GetDeviceState` hit by `this`) found
+  `GetDeviceData` fires ONLY on the mouse device (42/42 hits) and never once on the keyboard across an
+  80s window — notes/16's "lockstep" evidence was actually about the mouse, not the keyboard as
+  assumed; the "flakiness" was a real negative, not flaky tooling. In its place, a hardware (DR-
+  register) READ breakpoint on the DIK_SPACE byte — a technique not used before in this project —
+  found and fully disassembled the real consumer chain: the polled buffer is read by a function that
+  scans a 3×21 keybinding table plus three hardcoded DIK_RETURN/SPACE/ESCAPE checks, each calling a
+  `SetKeyState(dikCode, pressed)` function that maintains a proper per-key edge-detection state array
+  (`keyState[dik]`, bit0=held/bit1=just-pressed/bit2=just-released) and fires a registered one-shot
+  global callback pointer on a fresh press/release edge. Re-testing the already-proven buffer-patch
+  technique while watching this callback pointer live showed it correctly reaches
+  `SetKeyState(SPACE, pressed=1)` (state byte transitions exactly as predicted, 0x00→0x03) but the
+  global callback slot is **null** throughout — no listener is armed at the observed title-screen
+  state, which is the real, now-understood reason two sessions of correctly-delivered synthetic input
+  produce no visible effect. A further hardware-watch found a second consumer layer outside
+  `SetKeyState` itself: a per-frame edge-bit-clearing sweep and a keybinding-table-driven translator
+  converting raw DIK codes into abstracted 0x00/0xFF "digital button" output bytes, plus simple
+  `IsKeyHeld`/`IsKeyJustPressed` query helpers — a real, generic input-abstraction system. Identifying
+  which specific binding slot the title screen reads is the well-scoped next step, not yet done.
+- **Lead 2: FULLY CONFIRMED (upgraded from notes/16's "partial support")**: a clean 4-breakpoint live
+  stack/register trace (8/8 samples, both pointer identity and raw-float content compared at each
+  stage) proves the register-6 upload is the in-place TRANSPOSE of the second matrix-multiply's
+  result — the transpose call overwrites multiply #2's own output buffer, so the pointer never
+  changes but the content does. Manually verified by hand against one sample's raw numbers (transposing
+  the captured pre-transpose matrix exactly reproduces the uploaded matrix). Bonus: the same trace
+  independently confirms notes/16's "non-identity World" interpretation — multiply #1 reduces to a
+  bare projection matrix, multiply #2 then carries a real, non-trivial object-space translation.
+- **Two reusable x64dbg-automate tooling gotchas found and fixed**: (1) `wait_for_debug_event`'s
+  single-check pattern can silently lose a targeted single-shot breakpoint's event when an unrelated,
+  high-frequency breakpoint (here, an unconditional `SetKeyState` breakpoint firing ~66x/poll) is also
+  active — fixed with a proper drain-and-retry `wait_for_named_breakpoint()` helper, confirmed fixed
+  by a clean rerun; (2) hardware and memory breakpoints persist across `start_session()` calls
+  independently of software breakpoints — `clear_breakpoint(None)` does not clear them,
+  `clear_hardware_breakpoint(None)`/`clear_memory_breakpoint(None)` are needed too.
+- **Mod repo untouched this session** (Lead 1 didn't reach gameplay; Lead 2 is analysis/confirmation,
+  not a code change). Workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (buffered-input chase + transpose decomposition retry session, still valid)
+
+**Two independent leads worked in parallel this session — a deeper chase of the DirectInput input
+blocker, and a re-run of the matrix-decomposition mystery against the transposed candidate matrix.**
+Full detail in `notes/16-buffered-input-chase-and-transpose-decomposition.md`. Headline findings:
+
+- **Input blocker: real infrastructure breakthrough, but the behavioral goal still not achieved.**
+  This session finally resolved and hooked the actual live `IDirectInputDevice8` keyboard object (both
+  `GetDeviceState` and `GetDeviceData`), closing out notes/15's exact open item, via one concrete fix
+  (arm the `DirectInput8Create` breakpoint *before* resuming past startup, not after) plus two reusable
+  debugger-tooling bugs found and fixed (x64dbg persists breakpoints across `start_session()` calls
+  and needs an explicit `clear_breakpoint(None)`; `wait_for_debug_event` silently discards non-matching
+  events and needs a drain-and-retry wrapper). Patching `GetDeviceState`'s polled output buffer
+  (`DIK_SPACE` forced to "pressed") initially looked like a genuine win — a real "Loading" screen with
+  the game's falling-Raz vortex animation appeared shortly after — **but this was investigated further
+  and found to be a false positive**: a clean, fine-grained-timed control launch (no debugger, no
+  input at all) showed that exact same Loading screen appears naturally at ~4.5s into *any* launch,
+  input or no input. A longer, rigorous re-test (13 press/release cycles over ~2 minutes at the
+  confirmed-idle title screen) found zero further effect. A new, better-motivated hypothesis was found
+  instead: the game also polls **buffered** `GetDeviceData` (`DIDEVICEOBJECTDATA2`-sized records) in
+  lockstep with `GetDeviceState`, strongly suggesting the title screen's actual gate reads buffered
+  transition events, not polled state — a forged-event fix for this was implemented but not yet
+  confirmed working, blocked by a reproduced cross-run flakiness in hitting that specific call (the
+  same kind of flakiness notes/15 first flagged for `CreateDevice`, now understood but not fully tamed).
+  Opportunistically confirmed the stereo hook (unmodified notes/14 binary) stayed robust through ~2
+  minutes of concurrent debugger/DirectInput-hooking activity, and found a new nuance: the natural
+  Loading-transition screen renders as a single non-split image (the hooked render path apparently
+  isn't invoked for it), while the title screen itself continues to show correct split-screen
+  divergence throughout.
+- **Transform-path mystery: real, partial progress, not fully resolved.** Live-captured View/Proj/
+  register-6 data (fresh, since no raw floats from notes/14's session survived) was re-run through the
+  decomposition check against 4 hypotheses (transpose or not, on each side). The transpose hypothesis
+  measurably and substantially improves the result — several samples now show row lengths within a few
+  percent of 1.0, a qualitatively saner signature than notes/14's original "thousands to hundreds of
+  thousands" — but no sample fully resolves (the `[3][3]` homogeneous element and column-3 residuals
+  remain non-trivial), so this is partial support for the transpose hypothesis, not full confirmation.
+  Leading interpretation: the transpose is very likely real; the remaining gap is most likely a
+  genuine non-identity "World" component for whatever specific object register 6's draw call renders,
+  which the original check never actually assumed away correctly in the first place.
+- **Mod repo untouched this session** (neither lead reached a confirmed functional improvement).
+  Workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (input-blocker retry + stereo robustness/quality session, still valid)
+
+**This session split into two parts — an honest partial result on the long-standing gameplay-input
+blocker, followed by a pivot to concrete quality/robustness work on the existing stereo prototype.**
+Full detail in `notes/15-input-blocker-retry-and-stereo-robustness.md`. Headline findings:
+
+- **Input blocker (notes/08), retried via a DirectInput device-state poke as suggested — partial,
+  unresolved, but genuinely refines the prior diagnosis.** Live capture proved synthetic
+  `PostMessage`/`SendInput` keystrokes **do** correctly arrive in the game's own real message queue
+  (`WM_KEYDOWN`/`WM_CHAR`/`WM_KEYUP`, correct `hwnd`/`VK_SPACE`/scancode, retrieved by the game's own
+  `PeekMessageA`) — refining notes/08's broader "messages don't get through" framing. `GetAsyncKeyState`
+  (never called), `GetKeyState`/`GetKeyboardState` (called only by `msctf.dll`/IME, not game logic),
+  and Steam Overlay hooking (not loaded in-process) were all ruled out as the actual gate. The
+  `DIEmWin` window (confirming *some* DirectInput keyboard device exists) was found, but the
+  specific `IDirectInput8::CreateDevice` call that created it could not be pinned down consistently
+  across two fresh process launches (inconsistent stack/caller behavior each time) within this
+  session's budget — stopped and pivoted per the task's own explicit guidance, rather than
+  continuing to chase diminishing signal. Concrete next-session leads are in notes/15 §1d.
+- **Stereo prototype robustness: 4/4 clean consecutive full launch cycles**, using the exact
+  unmodified `d3d9.dll` from notes/14 (no code changes this session) — no crashes, `Stereo ready = 1`
+  every run, identical `xScale`/correction values every run, and pixel-identical left/right-divergence
+  screenshots across all 4 runs (the title screen's attract-mode camera turns out to be a fully
+  deterministic scripted playback, not random). This is a materially stronger robustness claim than
+  notes/14's single session.
+- **IPD value cross-validated on comfort grounds, kept at `3.25` (no code change)**: an independent
+  world-scale estimate (from `zNear`/`zFar` plausibility, "1 world unit ≈ 1cm") converges within 3%
+  of both the shipped value and notes/13's original proportional-to-distance estimate — and maps the
+  current value to **≈6.5cm real-world separation, within 1mm of average adult human IPD (63mm)**,
+  the standard comfort target for VR stereo. The proportional-to-shot-distance derivation method
+  itself is flagged as a real limitation (framing-dependent, not fixed like real human IPD) that
+  should be replaced with a fixed, scale-calibrated constant once real gameplay is reachable.
+- **Untraced transform-path (notes/14 §6.1): real static-disassembly progress.** `exe+0x433E50`
+  confirmed as a matrix-multiply helper with an SSE/FPU-dispatch flag; `exe+0x42E2A0` newly
+  confirmed as a **4×4 matrix transpose** (previously unknown). Recovered the register-6 upload's
+  actual call sequence: multiply → multiply → transpose → upload. New, concrete (not yet confirmed)
+  hypothesis: the transpose step plausibly explains notes/14's matrix-decomposition negative result,
+  since a naive row-major decomposition check would fail exactly as observed against a transposed
+  matrix. Cheap, no-live-debugging next step identified: rerun the decomposition check against
+  `Transpose(candidate)` too.
+- **Mod repo untouched this session** (no functional code change — the robustness test exercised the
+  already-pushed notes/14 binary); workspace notes, modding-notes, and dev-archive synced as usual.
+
+## Prior milestone (shader-constant stereo hook session, still valid)
+
+**REAL PROGRESS: the camera-offset injection now reaches the GPU and produces a confirmed,
+reproducible, magnitude-scaling visual effect — categorically different from the prior session's
+complete null result — plus the independent missing-background bug is root-caused and fixed.**
+Honest caveat: the evidence is a controlled 0/3.25/60-unit offset comparison (matching at zero,
+diverging predictably as magnitude increases) rather than a single obviously-legible "same object
+shifted sideways" screenshot, because the specific geometry driven by the identified register is a
+detailed background texture, not a discrete foreground object. Full detail, derivation, and
+screenshots description in `notes/14-shader-constant-stereo-hook.md`. Headline findings:
+
+- **Found the real per-draw shader-constant upload**: `IDirect3DDevice9::SetVertexShaderConstantF`,
+  `StartRegister=6`, `Vector4fCount=4`, from one consistent call site (`exe+0x11D343`) — identified
+  via three live probes (register/call-site survey, ground-truth View/Proj matrix capture at
+  `BuildViewMatrix`/`BuildProjectionMatrix`'s own `ret` instructions, and an EBP-chain
+  "caller-of-caller" read that separated registers by subsystem, since every
+  `SetVertexShaderConstantF` call shares one generic wrapper's return address). A pure-Python
+  matrix-decomposition check found this register's matrix does NOT derive from the specific
+  View/Proj instances the existing hooks observe (0/20 samples decomposed sanely) — a real,
+  reported negative result pointing at an untraced second transform-composition path
+  (`exe+0x433E50`/`0x42E2A0`), not papered over.
+- **Implemented a closed-form correction that works without tracing that indirection**: patch the
+  uploaded matrix's row-3/column-0 element by `-d * Proj[0][0]` — the exact algebraic result of
+  inserting a rigid (non-toe-in) eye-space translation between View and Proj in a row-vector
+  `v*World*View*Proj` pipeline, valid regardless of what World/View individually were. Needs only
+  one live scalar (`xScale = Proj[0][0]`).
+- **A real dangling-pointer bug found and fixed while computing that scalar**: caching
+  `BuildProjectionMatrix`'s output-buffer *pointer* (mirroring the proven-safe pattern for
+  `BuildViewMatrix`'s `pEye`/`pAt`/`pUp`) produced wildly inconsistent readbacks (`1.0`, `0.0`,
+  `0.0849` instead of the real `1.5377`) because, unlike `BuildViewMatrix`'s persistent object
+  fields, `BuildProjectionMatrix`'s output buffer is a short-lived caller stack temp that's reused
+  well before a later frame reads it back. Fixed by computing `xScale` directly from
+  `BuildProjectionMatrix`'s entry *arguments* using the exact conversion formula notes/07
+  disassembled — stable `1.5377` every time, matching the independently-captured ground truth.
+- **The notes/13 missing-background bug is root-caused and fixed**: both eyes' offscreen render
+  targets shared the device's one auto depth-stencil surface; an explicit `Clear()` (color+depth+
+  stencil) on eye 2 only (clearing both flipped which eye broke, rather than fixing both) resolved
+  it — confirmed via screenshots showing real textured background content on both eyes across
+  multiple runs.
+- **Visible-effect evidence**: at `STEREO_HALF_IPD=0` both eyes render matching silhouette/text at
+  matching positions (differing only in brightness) — proof the pipeline introduces no spurious
+  effect. At the realistic `3.25` and a diagnostic `60` (18×), the same background content
+  diverges between eyes in a reproducible, magnitude-scaling way (different pattern character at
+  each magnitude), while unrelated screen-space UI text stays fixed in both halves as expected.
+  This is real, causal evidence the correction reaches the GPU — not yet a single obviously-legible
+  "object visibly moved sideways" shot, since the driven content is a detailed background texture
+  rather than a discrete object, and the attract-mode camera didn't reliably hold a
+  discrete-object shot long enough this session to capture one directly comparable across offsets.
+- **Disposition**: judged, on balance, to clear the "confirmed visible stereo separation" bar for
+  the specific register-6-driven content (controlled, reproducible, magnitude-correlated, not a
+  one-off artifact) — pushed to the public mod repo this session, with the evidence's real
+  character (scaling comparison, not a single clean demo shot) stated plainly rather than oversold.
+  Concrete next steps (trace the untraced transform-composition path, extend the correction to
+  other matrix registers for skinned content, reach a discrete-object shot for a cleaner demo) are
+  in `notes/14` §6.
+
+## Prior milestone (first stereo prototype session, still valid)
+
+**PARTIAL: the first real stereo prototype was built and ran stably (no crash across six live
+runs), and proved two independent renders can be composited live in one frame — but the camera
+offset itself had zero visible effect on the image, so that session's success bar (two visibly
+different CAMERA ANGLES) was not met.** Full detail, root-cause analysis (later resolved above) in
+`notes/13-first-stereo-prototype.md`. Headline findings:
+
+- **New infrastructure proven**: real inline (byte-patch + trampoline) hooks directly into
+  `Psychonauts.exe`'s own code now exist and work — `BuildViewMatrix` (`exe+0x292480`) and `CandB`
+  (`exe+0xFEDA0`) are both hooked with a naked-asm detour mechanism (not just COM vtable patching,
+  which was all prior sessions used). `CandB`'s hook genuinely invokes the real function body
+  twice per frame in the live, undebugged game process (extending notes/12's 15-frame debugger
+  test to a real sustained in-process double-call) into two separate offscreen render targets,
+  composited via `StretchRect` into the left/right halves of the real backbuffer before the one
+  real `Present` — all `S_OK`, every frame, six separate runs, zero crashes/hangs.
+- **New discovery**: `CandB`'s own nested call tree (not `CandB`/`CandA` themselves — notes/11
+  found zero D3D calls at that level) calls the real `Present` internally, partway through
+  rendering. Proven via a reentrancy flag read back `TRUE` from inside the Present hook while
+  still nested inside `CandB`'s double-call region. Worked around this session with a 3-state
+  phase (suppress eye 1's premature internal Present; repurpose eye 2's internal Present as the
+  real "both eyes done, composite and flip" signal) — this fix is real and necessary, not
+  speculative.
+- **Camera offset doesn't reach the screen**: tested at both a realistic ~3.25-unit half-IPD and,
+  diagnostically, at 60 units (18x larger) — zero visible parallax either way, even though the
+  CPU-side matrix write was confirmed (byte-level read-back) to land correctly. Leading
+  explanation: the camera flows to the GPU via `SetVertexShaderConstantF` (established in
+  notes/07) at an upload call site that was never pinned down, most likely firing once per frame
+  *before* `CandB` runs — rewriting the CPU-side matrix buffer afterward has no path back to the
+  GPU. This is the single highest-value next step (see notes/13 §7).
+- **Second, independent, unexplained finding**: the second `CandB` invocation's render is missing
+  its background layer (near-white instead of the game's textured backdrop) even with the
+  Present-reentrancy bug fixed — a materially different open question from "is it safe to call
+  twice" (notes/12 already answered that for stack/register/return-value/timing; this is about
+  whether every individual draw call fires identically on a second invocation, which turns out to
+  be a different, unanswered question).
+- **Disposition**: proxy DLL source/build synced to modding-notes and dev-archive as a detailed
+  record of real working infrastructure plus a well-diagnosed partial result. **Not** pushed to
+  the public mod repo this session, since the literal success criterion (two different camera
+  angles) wasn't met — per the task's own explicit instruction not to oversell partial results.
+
+## Prior milestone (double-call safety test session, still valid)
+
+**GO: the double-call safety test passed cleanly** — this closed the last open empirical question
+from notes/11 by actually doing the thing (call `exe+0xFEDA0` twice per frame with unmodified state)
+instead of continuing to reason about it
+statically. Full detail, methodology, and two reusable x64dbg-automate tooling gotchas found
+along the way are in `notes/12-double-call-safety-test.md`:
+
+- **15/15 consecutive double-invokes of CandB (`exe+0xFEDA0`) succeeded cleanly** over a
+  sustained real-frame window: every one landed at the correct return address with the stack
+  pointer byte-identical before/after both calls, entry register state was bit-identical across
+  all 15 real hits, and the second call's return value (`eax=1`) exactly matched the first's on
+  every hit (no sign of an "already rendered this frame" reentrancy guard silently short-circuiting
+  the second call).
+- **Baseline frame cadence immediately before and after the double-call window is statistically
+  identical** (~0.204s/hit both times) — no lasting corruption, no growing lag, no delayed crash
+  once double-invoking stopped.
+- **Zero crashes, hangs, or unresolved exceptions** across the whole test. (Two earlier attempts
+  this session failed for tooling reasons unrelated to CandB itself — an event-queue
+  desynchronization bug, and x64dbg's `rtr`/"run to return" command not being reliably
+  call-depth-aware across CandB's ~90-deep nested call tree, landing short and cascading into a
+  self-inflicted bad state after 4 iterations — both diagnosed, fixed by switching to a targeted
+  single-shot breakpoint at the known return address, and confirmed fixed by the clean 15/15 run
+  that followed. Neither failure mode implicated CandB's own safety.)
+- **Honest limitation carried forward**: no visual/screenshot confirmation of animation speed was
+  performed (verdict rests on stack/register/return-value/timing consistency, not a direct look
+  at the screen); six brief, non-repeating, unexplained debugger stops in unrelated-looking DLL
+  address space were observed once mid-test and are noted but not folded into the verdict either
+  way (didn't correlate with any double-invoke failure, never recurred). Neither limitation was
+  judged to block proceeding.
+- **Next session**: attempt the actual dual-render hook (per the plan already laid out in
+  notes/10 §6 / notes/11 §4) — hook `exe+0xFEDA0`, call it twice per real frame (once per eye,
+  proven per-eye `BuildViewMatrix` offset from notes/09) into two render targets stood up via the
+  already-hooked `CreateDevice` (notes/06), compositing before the real `Present`. No remaining
+  *unscoped* unknowns block this.
+
+## Prior milestone (render-function classification session, still valid)
+
+**The dual-render open question was resolved via static + empirical analysis: the candidate
+"render one eye's scene" wrapper function was classified as pure-render-only, converging with
+this session's actual double-call test above.** Two launch-then-attach x64dbg captures (see
+`notes/11-render-function-classification.md` for full detail):
+
+- **Corrected notes/10's two candidate addresses**: `exe+0x115F36`/`exe+0xFEFEE` were return
+  addresses (mid-function), not entry points. Their real entry points were found by backward
+  prologue scan + forward-alignment verification: **`exe+0x115610`** (695-instruction body) and
+  **`exe+0xFEDA0`** (282-instruction body). **`exe+0xFEDA0` directly calls `exe+0x115610`**
+  (confirmed via the exact call/return-address byte offset) — this is the true, fully-confirmed
+  call hierarchy, not just an EBP-depth guess. Both fire **exactly once per real Present frame**.
+- **Full disassembly of both function bodies (695 + 282 instructions) found zero D3D API calls**
+  (all drawing is delegated to nested helpers, matching notes/10's deeper EBP frames) and only 21
+  non-stack memory writes total, **none floating-point, none increment/accumulate** — all
+  single-shot literal-constant resets or transient-pointer set/clear pairs.
+- **Empirical live-memory watch across 8 real frames** (register-resolved effective addresses,
+  fixing a first attempt's broken address-parsing) confirmed every write site fires **at most
+  once per frame** (not a loop) and targets a **different memory address almost every frame** —
+  the opposite of what a persistent game-state variable (timer, position) would look like; that
+  would live at one stable address.
+- **Verdict: leans safe to call twice**, not airtight (89 nested helper calls were identified by
+  address but not individually disassembled — judged not worth a full manual audit this
+  session). **Recommended next step, not another investigation**: hook `exe+0xFEDA0` and do the
+  actual double-call experiment (call it twice with unchanged matrices first, watch for
+  double-simulation symptoms over a sustained window) as the cheapest way to close the remaining
+  gap, then proceed to the real stereo hook (per-eye offset + second render target + composite)
+  using every already-proven primitive from notes 06/07/09/10.
+
+## Prior milestone (render-loop structure session, still valid)
+
+**The frame's render-loop structure was mapped, closing out the "how does the game
+structure a frame" unknown flagged at the end of the write-hook session.** Live x64dbg capture
+(three failed/diagnostic attempts plus one fully successful one — see
+`notes/10-render-loop-structure.md` §1 for two reusable debugging-harness bugs found and fixed
+along the way: launching directly under x64dbg hit a persistent access-violation retry loop this
+session, worked around by launching the game normally and attaching after ~15s; and the
+automation library's event-queue helper pops newest-first (LIFO) which silently corrupted a live
+pointer read until fixed to drain strictly oldest-first) confirmed:
+
+- **Frame order**: `[BuildProjectionMatrix x8, BuildViewMatrix x3] → [~89 draw calls across
+  multiple SetRenderTarget/Clear/BeginScene/EndScene brackets] → Present`, every frame, camera
+  matrices always built before any draw calls, `Present` always last.
+- **The engine already calls `SetRenderTarget` (8x) and `Clear` (3x) multiple times per single
+  frame**, with a `SetRenderTarget` burst immediately followed by `EndScene`→`BeginScene`→`Clear`
+  — strong evidence of an existing multi-pass structure (most plausibly a shadow/render-to-texture
+  pass) that a stereo second-eye pass could piggyback on the same mechanism.
+- **A candidate "draw the whole scene" wrapper was identified via an 8-level EBP frame-pointer
+  walk from the first live `DrawIndexedPrimitive` hit**: `exe+0x115F36` and `exe+0xFEFEE` are the
+  two outermost/best candidates (no symbols, not yet disassembled).
+- **Open risk, not yet resolved**: whether that candidate wrapper's call chain does *only*
+  rendering or also touches per-frame game-logic/animation state that would double-advance if
+  called twice — this is the concrete next step (disassemble those two addresses and check),
+  not a new open-ended unknown. Full plan in `notes/10-render-loop-structure.md` §6.
+
+**Proposed next milestone**: disassemble `exe+0x115F36`/`exe+0xFEFEE` to confirm one is a clean
+render-only entry point, then attempt the actual dual-render hook: call it twice per frame (once
+per eye, using the already-proven per-eye matrix offset from notes/09) into two render targets
+stood up via the already-hooked `CreateDevice` (notes/06), compositing before the real `Present`.
+If the split turns out not to be clean, fall back to single-render + post-process
+reprojection/warp instead of fighting a tangled call graph.
+
+## Prior milestone (write-hook proof-of-concept session, still valid)
+
+**The write-hook mechanism is proven end-to-end — this is the first behavior-modifying
+experiment, and it worked.** A real live write was installed at `BuildViewMatrix`
+(`exe+0x292480`): on each hit, `pEye`/`pAt`/`pUp` were read, a right vector was computed
+(`normalize(cross(normalize(at-eye), up))`), and `*pEye` was overwritten with `eye + right*40.0`
+before letting the real function proceed. A second breakpoint directly on the
+`call D3DXMatrixLookAtRH` instruction (`exe+0x2924AC`) re-read `*pEye` immediately before the
+call executed, to prove the write wasn't overwritten before use. Result: **40/40 writes
+succeeded, 39/39 call-site checks matched the written value exactly, 0 mismatches**, sustained
+across ~25 seconds / ~40 frames on the title screen's live camera — not a one-frame flicker. No
+crash, no anti-tamper reaction. Full detail, exact values, and one important surprise (below) in
+`notes/09-write-hook-proof-of-concept.md`.
+
+**Important surprise**: `*pEye` is a live pointer into the camera's own persistent state, not a
+fresh copy each call — writes on one hit partially carry forward into what the next hit on the
+same pointer reads as its "original" value. This produced **bounded compounding**: the first few
+writes on a given pointer stack close to additively, then the game's own camera smoothing visibly
+damps it and the value converges to a stable offset rather than diverging unboundedly or being
+cleanly reset. This is a concrete, actionable finding for the stereo work, not just a curiosity —
+see the recommendation below.
+
+**Proposed next milestone (the real stereo-rendering step)**: this is the big one and will likely
+need its own dedicated deep-dive session. Two parts:
+1. **Per-eye matrix math**: duplicate the offset logic proven this session for two eyes with
+   opposite-sign offsets, but **cache/derive a fresh unmodified base eye position each frame**
+   rather than reading back an already-offset `*pEye` (to sidestep the compounding behavior found
+   above) — either by capturing the pre-write value once per real frame and computing both eyes
+   from that cached base, or by not mutating the shared pointer in place at all and instead
+   calling `D3DXMatrixLookAtRH` (or the `BuildViewMatrix` wrapper) twice into two separate output
+   buffers.
+2. **Actual dual rendering** (the hard, unscoped part): the game's main render loop needs to run
+   *twice* per frame — once per eye — into two separate render targets, then composite. This
+   needs its own investigation into how the game's frame/draw-call loop is structured (where
+   `Present` is called relative to the full scene draw, whether the render path can be
+   re-entered cleanly a second time with a different view/projection matrix and target surface,
+   whether any per-frame state would need resetting between the two passes). The already-hooked
+   `CreateDevice`/`Present` proxy (`notes/06-createdevice-present-hooks.md`) is the natural place
+   to stand up a second render target, but nothing about invoking the render path twice has been
+   explored yet.
+
+Revisit the gameplay-input blocker (`notes/08`) in parallel/afterward — real player camera
+movement will eventually be needed to validate the stereo hook, not just the title screen's
+attract-mode animation.
+
+## Prior milestone (live-camera-data session, still valid)
+
+Both camera-matrix hook points were confirmed carrying real, live, changing data. Breakpoints on
+`BuildViewMatrix` (`exe+0x292480`) and `BuildProjectionMatrix` (`exe+0x2924D0`) were hit
+repeatedly (15 + 45 hits over ~15s) with real `pEye`/`pAt`/`pUp` vectors that drift smoothly
+frame-to-frame (proving a live, moving camera, not a cached one-shot value) and a stable,
+plausible `rawFov=104.0` / `aspect=1.3333` (4:3) / `zn=10.0` / `zf=50000.0`. This used the
+title/attract screen's own animated 3D camera (a real `D3DXMatrixLookAtRH` scene, unlike the
+static post-title menu observed previously) rather than player-controlled gameplay — **reaching
+actual gameplay was blocked this session by a simulated-input problem**: `SendInput` (VK and
+scan-code), legacy `keybd_event`, and `PostMessage` all failed to dismiss the title screen's
+"press any key" prompt, despite confirmed-correct OS-level window focus and a validated-working
+injection mechanism (control-tested against Notepad). Root cause narrowed to the game's `DIEmWin`
+DirectInput hook-based input path not reacting to synthetic input in this environment — not a
+debugger, hook, or config problem (full diagnostic trail in
+`notes/08-live-camera-data-gameplay.md`).
+
+## Prior milestone (camera-matrix injection-point session, still valid)
+
+**The camera-matrix injection point is identified with concrete, live-confirmed addresses.**
+Two small wrapper functions were fully disassembled — `exe+0x292480` (builds the view matrix,
+`BuildViewMatrix(pOut, pEye, pAt, pUp)`, all three vector args passed as pointers straight
+through to `D3DXMatrixLookAtRH`) and `exe+0x2924D0` (builds the projection matrix,
+`BuildProjectionMatrix(pOut, rawFov, aspect, zn, zf)`, feeding a FOV unit conversion into
+`D3DXMatrixPerspectiveFovRH`) — both are the actual hook points for per-eye view/projection
+matrix injection. Also resolved, with live evidence: **the game uses the shader-constant
+pipeline, not the fixed-function pipeline** — `IDirect3DDevice9::SetTransform` was never called
+by the game's own code across ~75 seconds of live observation (zero hits on a real breakpoint at
+its resolved address, versus 300+ hits on `SetVertexShaderConstantF` and 40+ `Present` frames in
+the same window); the `SetTransform` hits that did occur came from the D3D9 runtime's own
+`CreateDevice` bootstrap, not the game. The specific `SetVertexShaderConstantF` call/register
+range carrying the actual camera matrix wasn't pinned down yet — the observation window was the
+main menu (no active 3D camera), so `D3DXMatrixLookAtRH` never fired live and the
+`SetVertexShaderConstantF` hits observed all looked like 2D UI/screen-space constants from one
+call site (`exe+0x27EF03`). Full detail, full disassembly listings, and the concrete next step
+(reach real gameplay, watch for a `Vector4fCount=4` constant upload) are in
+`notes/07-camera-matrix-injection-point.md`.
+
+**Proposed next milestone**: get the debugger past the main menu into actual gameplay (simulated
+input or attach-after-manual-launch) and repeat the `SetVertexShaderConstantF` observation to
+find the exact call site/register range for the camera matrix upload — that's the second,
+possibly primary, injection point alongside the two wrapper functions already found. In
+parallel/afterward, use the already-hooked `CreateDevice` (`notes/06-createdevice-present-hooks.md`)
+to create a second render target, purely to prove a second surface can be stood up against this
+device/driver — still no compositing/stereo logic yet, just infrastructure.
+
+## Prior milestone (CreateDevice/Present vtable-hook session, still valid)
+
+The proxy `d3d9.dll` (`tools/proxy-d3d9/`) **vtable-hooks `IDirect3D9::CreateDevice` (slot 16)
+and `IDirect3DDevice9::Present` (slot 17)**, in addition to the previously-validated
+`Direct3DCreate9` forwarding — still pure observation, every hook calls straight through to the
+real implementation and returns its result unmodified. Both slot indices were cross-checked two
+ways (counting fields in mingw-w64's own `d3d9.h` vtbl structs, and the prior live x64dbg session
+that read the same slots out of live process memory) and patched by assigning the named vtbl
+struct fields (`lpVtbl->CreateDevice = ...`, `lpVtbl->Present = ...`) rather than raw pointer-index
+math, so the compiler — not manual offset arithmetic — guarantees the correct slot. Live-validated
+by copying into the game dir and launching `Psychonauts.exe` directly: `CreateDevice` fired once
+with full `D3DPRESENT_PARAMETERS` logged (640×480 windowed, `D3DFMT_A8R8G8B8` backbuffer,
+`D3DFMT_D24S8` depth/stencil, `BehaviorFlags=0x46` matching the live-debug session exactly), and
+`Present` fired repeatedly at a steady ~30 fps (frame counter `1→29→59→89→119→149` across six
+~1-second-apart throttled log lines) — proving the per-frame hook point is real and durable, not a
+one-shot artifact. Test DLL removed from the game directory and the game process killed
+immediately after validating, exactly as before. Full detail:
+`notes/06-createdevice-present-hooks.md`.
+
+## Prior milestone (proxy-DLL validation session, still valid)
+
+The minimal logging proxy `d3d9.dll` was **built and validated end-to-end** as plain
+load-and-forward (no vtable hooking yet at that point). No C/C++ compiler existed on this machine;
+installed LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`) to get an
+`i686-w64-mingw32-clang` 32-bit target compiler (game is 32-bit). The real `Direct3DCreate9`
+address resolved by the proxy (`d3d9.dll base + 0x64B20`) exactly matched the offset independently
+found via x64dbg in the live-debug session — good cross-confirmation. Full detail:
+`notes/05-proxy-dll-validation.md`.
+
+## Prior milestone (live-debug session, still valid)
+
+x64dbg, a real Python 3.12, the `x64dbg_automate[mcp]` pip package, and the
+(separately-downloaded, not bundled) x64dbg-automate debugger plugin are all installed and
+working. First live/dynamic analysis pass **fully confirmed the static-recon hook plan**:
+`Direct3DCreate9` (`d3d9.dll+0x64B20`) → `IDirect3D9::CreateDevice` (`d3d9.dll+0x6F750`, called
+from `exe+0x27BD52` with `D3DCREATE_HARDWARE_VERTEXPROCESSING`) → `IDirect3DDevice9::Present`
+(`d3d9.dll+0xE6120`, called from `exe+0x27E755`) were all hit live with a debugger and their
+addresses read from real process memory, not guessed. Camera matrix call sites
+(`D3DXMatrixPerspectiveFovRH` / `D3DXMatrixLookAtRH`, both called from the `exe+0x2925xx`
+region) were also located. No anti-debug/anti-tamper behavior encountered. Full detail, exact
+addresses, and two non-obvious debugger gotchas (default entry breakpoint; first-chance-AV loop
+when launching outside Steam under x64dbg) are in `notes/04-live-debug-findings.md`.
+
+## Summary
+
+First recon pass complete. Workspace stood up, both trusted tools installed, key prior-art
+resources read and summarized, and read-only static analysis of `Psychonauts.exe` performed.
+No changes made to the game install. Findings line up well: this looks like a tractable
+in-process D3D9 hook + shader patch project, closely following the path Helix Mod already
+proved works for this exact game in 2013.
+
+## What's set up
+
+- Workspace: `C:\Users\Tefa\Documents\PsychonautsVR\` with `notes/`, `tools/` (empty, reserved),
+  `recon/` (raw PE dump).
+- Git installed (was missing; required by the plugin marketplace clone mechanism — installed
+  via winget, standard low-risk dev tool, not the "third-party debugger" caution).
+- **x64dbg-skills** plugin installed & enabled (`claude plugin marketplace add
+  dariushoule/x64dbg-skills` + `claude plugin install`). **Now fully usable**: x64dbg, x64dbg
+  Automate (debugger plugin), a real Python 3.12, `x64dbg_automate[mcp]`, and the MCP server
+  registration are all installed and verified — see `notes/04-live-debug-findings.md` for the
+  install log and the first successful live-debug pass. The MCP tools need a Claude Code
+  restart to appear (registered mid-session); the raw Python client works immediately.
+- **superpowers** plugin installed & enabled from the official marketplace, fully usable now.
+  `SUPERPOWERS_DISABLE_TELEMETRY=1` set in the global `~/.claude/settings.json` `env` block.
+
+Full detail: `notes/01-tooling-setup.md`.
+
+## What was learned from prior art
+
+- **Helix Mod's 2013 fix is the strongest signal**: someone already got per-eye stereo working
+  on this exact game by patching a small, identifiable family of shaders (sky/celestial
+  objects). Proves the shader pipeline is patchable and that once fixed, convergence/depth are
+  freely controllable.
+- **dxwrapper's `d3d9.dll` stub-replacement mechanism is directly applicable** — the game
+  imports `d3d9.dll` by plain name with one call (`Direct3DCreate9`), no Ex variant, nothing in
+  the game folder to conflict with a proxy DLL.
+- Jill Crungus's blog is confirmed to cover Lua scripting + ASD format + level construction;
+  independently corroborated by our own recon (the exe has `.dflua`/`.dfluatx` PE sections).
+  Deeper read deferred until we need entity/camera data, not just the rendering hook.
+- RayCarrot/PsychonautsStudio: thin, WIP, low value for this phase.
+- Brobert-in-aus's two guides are generic Godot/OpenXR external-host porting methodology, not
+  Psychonauts-specific — useful only as a fallback architecture if in-process shader hooking
+  hits a wall; the in-process path is better supported by actual prior art for this game.
+
+Full detail: `notes/02-technical-leads.md`.
+
+## Static recon findings (Psychonauts.exe, read-only)
+
+- 32-bit PE, VS2008/linker 9.0, Steam-era patched build (timestamp 2016, not the original 2005
+  build — pulls in steam_api/XInput/DirectInput8).
+- `d3d9.dll` import: exactly `Direct3DCreate9`, plain D3D9 (no Ex) — confirms `CreateDevice` →
+  `Present`/`SetVertexShaderConstantF` as the hook points, and confirms the stub-DLL injection
+  approach is viable.
+- `d3dx9_40.dll` imports include `D3DXCompileShader`, `D3DXAssembleShader`,
+  `D3DXGetShaderConstantTable` — real shader pipeline, not fixed-function, matching how Helix
+  Mod's fix operated. Also imports `D3DXMatrixPerspectiveFovRH`/`D3DXMatrixLookAtRH` — likely
+  call sites for injecting per-eye projection/view matrices.
+- No packing/anti-tamper signals in the import table; everything is plaintext standard Win32/
+  D3D9/MSVC runtime names.
+
+Full detail + raw dump: `notes/03-static-recon.md`, `recon/psychonauts_exe_imports.txt`.
+
+## Blocker (resolved 2026-08-16, live-debug session)
+
+~~x64dbg-skills needs x64dbg + x64dbg Automate + a working Python 3 install~~ — all installed
+and verified working this session (x64dbg 2026.05.27, Python 3.12.10, `x64dbg_automate[mcp]`
+0.9.2, plus the separately-downloaded x64dbg-automate debugger plugin the README doesn't
+mention as a distinct download). See `notes/04-live-debug-findings.md` for the full install log
+and the live analysis results. Superseded by "Latest status" at the top of this file.
+
+## Proposed next milestone
+
+See "Latest status" at the top of this file for the current one — this section is left as
+historical context from the first live-debug session; each subsequent session's "Latest status"
+supersedes it.
