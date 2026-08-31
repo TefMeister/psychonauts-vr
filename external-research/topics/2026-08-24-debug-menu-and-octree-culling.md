@@ -1,6 +1,6 @@
 # Dormant debug menu (Lance McDonald) + octree collision structure
 
-**Status:** 🆕 new — live test in progress (see [00-status.md](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/00-status.md) in modding-notes for the current live result).
+**Status:** 🆕 new — live test in progress (see [00-status.md](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/00-status.md) in modding-notes for the current live result).
 **Also archived in:** `psychonauts-vr-modding-notes/59-public-research-sweep-debug-menu-and-octree-leads.md` and `02-technical-leads.md` (this topic predates this repo's creation; that's the original write-up, this is the canonical copy going forward).
 
 Pure public-research pass (web search/fetch only, zero game execution) done specifically to find outside
