@@ -15,7 +15,7 @@ what's new to verify in the current release.
 ## Part A — Pre-flight (do this before putting the headset on)
 
 1. **Get the build.** Download the release ZIP from
-   https://github.com/TefMeister/psychonauts-vr/tree/main/mod/releases (latest tag), or use the pre-tuned
+   https://github.com/TefMeister/psychonauts-vr/releases (latest tag), or use the pre-tuned
    launcher assets attached to the release.
 2. **Deploy into the game folder** (next to `Psychonauts.exe`):
    - `d3d9.dll`  (the mod)
