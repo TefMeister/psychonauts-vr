@@ -37,24 +37,24 @@ what's described here.
    pulled from OpenVR itself when available, with a safe fallback to calibrated constants. The
    OpenVR-sourced path passed its first real-hardware inspection (user-confirmed correct and
    comfortable in-headset). See
-   [modding-notes/24](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/24-off-axis-projection-upgrade-and-vr-runtime-scoping.md),
-   [32](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/32-real-openvr-ipd-projection-data-and-menu-bug-revisit.md),
-   [33](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
+   [modding-notes/24](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/24-off-axis-projection-upgrade-and-vr-runtime-scoping.md),
+   [32](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/32-real-openvr-ipd-projection-data-and-menu-bug-revisit.md),
+   [33](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
 5. **Per-eye private depth-stencil surfaces** (fixed a shared depth-stencil bug that corrupted
    both eyes — see
-   [modding-notes/22](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/22-eye-parity-refutes-culling-shared-depth-stencil-fix.md)).
+   [modding-notes/22](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/22-eye-parity-refutes-culling-shared-depth-stencil-fix.md)).
 6. **Composites** both eyes into the left/right halves of the real backbuffer before the one
    real hardware Present. This monitor-view path is always on.
 7. **(Opt-in) Submits real frames to a VR compositor** via a D3D9Ex/D3D11 bridge into
    `IVRCompositor::Submit` — confirmed working end-to-end with a real headset at the HMD's
    native refresh rate. See
-   [modding-notes/33](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
+   [modding-notes/33](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
 8. **(New) Head tracking**: the HMD pose returned by `WaitGetPoses` every frame is converted
    into a per-frame view correction applied at the same proven per-draw patch point as the
    stereo correction — full rotation plus positional lean, with the tracking reference
    (position + yaw) captured at startup so the game's horizon stays level. Math validated
    numerically before build; live-verified on-monitor via a synthesized moving pose. See
-   [modding-notes/34](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/34-shutdown-zombie-fix-quit-events-and-head-tracking.md).
+   [modding-notes/34](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/34-shutdown-zombie-fix-quit-events-and-head-tracking.md).
 9. **(New) Clean lifecycle**: SteamVR quitting mid-game is now handled (the game drops back to
    flat monitor rendering and keeps running instead of being killed), and the v0.1.0 bug where
    the game could hang on exit as an unkillable process with the VR bridge active is fixed.
@@ -63,18 +63,18 @@ what's described here.
 
 **Real gameplay stereo, user-confirmed (2026-08-17)**: real, player-controlled gameplay renders
 correctly in stereo on both eyes
-([modding-notes/23](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/23-gameplay-stereo-working-milestone.md)).
+([modding-notes/23](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/23-gameplay-stereo-working-milestone.md)).
 
 **First physical-headset test, user-confirmed (2026-08-17)**: with `PSYVR_ENABLE_SUBMIT=1` and
 SteamVR running, the game displayed inside a real Quest 3 (via Virtual Desktop), sustaining the
 HMD's native 72Hz for the whole run; the user later confirmed the stereo looked correct and
 comfortable. Head tracking did not exist yet in that build. Full write-up:
-[modding-notes/33](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
+[modding-notes/33](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
 
 **Head tracking (2026-08-18)**: implemented and verified on-monitor via a synthesized moving
 pose (smooth, solid camera motion; static-pose regression clean). **Not yet verified with a
 real headset** — that is exactly what this release exists to test.
-[modding-notes/34](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/34-shutdown-zombie-fix-quit-events-and-head-tracking.md).
+[modding-notes/34](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/34-shutdown-zombie-fix-quit-events-and-head-tracking.md).
 
 ## Known issues / limitations
 
@@ -97,7 +97,7 @@ real headset** — that is exactly what this release exists to test.
   ~28-31fps ceiling was an artifact of SteamVR's headset-free null driver, not the mod — with a
   real HMD, the bridge sustains the headset's native refresh (72Hz measured) with large
   headroom at the current render resolution. See
-  [modding-notes/33 §3](https://github.com/TefMeister/psychonauts-vr-modding-notes/blob/main/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
+  [modding-notes/33 §3](https://github.com/TefMeister/psychonauts-vr/blob/main/modding-notes/33-first-physical-headset-test-confirmed-and-shutdown-hang.md).
 - **VR-bridge eye buffers now render at 2× the game's resolution by default** (e.g. 1600×1200
   from an 800×600 game setting; `PSYVR_RENDER_SCALE=1`..`4` to override) — still below the
   headset's recommended per-eye size (2496×2688 on a Quest 3), but a large sharpness step over

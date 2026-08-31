@@ -1,22 +1,22 @@
-# psychonauts-vr-modding-notes
+# psychonauts-vr — `modding-notes/`
 
 Trial-and-error field notes from AI-assisted reverse engineering of the original **Psychonauts** (2005, Double Fine) — a project to add VR support to a DirectX 9, custom-engine game that has no existing modding framework.
 
-This repo holds the readable, curated write-ups: what was tried, what was learned, confirmed technical facts (hook addresses, offsets, engine behavior), and the reasoning behind each decision. For the raw, messy, everything-including-failed-attempts material, see the companion [psychonauts-vr-dev-archive](https://github.com/TefMeister/psychonauts-vr-dev-archive) repo. For actual working mod releases, see [psychonauts-vr-mod](https://github.com/TefMeister/psychonauts-vr-mod).
+This folder holds the readable, curated write-ups: what was tried, what was learned, confirmed technical facts (hook addresses, offsets, engine behavior), and the reasoning behind each decision. For the raw, messy, everything-including-failed-attempts material, see the companion [`dev-archive/`](../dev-archive/) repo. For actual working mod releases, see [`mod/`](../mod/).
 
-## The six repositories for Psychonauts VR
+## The folders for Psychonauts VR
 
-Everything for this game lives in six repositories, each with one job — so you
-always know where to look. You are in **psychonauts-vr-modding-notes**.
+Everything for this game lives in one repository, one folder per job — so you
+always know where to look. You are in **`modding-notes/`**.
 
-| Repository | What lives here |
+| Folder | What lives here |
 | --- | --- |
-| [psychonauts-vr-mod](https://github.com/TefMeister/psychonauts-vr-mod) | The mod itself — the DirectX 9 stereo + head-tracking VR proxy (`d3d9.dll`). |
-| [psychonauts-vr-dev-archive](https://github.com/TefMeister/psychonauts-vr-dev-archive) | Full development history — snapshots, probes, dead ends, raw recon. |
-| **psychonauts-vr-modding-notes** ← you are here | Readable field notes / progress ledger. |
-| [psychonauts-vr-staging](https://github.com/TefMeister/psychonauts-vr-staging) 🔒 | **Private** — unverified WIP builds, cross-machine handoff. |
-| [psychonauts-vr-engine-research](https://github.com/TefMeister/psychonauts-vr-engine-research) | Distilled engine reference (dossier) + reusable VR RE playbook. |
-| [psychonauts-vr-external-research](https://github.com/TefMeister/psychonauts-vr-external-research) | Ongoing public-research leads, gathered separately from hands-on modding work. |
+| [`mod/`](../mod/) | The mod itself — the DirectX 9 stereo + head-tracking VR proxy (`d3d9.dll`). |
+| [`dev-archive/`](../dev-archive/) | Full development history — snapshots, probes, dead ends, raw recon. |
+| **`modding-notes/`** ← you are here | Readable field notes / progress ledger. |
+| [staging/psychonauts-vr](https://github.com/TefMeister/staging/tree/main/psychonauts-vr) 🔒 | **Private** — unverified WIP builds, cross-machine handoff. |
+| [`engine-research/`](../engine-research/) | Distilled engine reference (dossier) + reusable VR RE playbook. |
+| [`external-research/`](../external-research/) | Ongoing public-research leads, gathered separately from hands-on modding work. |
 
 ## Status
 
