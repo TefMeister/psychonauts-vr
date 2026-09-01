@@ -3011,11 +3011,15 @@ static void *AutoGetCamera(void)
  *     obj    = *(void **)(player + 0x10)
  *     pos    = (float *)(obj + 0x40)           <- x, y, z, contiguous
  *
- * The +0x818C player object is corroborated by three independent bindings
- * that all reach it the same way: GetPlayerPosition (0x005C1CE0),
- * GetPlayerLSO (0x005C0BD0) and IsRazZLocked (0x005B6CB0). The +0x10 -> +0x40
- * position tail is from GetPlayerPosition alone, so that half is n=1 and is
- * the part to distrust first if the numbers look wrong.
+ * The +0x818C player object is corroborated by four independent bindings that
+ * all reach it the same way: GetPlayerPosition (0x005C1CE0), GetPlayerLSO
+ * (0x005C0BD0), IsRazZLocked (0x005B6CB0) and GetPlayerDist (0x005C0920).
+ *
+ * The +0x10 -> +0x40 position tail is n=2, not n=1 as first recorded:
+ * GetPlayerDist walks the identical chain and then uses those three floats as
+ * a POSITION in a distance computation against another entity. That is a
+ * second *independent use* consistent with the meaning, which is stronger
+ * corroboration than a second identical read would have been.
  *
  * This is READ-ONLY and calls nothing, so it is safe from the render-path
  * hook under the same rule the rest of the harness follows.
@@ -4008,6 +4012,14 @@ static void AutoRunCommand(const char *cmd)
         g_fpCamOn = (cmd[6] == '1');
         LogLine("Auto: END   \"%s\" -> fpcam = %d (height %.1f on axis %d, forward %.1f)",
                 cmd, g_fpCamOn, g_fpCamHeight, g_fpCamUpAxis, g_fpCamForward);
+        /* fpcam and camhold both own camera+0x08 and would silently fight:
+         * camhold writes from the automation tick (AfterBoth) while fpcam
+         * writes at BeforeEye1, so fpcam always wins and camhold/campos/cammove
+         * would appear broken rather than overridden. Say so instead. */
+        if (g_fpCamOn && g_camHold)
+            LogLine("Auto:       NOTE fpcam overrides camhold - camhold, campos and cammove "
+                    "cannot move the camera while fpcam is on. Use 'camhold 0' + 'fpcam 0' "
+                    "to get the free camera back.");
 
     } else if (_strnicmp(cmd, "fpheight ", 9) == 0) {
         if (sscanf(cmd + 9, "%f", &a) == 1 && a >= -500.0f && a <= 500.0f) {
@@ -4116,6 +4128,12 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: camhold on, but no camera yet - target stays as last set");
         LogLine("Auto: END   \"%s\" -> camhold=%d target %.1f %.1f %.1f", cmd, (int)g_camHold,
                 g_camHoldPos[0], g_camHoldPos[1], g_camHoldPos[2]);
+        /* See the matching note on fpcam: both own camera+0x08, and fpcam wins
+         * because it writes later in the frame. Warn rather than let camhold
+         * look broken. */
+        if (g_camHold && g_fpCamOn)
+            LogLine("Auto:       NOTE fpcam is ON and overrides camhold every frame - "
+                    "run 'fpcam 0' first if you want the free camera back.");
 
     } else if (_strnicmp(cmd, "flag ", 5) == 0) {
         void *engine = *(void **)0x78BC20;
