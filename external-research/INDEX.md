@@ -1,6 +1,6 @@
 # Research index
 
-**Last `/gr` pass: 2026-09-01 — FULL.** Inbox was empty. One new topic and it is the largest gap this
+**Last `/gr` pass: 2026-09-01 — CHECK-IN** (board read closely + INDEX; the dossier was skimmed by section only, so a FULL pass is still owed)**.** Inbox was empty. One new topic and it is the largest gap this
 lane had: **Astralathe** — a mod loader / debugger / API extender for this exact modern release —
 already ships an **in-game Lua console**, the **native debug menu and level select**, and restored
 debug rendering. That touches a primitive recorded as unfinished, a test still marked "in progress",
