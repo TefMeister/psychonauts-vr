@@ -77,6 +77,15 @@ into with a `d3d9.dll` proxy**. `[reported 2026-09-01]` Its published feature li
 functions**, engine bugfixes and widescreen support. PsychoRando and a Psychonauts Archipelago
 integration are both built on it and current.
 
+**✅ Assessed from its source 2026-09-01 (home PC, notes/70 §2):** Astralathe injects as a **`dsound.dll`**
+proxy (no filename clash with our `d3d9.dll`), is **GPLv3** (study-only is a legal requirement, not
+just our rule), and uses PolyHook2 to IAT-hook `Direct3DCreate9` + `DirectInput8Create` and to
+vtable-swap `IDirect3D9::CreateDevice`, `IDirect3DDevice9::EndScene`/`Reset` and
+`IDirectInputDevice8A::GetDeviceState`/`GetDeviceData`/`SetCooperativeLevel` — **the same seams our
+proxy owns**. `[reported 2026-09-01, read from the project's source via the GitLab REST API]`
+Verdict: no file collision, a real functional one; keep it off the working install, use it on a
+separate copy only. Its menu key is F10. The paragraph below is kept as the original warning.
+
 **🚨 The safety issue, and why this is a warning rather than a recommendation: which file it hooks is
 UNREAD.** Its GitLab repo and wiki render client-side and returned empty page shells to every
 automated fetch. **If it also wraps `d3d9.dll`, running it alongside our proxy is a direct conflict**;
@@ -352,11 +361,18 @@ and `fpcam` in the proxy; **built and deployed 2026-09-01 but NOT yet run.**
 * `engine + 0x818C` = the player object - `[inferred-static 2026-09-01, n=3]`,
   corroborated by `GetPlayerPosition` (`0x005C1CE0`), `GetPlayerLSO`
   (`0x005C0BD0`) and `IsRazZLocked` (`0x005B6CB0`), which all reach it the same way.
-* `+0x10 -> +0x40` = the position - `[inferred-static 2026-09-01, n=2]`. **Upgraded
+* `+0x10 -> +0x40` = the position - `[inferred-static 2026-09-01, n=4]`. **Upgraded
   from n=1 on review the same day:** `GetPlayerDist` (`0x005C0920`) walks the identical chain and
   then uses those three floats as a POSITION in a distance computation against another entity.
   That corroborates the *meaning*, not just the offsets, which is stronger than a second identical
-  read would have been.
+  read would have been. **Upgraded again to n=4 the same evening (home PC, notes/70):** the generic
+  `GetAbsPosition_impl` (`0x005C0C70`) walks `+0x10 -> +0x40` for ANY entity Lua hands it, and the
+  WRITE side `SetAbsPosition_impl` (`0x005C0EC0` -> `0x0046F1B0`) stores the new xyz at
+  `node+0x10+0x30`, i.e. **`+0x40` is row 3 (translation) of a row-major 4x4 local transform that
+  starts at `node+0x10`** `[inferred-static 2026-09-01, n=1]`. Caveat from the setter: when
+  `[node+0xB8]` is non-null the position is converted through that (parent) object first, so
+  `+0x40` is LOCAL and equals world only for an unparented node `[inferred-static 2026-09-01, n=1]`;
+  `GetPlayerPosition_impl` reads it with no parent check, so the engine treats Raz as unparented.
 
 **This retires the recorded blocker** that FP needed the Lua exec primitive to
 learn where Raz is (notes/47, notes/48). It never did.
