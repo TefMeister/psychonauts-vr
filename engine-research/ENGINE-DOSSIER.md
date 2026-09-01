@@ -68,6 +68,44 @@ either the FP engine-native route or the level-jump automation fix. See
 
 ## 4. DRM / anti-debug & injection foothold
 
+### ⚠️ A public loader for this exact build exists — Astralathe. DO NOT install it into the working folder yet. (`/gr`, folded 2026-09-01)
+
+**Astralathe** (Jill / `scrunguscrungus`, GitLab) is *"an all-in-one mod loader, debugging tool, API
+extender and patcher for Psychonauts"*, in beta, targeting **the same modern digital release we inject
+into with a `d3d9.dll` proxy**. `[reported 2026-09-01]` Its published feature list includes an
+**in-game Lua console**, the game's **native level select and debug menu**, **restored debug rendering
+functions**, engine bugfixes and widescreen support. PsychoRando and a Psychonauts Archipelago
+integration are both built on it and current.
+
+**🚨 The safety issue, and why this is a warning rather than a recommendation: which file it hooks is
+UNREAD.** Its GitLab repo and wiki render client-side and returned empty page shells to every
+automated fetch. **If it also wraps `d3d9.dll`, running it alongside our proxy is a direct conflict**;
+if it uses a different seam, that is itself worth knowing. Ten minutes in a browser settles it, and
+that has not happened. **Its licence is unread for the same reason, so nothing from it may be reused
+or referenced in our code until someone looks.**
+
+Under this project's own rules it is a **third-party non-tool mod**: study the method and reimplement
+in our own words, never rebuild from its files. The safe use is as an **observation instrument on a
+separate copy of the game**.
+
+**What it bears on:** the Lua-exec primitive (already made unnecessary for the FP work by notes/69's
+direct pointer chain — but a working public Lua console exists, worth knowing before more effort goes
+into building one); the dormant debug menu, which
+`external-research/topics/2026-08-24-debug-menu-and-octree-culling.md` still lists as *"live test in
+progress"* and which Astralathe claims as shipped and working; and §8, where "restored debug rendering
+functions" would make a pass inventory cheap.
+
+### ✅ Free with the queued `playerpos` run: measure the eye height instead of guessing it
+
+`status/psychonauts-vr.md` records *"Height default 60 is a guess — unit scale is recorded nowhere."*
+No public source documents Psychonauts' unit scale — the modding scene's published work is file
+formats (`.ppf`, `.plb`), not coordinate conventions. **But the scale is not needed.** The deployed
+build already prints the camera position, and now the player position too. **On flat ground the
+up-axis difference between them IS the engine's own eye height, in its own units — measured rather
+than guessed, and needing no conversion to be correct.** Record both during the already-queued
+`playerpos` run; it costs nothing extra and retires the guess.
+
+
 - **No DRM, no anti-tamper, no anti-debug** observed (confirmed live,
   notes/04). This is a plain Steamworks-integrated build (achievements/cloud
   saves), not copy protection.
