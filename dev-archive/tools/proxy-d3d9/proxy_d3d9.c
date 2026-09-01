@@ -2995,6 +2995,67 @@ static void *AutoGetCamera(void)
     return ((void *(__thiscall *)(void *))0x4FA5A0)(engine);
 }
 
+/* ===================================================================== *
+ * notes/69: RAZ'S WORLD POSITION, WITHOUT LUA AND WITHOUT A SINGLE CALL.
+ * [inferred-static 2026-09-01, n=3 corroborating call sites] - NOT yet live.
+ *
+ * The FP sub-project has been recorded as blocked on "get Raz's position"
+ * since notes/47, on the assumption it needed the Lua exec primitive plus
+ * GetBoneWorldPosition. Static decode of the binding impls shows it needs
+ * neither: GetPlayerPosition_impl (0x005C1CE0) is fifteen instructions and
+ * does nothing but walk three pointers off a global the proxy ALREADY
+ * dereferences for the camera (0x0078BC20):
+ *
+ *     engine = *(void **)0x0078BC20            <- same global as AutoGetCamera
+ *     player = *(void **)(engine + 0x818C)
+ *     obj    = *(void **)(player + 0x10)
+ *     pos    = (float *)(obj + 0x40)           <- x, y, z, contiguous
+ *
+ * The +0x818C player object is corroborated by three independent bindings
+ * that all reach it the same way: GetPlayerPosition (0x005C1CE0),
+ * GetPlayerLSO (0x005C0BD0) and IsRazZLocked (0x005B6CB0). The +0x10 -> +0x40
+ * position tail is from GetPlayerPosition alone, so that half is n=1 and is
+ * the part to distrust first if the numbers look wrong.
+ *
+ * This is READ-ONLY and calls nothing, so it is safe from the render-path
+ * hook under the same rule the rest of the harness follows.
+ *
+ * Head bone, for when a bone-exact eye replaces the fixed height below:
+ * Raz's rig names are in the exe - "headJA_1" (0x00703F94, used as a node
+ * name via a __thiscall(node, name) at 0x0043CA90), "headJEnd_1", "spineJC_1",
+ * "handJEndLf_2" (the default attach bone in AttachInventoryEntityToPlayer).
+ * The lookup is __thiscall 0x00438B70(entity, name) -> bone, then
+ * __thiscall 0x00492B70(bone, float out[16]) for its matrix. Not wired yet:
+ * a fixed eye height is enough to make FP testable, and the bone route can
+ * be added once the cheap version is confirmed in a headset. */
+#define PSY_PLAYER_OFFSET    0x818C
+#define PSY_PLAYEROBJ_OFFSET 0x10
+#define PSY_PLAYERPOS_OFFSET 0x40
+
+/* A pointer we are about to walk came from game memory, so validate it rather
+ * than trusting it: a null or obviously bogus value during a level load would
+ * otherwise crash the game from the render path. */
+static BOOL PsyPtrLooksSane(const void *p)
+{
+    ULONG_PTR v = (ULONG_PTR)p;
+    return v >= 0x00010000 && v < 0x7FFF0000 && (v & 3) == 0;
+}
+
+static BOOL PsyGetPlayerPos(float out[3])
+{
+    char *engine, *player, *obj;
+
+    engine = *(char **)0x78BC20;
+    if (!PsyPtrLooksSane(engine)) return FALSE;
+    player = *(char **)(engine + PSY_PLAYER_OFFSET);
+    if (!PsyPtrLooksSane(player)) return FALSE;
+    obj = *(char **)(player + PSY_PLAYEROBJ_OFFSET);
+    if (!PsyPtrLooksSane(obj)) return FALSE;
+
+    memcpy(out, obj + PSY_PLAYERPOS_OFFSET, sizeof(float) * 3);
+    return TRUE;
+}
+
 /* notes/67: the camera's WORLD matrix, found by dumping the camera object and
  * diffing it across a camera turn (2026-08-27):
  *
@@ -3312,6 +3373,65 @@ static void PsyBasisFollowHead(void *cam)
     PsyApplyBasisYaw(cam, g_headYawDeg * g_camFollowScale);
 }
 
+/* ===================================================================== *
+ * notes/69: FIRST PERSON ON THE CAMERA OBJECT (fpcam), not on the render
+ * transform. UNTESTED - built on the dev PC, never yet run.
+ *
+ * The existing PSYVR_FIRST_PERSON path composes a translation into the
+ * register-6 WVP upload. notes/68 proved that layer is POST-culling: it moves
+ * the picture, not the camera, so the engine still culls for wherever the
+ * chase camera was. That is almost certainly why notes/51-53 recorded "zero
+ * visible eye movement" from an FP path that looked correct on paper, and it
+ * is why the black void survives it.
+ *
+ * This is the rebuild §1 of the status board asks for: put the eye where Raz
+ * is by writing the two fields that ARE pre-culling inputs and are both now
+ * known-writable -
+ *
+ *   position    camera+0x08   (already exercised by campos/camhold)
+ *   orientation camera+0x150  (the basis, already exercised by camfollow)
+ *
+ * so head yaw and the eye position both land before the engine culls.
+ *
+ * Deliberately kept to a FIXED eye height rather than the head bone. The bone
+ * route is fully mapped above and costs one more call chain, but a fixed
+ * height is enough to answer the only question that matters first: does the
+ * engine cull correctly for a camera parked inside the player? Adding the
+ * bone before knowing that would risk attributing a bone bug to the camera.
+ *
+ * Height/forward defaults are GUESSES in world units, hence both are live
+ * commands: Raz is a child, the game's unit scale is not established anywhere
+ * in the notes, and a respawn is ~26000 units of travel (notes/67), so the
+ * scale is large. Tune in the headset, do not trust these numbers. */
+static int   g_fpCamOn      = 0;
+static float g_fpCamHeight  = 60.0f;  /* along the world up axis, from Raz's origin */
+static float g_fpCamForward = 0.0f;   /* along camera forward, to clear the head mesh */
+static int   g_fpCamUpAxis  = 2;      /* 0=X 1=Y 2=Z. notes/68: the camera world
+                                       * matrix's right vector reads Z=0 exactly,
+                                       * which puts world up on Z - but the dossier
+                                       * warns levels do not all share an up axis,
+                                       * so this stays selectable. */
+
+static void PsyFirstPersonCam(void *cam)
+{
+    float p[3], fwd[3];
+
+    if (!PsyGetPlayerPos(p)) return;   /* loading / menu: leave the camera alone */
+
+    if (g_fpCamUpAxis >= 0 && g_fpCamUpAxis <= 2)
+        p[g_fpCamUpAxis] += g_fpCamHeight;
+
+    if (g_fpCamForward != 0.0f) {
+        PsyGetLookDir(cam, fwd);
+        p[0] += fwd[0] * g_fpCamForward;
+        p[1] += fwd[1] * g_fpCamForward;
+        p[2] += fwd[2] * g_fpCamForward;
+    }
+
+    memcpy((char *)cam + PSY_CAM_POS_OFFSET, p, sizeof(float) * 3);
+    *((unsigned char *)cam + PSY_CAM_DIRTY_OFFSET) |= 1;
+}
+
 static float g_camYawDeg = 0.0f;   /* 0 = off */
 
 /* notes/68: WHERE the yaw write lands, which is the whole ballgame.
@@ -3403,6 +3523,15 @@ static void ApplyCameraYaw(void)
     if (g_lookHold) {
         void *lc = AutoGetCamera();
         if (lc) PsySetLookDir(lc, g_lookHoldDir[0], g_lookHoldDir[1], g_lookHoldDir[2]);
+    }
+
+    /* notes/69: first person on the camera object. Applied HERE, at BeforeEye1,
+     * for exactly the reason the look-direction hold is: the automation tick
+     * runs from AfterBoth, one frame too late and after culling. Runs before
+     * the yaw block so head-follow rotates the camera we just moved. */
+    if (g_fpCamOn) {
+        void *fc = AutoGetCamera();
+        if (fc) PsyFirstPersonCam(fc);
     }
 
     /* notes/68 part 3: head-follow takes precedence over the manual test yaw. */
@@ -3860,6 +3989,51 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> camera yaw = %.1f deg (0 = off), site %d", cmd, a, g_camYawSite);
         } else {
             LogLine("Auto: END   \"%s\" -> FAILED (expected: camyaw <degrees>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "playerpos", 9) == 0) {
+        /* notes/69: report Raz's world position straight off the pointer chain.
+         * Run this FIRST on the next launch - it is the one-command check that
+         * the statically-derived chain is real. Sanity test: the numbers must
+         * move when Raz walks and must NOT move when only the camera turns. */
+        float pp[3];
+        if (PsyGetPlayerPos(pp))
+            LogLine("Auto: END   \"%s\" -> player %.2f %.2f %.2f", cmd, pp[0], pp[1], pp[2]);
+        else
+            LogLine("Auto: END   \"%s\" -> FAILED (no player object; loading or menu?)", cmd);
+
+    } else if (_strnicmp(cmd, "fpcam ", 6) == 0) {
+        /* notes/69: first person by moving the CAMERA (pre-culling), not the
+         * render transform (post-culling, which notes/68 refuted). */
+        g_fpCamOn = (cmd[6] == '1');
+        LogLine("Auto: END   \"%s\" -> fpcam = %d (height %.1f on axis %d, forward %.1f)",
+                cmd, g_fpCamOn, g_fpCamHeight, g_fpCamUpAxis, g_fpCamForward);
+
+    } else if (_strnicmp(cmd, "fpheight ", 9) == 0) {
+        if (sscanf(cmd + 9, "%f", &a) == 1 && a >= -500.0f && a <= 500.0f) {
+            g_fpCamHeight = a;
+            LogLine("Auto: END   \"%s\" -> fp eye height = %.1f wu", cmd, a);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: fpheight <-500..500>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "fpforward ", 10) == 0) {
+        if (sscanf(cmd + 10, "%f", &a) == 1 && a >= -500.0f && a <= 500.0f) {
+            g_fpCamForward = a;
+            LogLine("Auto: END   \"%s\" -> fp forward offset = %.1f wu", cmd, a);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: fpforward <-500..500>)", cmd);
+        }
+
+    } else if (_strnicmp(cmd, "fpaxis ", 7) == 0) {
+        /* The dossier warns this engine's levels do not share one up axis, so
+         * the height axis is a runtime choice rather than a build-time guess. */
+        int ax = cmd[7] - '0';
+        if (ax >= 0 && ax <= 2) {
+            g_fpCamUpAxis = ax;
+            LogLine("Auto: END   \"%s\" -> fp up axis = %d (0=X 1=Y 2=Z)", cmd, ax);
+        } else {
+            LogLine("Auto: END   \"%s\" -> FAILED (expected: fpaxis <0|1|2>)", cmd);
         }
 
     } else if (_strnicmp(cmd, "camfollow ", 10) == 0) {
