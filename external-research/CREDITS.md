@@ -30,6 +30,11 @@ ourselves, plus third-party components whose licenses permit redistribution
 | dinput8-hook (minimal DirectInput hook reference) | fiki574 | https://github.com/fiki574/dinput8-hook |
 | "Psi-Epilepsy: Fixing Object Pop-In and Refresh Rate Bugs" guide | Steam Community guide author | https://steamcommunity.com/sharedfiles/filedetails/?id=841015059 |
 | AMD flickering-fix forum thread | GOG.com forum community | https://www.gog.com/forum/psychonauts/solution_resolving_flickering_issues_on_amd_cards |
+| Astralathe (mod loader / debugging tool / API extender for Psychonauts — in-game Lua console, native debug menu, level select, restored debug rendering) | Jill (`scrunguscrungus`) | https://gitlab.com/scrunguscrungus/astralathe |
+| PsychonautsStudio (file-format tools and serialization logs for all Psychonauts versions, MIT) | RayCarrot | https://github.com/RayCarrot/PsychonautsStudio |
+| PsychoRando (Psychonauts randomiser, built on Astralathe) | Akashortstack and contributors | https://github.com/Akashortstack/PsychoRando |
+| Psychonauts Archipelago integration (evidence of deep programmatic reach into the live game) | Akashortstack and contributors | https://github.com/Akashortstack/Psychonauts-AP-Integration |
+| Psychonauts Explorer file-format notes (`.ppf` level pack files, `.plb` scene/model files) | Quick and Easy Software | https://quickandeasysoftware.net/readmes/PsychonautsExplorerHelp/psychonautsfiles.htm |
 
 Development on this project is AI-assisted: much of the research, code, and
 documentation was produced with **Claude (Anthropic)** (https://claude.com)
