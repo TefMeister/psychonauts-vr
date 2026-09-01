@@ -222,7 +222,8 @@ we've exercised:
 | `SetCameraOrientation` | `0x005691C0` | Direct camera orientation control |
 | `AttachCameraToEntity` | (in the 1129-binding table, `tools/lua-bindings.def`) | Camera-follows-entity mode |
 | `SetEntityCameraAlphaRadius` | ″ | Fade an entity near-camera (candidate for hiding Raz's head mesh in FP) |
-| `GetBoneWorldPosition` | `0x005B1630` (shim) / `0x005B1690` (impl) | Query a bone's world position — the clean source of Raz's head/shoulder position for FP, once Lua exec works |
+| `GetBoneWorldPosition` | `0x005B1630` (shim) / `0x005B1690` (impl) | Query a bone's world position. **Fully decoded statically, notes/69 (2026-09-01) — needs no Lua exec.** Returns **six** values: world position *and* euler orientation. Chain: `__thiscall 0x00438B70(ent, name)` (or `0x00438F30(ent, id)`) -> bone, then `__thiscall 0x00492B70(bone, float[16])`, composed with `0x00433E50` and converted by `0x00692890`. |
+| `GetPlayerPosition` | `0x005C1C80` (shim) / `0x005C1CE0` (impl) | **Raz's world position with no Lua and no call at all** — see the player-pointer-chain section below. |
 | `DumpSkeletonInfo` | `0x00571F10` (shim) / `0x00571F70` (impl) | Dumps an entity's bone map. **Partially traced, session 58**: entity `+0x54` = packed bone-count bitfield `(dword>>5)&0x7FFFFFF`, `+0x5C` = bone-pointer array; per-bone records are 96 (`0x60`) bytes, layout not decoded. |
 | `SetEntityAlpha` / `SetEntityVisible` | `0x00593DA0` / `0x00593AA0` | Hide/fade an entity |
 | `SetShadowFixedDirection` etc. | (see §8) | Shadow control, untested |
@@ -294,6 +295,52 @@ should reach any of the 1129 bindings whose real work is field writes or a
 `__thiscall` on the singleton; `GetBoneWorldPosition` (`0x005B1630`/`0x005B1690`)
 is the obvious next target, since §11 records the FP/orientation work as blocked
 waiting for exactly that.
+
+### Player pointer chain - Raz's world position, no Lua, no call (notes/69, 2026-09-01)
+
+`GetPlayerPosition_impl` (`0x005C1CE0`) is fifteen instructions and walks three
+pointers off the **same global the camera already uses**:
+
+```
+engine = *(void **)0x0078BC20
+player = *(void **)(engine + 0x818C)
+obj    = *(void **)(player + 0x10)
+pos    = (float *)(obj + 0x40)        // x, y, z contiguous
+```
+
+Read-only, calls nothing, safe from the render-path hook. Wired as `playerpos`
+and `fpcam` in the proxy; **built and deployed 2026-09-01 but NOT yet run.**
+
+* `engine + 0x818C` = the player object - `[inferred-static 2026-09-01, n=3]`,
+  corroborated by `GetPlayerPosition` (`0x005C1CE0`), `GetPlayerLSO`
+  (`0x005C0BD0`) and `IsRazZLocked` (`0x005B6CB0`), which all reach it the same way.
+* `+0x10 -> +0x40` = the position - `[inferred-static 2026-09-01, n=1]`. **Distrust
+  this half first** if the live numbers look wrong.
+
+**This retires the recorded blocker** that FP needed the Lua exec primitive to
+learn where Raz is (notes/47, notes/48). It never did.
+
+### Raz's rig bone names, straight out of `.rdata` (notes/69)
+
+`headJA_1` `0x00703F94` - `HeadJA_1` `0x00707FA4` - `headJEnd_1` `0x0070D828` -
+`spineJC_1` `0x00704E60` - `handJEndLf_2` `0x0071195C` - `handJEndRt_1`
+`0x0070E5F0` - `bubbleJC_1` `0x00713D00`.
+
+`handJEndLf_2` is the default attach bone `AttachInventoryEntityToPlayer` falls
+back to (`0x005B0D6A`), which is what makes these real rig names rather than
+unrelated strings. `[inferred-static 2026-09-01, n=1 per name]` - none resolved
+against a live skeleton. **This retires the notes/48 claim that learning Raz's
+rig needed a live `DumpSkeletonInfo` session.**
+
+### Correction to the binding ABI table (notes/69)
+
+`0x006AEF20` was recorded as "get arg 0 / self". **It is `lua_gettop(L)` - the
+argument count**: nine instructions computing `(L->top - L->base) >> 3` over an
+8-byte Lua 4 TObject. Read as "self", the optional-argument branches in these
+bindings (`cmp argc, 3`) are incomprehensible. Also mapped: `0x005B01B0` = arg ->
+script object (the layer above `0x005B01E0`'s native node), `0x006AF600` =
+`lua_pushnumber`, `0x006AF650` = push bool, `0x006AFB00` = push int/handle. The
+**impl is always shim + 0x60** in this build.
 
 **✅ LIVE-VERIFIED 2026-08-27, first try, in a real level.** Reading returns
 plausible world coordinates; writing moves the camera; the new position holds;
