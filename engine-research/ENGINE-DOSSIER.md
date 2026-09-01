@@ -314,8 +314,11 @@ and `fpcam` in the proxy; **built and deployed 2026-09-01 but NOT yet run.**
 * `engine + 0x818C` = the player object - `[inferred-static 2026-09-01, n=3]`,
   corroborated by `GetPlayerPosition` (`0x005C1CE0`), `GetPlayerLSO`
   (`0x005C0BD0`) and `IsRazZLocked` (`0x005B6CB0`), which all reach it the same way.
-* `+0x10 -> +0x40` = the position - `[inferred-static 2026-09-01, n=1]`. **Distrust
-  this half first** if the live numbers look wrong.
+* `+0x10 -> +0x40` = the position - `[inferred-static 2026-09-01, n=2]`. **Upgraded
+  from n=1 on review the same day:** `GetPlayerDist` (`0x005C0920`) walks the identical chain and
+  then uses those three floats as a POSITION in a distance computation against another entity.
+  That corroborates the *meaning*, not just the offsets, which is stronger than a second identical
+  read would have been.
 
 **This retires the recorded blocker** that FP needed the Lua exec primitive to
 learn where Raz is (notes/47, notes/48). It never did.

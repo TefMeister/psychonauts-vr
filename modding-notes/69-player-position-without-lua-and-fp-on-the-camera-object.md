@@ -29,11 +29,17 @@ That is the **entire** function apart from three `lua_pushnumber` calls. No Lua 
 call, no VM re-entrancy risk — a read-only pointer walk that is safe from the render-path hook
 under the same rule the rest of the harness follows.
 
-**Confidence.** The player object at `engine+0x818C` is `[inferred-static 2026-09-01, n=3]` —
-three independent bindings reach it identically: `GetPlayerPosition` (`0x005C1CE0`),
-`GetPlayerLSO` (`0x005C0BD0`), `IsRazZLocked` (`0x005B6CB0`). The `+0x10 → +0x40` position tail is
-`[inferred-static 2026-09-01, n=1]` — `GetPlayerPosition` alone. **If the numbers look wrong live,
-distrust the tail first.** Nothing here is verified against a running game.
+**Confidence.** The player object at `engine+0x818C` is `[inferred-static 2026-09-01, n=4]` — four
+independent bindings reach it identically: `GetPlayerPosition` (`0x005C1CE0`), `GetPlayerLSO`
+(`0x005C0BD0`), `IsRazZLocked` (`0x005B6CB0`), and `GetPlayerDist` (`0x005C0920`), the last added on
+a review pass the same day.
+
+The `+0x10 → +0x40` position tail is `[inferred-static 2026-09-01, n=2]`. It was first recorded as
+n=1 (`GetPlayerPosition` alone); the review pass found that **`GetPlayerDist` walks the identical
+chain and then uses those three floats as a POSITION in a distance computation against another
+entity.** That is a second *independent use* consistent with the meaning, which is better evidence
+than a second identical read would have been — it corroborates what the field IS, not just where it
+sits. Still nothing here is verified against a running game.
 
 ## 2. `GetBoneWorldPosition` fully decoded — and it returns six values, not three
 
