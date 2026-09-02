@@ -374,6 +374,51 @@ and `fpcam` in the proxy; **built and deployed 2026-09-01 but NOT yet run.**
   `+0x40` is LOCAL and equals world only for an unparented node `[inferred-static 2026-09-01, n=1]`;
   `GetPlayerPosition_impl` reads it with no parent check, so the engine treats Raz as unparented.
 
+* **`engine + 0x818C` upgraded to n=5, two of them independent of us (2026-09-02).** `/gr` reports
+  Astralathe's source names `GameApp::pPlayer` at byte 33164 = `0x818C` `[reported 2026-09-02]` — an
+  independent reader arriving at the same offset from a different direction. And a fifth in-binary
+  sighting turned up while decoding the bone route (notes/73): `AttachInventoryEntityToPlayer`'s impl
+  **defaults its target entity to `*(*(0x0078BC20) + 0x818C)`** at `0x005B0DC9` when the optional
+  argument is omitted — i.e. the engine's own idea of "the player" is exactly our chain's first two
+  steps. `[inferred-static 2026-09-02]`
+
+### The `+0xB8` parent caveat — narrowed hard, 2026-09-02 (`/pd`, static)
+
+The one-line caveat above was the last unresolved thing about `playerpos`. Static investigation this
+pass:
+
+* **`+0xB8` IS the parent pointer, and it sits in a three-field scene-graph cluster.**
+  `[inferred-static 2026-09-02, n=3 independent uses]` — upgraded from n=1. Beyond the setter branch
+  already on record (`0x0046F1CC`, `0x0046F223`): `0x00466609–0x0046665C` transfers `[src+0xB8]` to
+  `[dst+0xB8]`, **clears the source**, then walks a `+0xC0`/`+0xBC` chain; and `0x00466E9B` sets
+  `[node+0xB8]` from a call result, sets `[node+0xBC]` from `[other+0xC0]`, then writes
+  `[[node->0xB8]+0x40]+0xC0] = node` — head-insertion into a parent's child list. So the triple reads
+  as **`+0xB8` parent · `+0xBC` next sibling · `+0xC0` first child**.
+  ⚠️ **Unresolved type ambiguity, stated rather than smoothed over:** at `0x0046F21A` the setter does
+  a `rep movsd` of 16 dwords *directly from* `[this+0xB8]`, which type-checks as "pointer to a 4x4",
+  while the child-list code dereferences `[parent+0x40]` as a pointer. Those reconcile only if
+  different classes share the offset. Not settled.
+* **⭐ THE DECISIVE ONE: the read side never composes the parent chain.**
+  `[inferred-static 2026-09-02, n=2]` `GetAbsPosition_impl` (`0x005C0C70`, 65 insns) and
+  `GetPlayerPosition_impl` (`0x005C1CE0`, 40 insns) contain **zero** references to `+0xB8`. So the
+  engine's own "absolute position" accessor **ignores the parent link entirely** — getter and setter
+  genuinely disagree (the setter converts world→local through the parent; the getter returns the raw
+  row). **Every script-facing position read in this engine already lives with this**, which means
+  `playerpos` is exactly as correct as the engine's own `GetAbsPosition` and no more wrong.
+* **Can Raz ever get a non-null parent? No evidence found; not ruled out.** `[hypothesis]` A scan of
+  `.text` for field writes to `+0xB8` found only the generic node cluster plus null-clears, and no
+  player-specific parenting path — but the attach machinery is class-generic, so it *could* apply.
+  Note the direction of the one attach path we fully decoded: `AttachInventoryEntityToPlayer` →
+  `0x00421DD0` → `0x00466DE0` reparents **the inventory item, giving it Raz as parent** — Raz does not
+  acquire a parent there. **Two false positives worth recording so nobody re-cites them:**
+  `0x0050A36B` writes a *texture* pointer at `+0xB8` (its string is
+  `workresource/textures/phatline.tga`) and `0x00440EDC` sets `+0xB0`/`+0xB4`/`+0xB8` together —
+  both different classes sharing the offset.
+* **Settled by one live reading, now wired:** the `headpos` command prints `node+0xB8` beside
+  `playerpos`. Zero while riding a moving platform, the levitation ball, or while grabbed ⇒ the
+  caveat is empirically dead. Non-zero ⇒ that is the case that would break an FP camera built on
+  this chain, and it names itself.
+
 **This retires the recorded blocker** that FP needed the Lua exec primitive to
 learn where Raz is (notes/47, notes/48). It never did.
 
@@ -388,6 +433,40 @@ back to (`0x005B0D6A`), which is what makes these real rig names rather than
 unrelated strings. `[inferred-static 2026-09-01, n=1 per name]` - none resolved
 against a live skeleton. **This retires the notes/48 claim that learning Raz's
 rig needed a live `DumpSkeletonInfo` session.**
+
+**Both string addresses re-read directly out of `.rdata` 2026-09-02** as a citation check:
+`0x00703F94` → `headJA_1`, `0x0071195C` → `handJEndLf_2`. `[inferred-static 2026-09-02, n=1 each]`
+
+### The bone world-position route, decoded (notes/73, 2026-09-02)
+
+`GetBoneWorldPosition`'s shim is `0x005B1690` (`lua-bindings.def` row
+`GetBoneWorldPosition 005B1630`). Stripped of Lua marshalling it is **four engine calls**, and it
+**returns SIX values — position AND euler**, not three:
+
+```
+bone     = FindBoneByName(owner, "headJA_1")     0x00438B70   __thiscall, ret 4
+           GetBoneMatrix(bone, boneMtx[16])      0x00492B70   __thiscall, ret 4
+ownerMtx = GetOwnerWorldMatrix(owner)            0x00438390   __thiscall, ret 0
+           MatMul(ownerMtx, worldMtx[16], boneMtx) 0x00433E50 __thiscall, ret 8
+```
+
+`[inferred-static 2026-09-02]` **Every `ret` form above was read off the binary**, so the calling
+conventions are checked rather than assumed — a mismatch would corrupt the render thread's stack
+rather than fail cleanly. `0x00433E50` is confirmed a 4×4 multiply by its float body
+(`fld [this+0x30] * [B+0xc]`, …); `0x00438B70` iterates `count = (owner[0x54] >> 5) & 0x7FFFFFF`
+over an array at `owner[0x5C]`, comparing names via `0x00492C10`.
+
+**Translation is floats 12..14** (row 3 of a row-major 4×4) — corroborated twice independently in
+this engine: the node transform (`+0x40` = row 3 of the 4×4 at `node+0x10`) and the camera world
+matrix (rows `0x90`/`0xA0`/`0xB0`, translation `0xC0`).
+
+⚠️ **What could NOT be settled statically: which object owns the bone array.** The Lua binding gets
+its owner from `0x005B01E0`, which returns `luaEntityWrapper->[0xA8]`; the attach path instead uses
+`targetEntity->[0x10]` — the same node our position chain walks. Two different accessors, and the
+player object reaching `0x00421DD0` is passed as `[entity+0x10]`. Rather than guess, the `headpos`
+command **shape-checks four candidates with pure reads** (a sane bone count at `+0x54` and a sane
+array pointer at `+0x5C`) and only calls into the engine against one that passes, reporting which
+matched. One run settles it.
 
 ### Correction to the binding ABI table (notes/69)
 
@@ -593,6 +672,22 @@ value either way. Wrong field, not wrong timing.
 
 ### Engine-side input internals (sessions 16–18, live-traced)
 
+> **Independent corroboration (`/gr`, folded 2026-09-02)** `[reported 2026-09-02]`, from
+> Astralathe's GPLv3 source; nothing copied. Our `IsKeyJustPressed 0x00405930` is the same address
+> it names `WasInputPressed(input)`, and it hooks the keyboard poll at **`0x00402CF0`**
+> (`GetKeyboardInput`), reading the same DIK-indexed array we mapped at `0x00782D78`. Two
+> independent derivations landing on the same addresses is the useful part; **none of its addresses
+> have been re-verified in our own binary**, so treat the ones we had not already found as leads.
+> Other fixed addresses it publishes, unverified here: `InitUIMenu 0x004FA2E0`,
+> `UpdateCheatCodes 0x00506CB0`, `EScriptObject::GetName 0x005CAE50`; `GameApp` fields
+> `m_cRazInvincible +0x3E`, `pUIMenu +0x8C64`, `m_bStartupComplete +0x9035`. Also
+> **`GameApp_CallFunctionf(GameApp*, EScriptVM*, const char* fn, const char* fmt, ...)`**
+> (`__fastcall`, edx unused, `55 8B EC 83 EC 08 8D 45 ? 89 45 ? 6A 00`) — the engine's own
+> call-any-Lua-binding-by-name bridge, which would be a cleaner route than raw `lua_dobuffer` if the
+> Lua path is ever needed. And a precedent worth knowing: Astralathe's console calls
+> `lua_dobuffer` **synchronously inside an `EndScene` vtable hook**, no deferral — precedent, not
+> proof, and outside a binding callback is the safe case.
+
 Full mechanism map of how this engine consumes keyboard input — useful
 context for why the harness drives menus with window-level `SendInput`
 rather than memory-forged DirectInput state:
@@ -626,6 +721,39 @@ rather than memory-forged DirectInput state:
   path. `SendInput` at the window level (above) sidesteps the question.
 
 ## 11. Dead ends & false leads (save future time)
+
+> ### ✅ THE CULL TEST HAS A NAME, AND THE HUNT FOR IT IS CLOSED AS A *LOCATION* (`/gr`, folded 2026-09-02)
+>
+> Four sessions failed to find "the cull test" and the honest conclusion at the time was that
+> there might not be a single 6-plane frustum function to find. Both halves of that turn out to
+> be right, and the reason is now known. All `[reported 2026-09-02]` from `/gr` (Astralathe's
+> GPLv3 source and PsychoPortal's level-format work; nothing copied, neither is installed):
+>
+> - **The per-object visibility decision is `ECamera::BoxVisible(EBox3 box /*by value*/,
+>   void* pVisCache, bool)`**, `__thiscall`, prologue
+>   `55 8B EC 83 EC 28 89 4D ? 8B 45 ? 8A 88 ? ? ? ?`. Sibling:
+>   `ECamera::CalculateScreenDiagonal(EBox3*)` (the LOD metric),
+>   `55 8B EC 83 EC 44 89 4D ? 8B 45 ? 8B 48 ? 89 4D ? C7 45 ? 00 00 00 00`.
+>   **Not yet located in our own binary by that pattern — do that before relying on it.**
+> - **⭐ Culling has TWO gates in series, and only one of them follows the camera matrix.**
+>   The `.plb` level format ships a **`VisibilityTree` separate from the `CollisionTree` and the
+>   `NavMesh`** — an octree plus one bit-buffer per leaf, sized from `LeavesCount − 1`, i.e.
+>   **one bit per other leaf: a from-region PVS**. So the PVS gate keys on **which leaf the camera
+>   is in** (position, orientation-independent), while the frustum gate keys on the
+>   **`camera+0x150` basis** (which the 2026-08-28 yaw sweep proved).
+>   **This partly supersedes the August guess that one octree served both collision and
+>   visibility — there are two trees.**
+> - **The diagnostic that separates them, and it is cheap:** frustum culling varies *smoothly with
+>   yaw*; a PVS shows a *step change with position and none with yaw*. So **a residual void that
+>   survives every rotation is the PVS gate's signature, not a transform bug** — which is exactly
+>   the shape of the residual left after 2026-08-28 got the void from 92% to 18.5%.
+> - **Bears directly on first person vs. the free camera:** moving the eye to Raz's head is a small
+>   translation that stays inside the same leaf, so **FP is probably unaffected by the PVS gate**.
+>   A *flown* free camera is affected — outside the level the current leaf's visible set can be
+>   empty, blacking the screen for reasons that have nothing to do with the transform. Worth
+>   remembering before diagnosing a black free-camera frame as a matrix bug.
+> - `pVisCache` is plausibly the decoded current-leaf visible set, cached between per-object calls
+>   `[hypothesis]`; cheap check is whether the pointer is stable while the camera is still.
 
 - **Direct camera ORIENTATION control (2026-08-27)** — refuted two different
   ways, and the pair is diagnostic. `camera+0x20` (what `SetCameraOrientation`'s
@@ -746,14 +874,30 @@ Phase 7+ sub-project (first-person) and beyond, not the core conversion:
   executor, if compilation succeeded). **No `lua_pushstring` is needed at
   all** — notes/50's premise that the push-side had to be found or the
   compile/run pair fully decoded turned out to be satisfiable by the second
-  option. Still open before this counts as done: (1) runtime `lua_State*`
-  capture (heap address, changes per launch — unchanged from notes/46's
-  finding), (2) thread/reentrancy safety (call from our own frame hook, not
-  from inside a binding callback), (3) a live trivial-payload test before
-  anything camera-related. This still gates the clean, engine-native fix for
-  first-person (`SetCameraPosition`/`GetBoneWorldPosition`) and everything
-  after it (hand IK, mesh hiding, shadow verification) — but the estimated
-  cost to unblock it dropped sharply. See notes/57.
+  option. Still open before this counts as done: (1) ~~runtime `lua_State*`
+  capture (heap address, changes per launch)~~ — **CLOSED STATICALLY
+  2026-09-02, see below**, (2) thread/reentrancy safety (call from our own
+  frame hook, not from inside a binding callback), (3) a live trivial-payload
+  test before anything camera-related. This still gates the clean,
+  engine-native fix for first-person (`SetCameraPosition`/`GetBoneWorldPosition`)
+  and everything after it (hand IK, hand mesh hiding, shadow verification) —
+  but the estimated cost to unblock it dropped sharply. See notes/57.
+
+  > **✅ (1) IS CLOSED: the `lua_State*` does NOT need a runtime capture.**
+  > `[inferred-static 2026-09-02, n=1 from our own binary]` `/gr` read Astralathe's
+  > source (GPLv3, nothing copied) and reported that `GameApp` embeds its
+  > `EScriptVM` at `+0x9A34`, with `lua_State*` the dword at `EScriptVM + 8` — so
+  > `L = *(void**)(*(char**)0x0078BC20 + 0x9A3C)`, provided the global really is
+  > `GameApp`. **Confirmed against our own exe, not taken on trust:** the
+  > `AttachInventoryEntityToPlayer` impl at `0x005B0E0E` does literally
+  > `mov eax, [0x78BC20]; add eax, 0x9A34` — our singleton, that exact offset, in a
+  > function we decoded independently for other reasons. `/gr` predicted the check
+  > would appear as `A1 ?? ?? ?? ?? 05 34 9A 00 00` in `SetTableValue`; it shows up
+  > in this function instead, which is a stronger result than the predicted one
+  > because it was not the place we went looking.
+  > **Not established:** that `EScriptVM+8` is the `lua_State*` — that half is still
+  > `[reported]` from Astralathe alone, and it is the half that would crash if wrong.
+  > Read it and print it before passing it to anything.
 - **Shadow pass bone-palette assumption is unverified** (§8) — projected
   shadows *may* consume the same bone overrides "for free", but this has
   never been captured live.

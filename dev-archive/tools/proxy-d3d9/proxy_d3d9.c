@@ -3060,6 +3060,138 @@ static BOOL PsyGetPlayerPos(float out[3])
     return TRUE;
 }
 
+/* ===================================================================== *
+ * notes/73: THE HEAD BONE'S WORLD POSITION - i.e. the MEASURED eye height.
+ * [inferred-static 2026-09-02] - built, never run.
+ *
+ * WHY THIS EXISTS: the board wanted eye height as camera-minus-player, and
+ * notes/71 disproved that - both the camera position (+327.8 Y) and the
+ * render eye (~149) are the height of a THIRD-PERSON camera, not an eye.
+ * Recording either would have baked a wrong constant into the FP work at
+ * exactly the spot where fpheight's default of 60 is already a flagged guess.
+ * The head bone gives it with no third-person camera in the path and no
+ * unit-scale conversion: headWorldPos - playerPos IS the eye height, in the
+ * engine's own units.
+ *
+ * DECODED FROM GetBoneWorldPosition's Lua binding (shim 0x005B1690, the
+ * `GetBoneWorldPosition' row of lua-bindings.def). Stripped of marshalling it
+ * is four engine calls, and the shim returns SIX values - position AND euler,
+ * which is where the "returns 3 floats" reading in earlier notes was wrong:
+ *
+ *     owner = <the object that owns the bone array>
+ *     bone  = FindBoneByName(owner, "headJA_1")      0x00438B70  ret 4
+ *     GetBoneMatrix(bone, boneMtx[16])               0x00492B70  ret 4
+ *     ownerMtx = GetOwnerWorldMatrix(owner)          0x00438390  ret 0
+ *     MatMul(ownerMtx, worldMtx[16], boneMtx)        0x00433E50  ret 8
+ *
+ * Every one of those four ret forms was read off the binary, so the __thiscall
+ * signatures below are checked, not assumed - a stack-convention mismatch here
+ * would corrupt the render thread's stack rather than fail cleanly.
+ *
+ * ⚠️ NOT read-only, unlike playerpos - say so rather than inherit playerpos's
+ * safety claim. 0x00438390 branches on flag bits at owner+0x94 across 143
+ * instructions, which is the shape of a lazy "recompute the world transform if
+ * dirty, then cache it" accessor, so calling it can WRITE engine state. That is
+ * what the engine itself does every time a script asks for a bone position, so
+ * it is not novel - but it is a different risk class from the pure pointer walk
+ * in PsyGetPlayerPos, and it is why this is a MANUAL one-shot command rather
+ * than anything that runs per frame.
+ *
+ * Translation is floats 12..14 (row 3 of a row-major 4x4). That layout is
+ * corroborated twice independently in this engine: notes/70's node transform
+ * (+0x40 = row 3 of the 4x4 at node+0x10) and the camera world matrix (rows
+ * 0x90/0xA0/0xB0, translation 0xC0 = +0x30 from row 0).
+ *
+ * "headJA_1" is passed as the exe's OWN string constant at 0x00703F94 rather
+ * than a literal of ours, so the comparison inside the lookup sees exactly the
+ * bytes the engine shipped. Verified by reading .rdata at that address; the
+ * sibling default attach bone at 0x0071195C reads "handJEndLf_2", which is the
+ * cross-check that these are real rig names and not a coincidental hit.
+ *
+ * ============================= THE UNKNOWN =============================
+ * WHICH object owns the bone array could NOT be settled statically, and this
+ * command is built to answer that safely rather than to assume it:
+ *   - the Lua binding gets its owner from 0x005B01E0, which returns
+ *     luaEntityWrapper->[0xA8];
+ *   - the attach path (AttachInventoryEntityToPlayer, whose default target IS
+ *     our player at engine+0x818C) instead uses targetEntity->[0x10] - the same
+ *     node our position chain walks.
+ * Those are two different accessors, so rather than guess, the probe below
+ * SHAPE-CHECKS each candidate with pure reads before calling anything into the
+ * engine: 0x00438B70 needs count = (owner[0x54] >> 5) & 0x7FFFFFF and an array
+ * pointer at owner[0x5C], so a candidate that does not decode to a sane count
+ * and a sane pointer is never passed to it. All the guessing is therefore
+ * read-only; the engine calls only ever run against a plausible object.
+ * The command reports WHICH candidate matched, so one run settles it.
+ * ===================================================================== */
+#define PSY_BONECOUNT_OFFSET 0x54
+#define PSY_BONEARRAY_OFFSET 0x5C
+#define PSY_NODE_PARENT_OFFSET 0xB8
+
+typedef void  *(__thiscall *PsyFindBone_t)(void *owner, const char *name);
+typedef float *(__thiscall *PsyBoneMatrix_t)(void *bone, float *out16);
+typedef float *(__thiscall *PsyOwnerWorldMtx_t)(void *owner);
+typedef float *(__thiscall *PsyMatMul_t)(void *matA, float *out16, const float *matB);
+
+/* Read-only shape test for "does this object own a bone array?", mirroring
+ * exactly what 0x00438B70 will do with it. Pure reads - safe to run on a
+ * candidate that turns out to be the wrong class. */
+static BOOL PsyLooksLikeBoneOwner(const char *obj, unsigned *outCount)
+{
+    unsigned count;
+    const char *arr;
+
+    if (!PsyPtrLooksSane(obj)) return FALSE;
+    count = (*(const unsigned *)(obj + PSY_BONECOUNT_OFFSET) >> 5) & 0x07FFFFFFu;
+    if (count == 0 || count > 4096) return FALSE;      /* a rig, not a coincidence */
+    arr = *(const char *const *)(obj + PSY_BONEARRAY_OFFSET);
+    if (!PsyPtrLooksSane(arr)) return FALSE;
+
+    if (outCount) *outCount = count;
+    return TRUE;
+}
+
+/* Find the bone-owning object hanging off the player, trying the candidates the
+ * static read left open, cheapest and most-likely first. Returns NULL if none
+ * shape-checks, which is a clean "not in gameplay / wrong class" answer rather
+ * than a crash. `whichOut' names the winner for the log. */
+static void *PsyFindPlayerBoneOwner(const char **whichOut, unsigned *countOut)
+{
+    char *engine, *player, *node;
+    struct { const char *name; char *obj; } cand[4];
+    int i, n = 0;
+
+    engine = *(char **)0x78BC20;
+    if (!PsyPtrLooksSane(engine)) return NULL;
+    player = *(char **)(engine + PSY_PLAYER_OFFSET);
+    if (!PsyPtrLooksSane(player)) return NULL;
+
+    cand[n].name = "player+0x10 (node)";
+    node = *(char **)(player + PSY_PLAYEROBJ_OFFSET);
+    cand[n].obj = PsyPtrLooksSane(node) ? node : NULL;
+    n++;
+
+    cand[n].name = "player";
+    cand[n].obj  = player;
+    n++;
+
+    cand[n].name = "player+0xA8";
+    cand[n].obj  = PsyPtrLooksSane(player) ? *(char **)(player + 0xA8) : NULL;
+    n++;
+
+    cand[n].name = "player+0x10+0xA8";
+    cand[n].obj  = (node && PsyPtrLooksSane(node)) ? *(char **)(node + 0xA8) : NULL;
+    n++;
+
+    for (i = 0; i < n; ++i) {
+        if (cand[i].obj && PsyLooksLikeBoneOwner(cand[i].obj, countOut)) {
+            if (whichOut) *whichOut = cand[i].name;
+            return cand[i].obj;
+        }
+    }
+    return NULL;
+}
+
 /* notes/67: the camera's WORLD matrix, found by dumping the camera object and
  * diffing it across a camera turn (2026-08-27):
  *
@@ -4005,6 +4137,83 @@ static void AutoRunCommand(const char *cmd)
             LogLine("Auto: END   \"%s\" -> player %.2f %.2f %.2f", cmd, pp[0], pp[1], pp[2]);
         else
             LogLine("Auto: END   \"%s\" -> FAILED (no player object; loading or menu?)", cmd);
+
+    } else if (_strnicmp(cmd, "headpos", 7) == 0) {
+        /* notes/73: the MEASURED eye height. Prints, in one line each:
+         *   - which candidate object owned the bone array (the one thing the
+         *     static read could not settle - see PsyFindPlayerBoneOwner);
+         *   - the head bone's world position;
+         *   - playerpos beside it, and the difference, which IS the eye height
+         *     in engine units. Feed the up-axis figure to `fpheight'.
+         *   - node+0xB8, the parent pointer. Zero here while riding a moving
+         *     platform / the levitation ball / while grabbed is what retires
+         *     the last playerpos caveat; non-zero names the case that breaks
+         *     an FP camera built on this chain.
+         * Each stage logs BEFORE it calls into the engine, so if the game dies
+         * the log names the exact stage rather than leaving a mystery. */
+        const char *which = NULL;
+        unsigned boneCount = 0;
+        void *owner = PsyFindPlayerBoneOwner(&which, &boneCount);
+        char *engine = *(char **)0x78BC20;
+        char *player = PsyPtrLooksSane(engine) ? *(char **)(engine + PSY_PLAYER_OFFSET) : NULL;
+        char *node   = PsyPtrLooksSane(player) ? *(char **)(player + PSY_PLAYEROBJ_OFFSET) : NULL;
+
+        if (PsyPtrLooksSane(node)) {
+            void *parent = *(void **)(node + PSY_NODE_PARENT_OFFSET);
+            LogLine("Auto:       node+0xB8 (parent) = %p  %s", parent,
+                    parent ? "NON-NULL - playerpos is LOCAL to this parent, see notes/73"
+                           : "NULL - playerpos is world space here");
+        }
+
+        if (!owner) {
+            LogLine("Auto: END   \"%s\" -> FAILED (no bone-owning object off the player; "
+                    "loading, a menu, or none of the four candidates shape-checked)", cmd);
+        } else {
+            float boneMtx[16], worldMtx[16], pp[3];
+            float *ownerMtx, *world;
+            void *bone;
+
+            LogLine("Auto:       bone owner = %s (%p), %u bones", which, owner, boneCount);
+            LogLine("Auto:       calling FindBoneByName(owner, \"headJA_1\") @0x00438B70");
+            bone = ((PsyFindBone_t)0x00438B70)(owner, (const char *)0x00703F94);
+            if (!bone) {
+                LogLine("Auto: END   \"%s\" -> FAILED (owner shape-checked but has no "
+                        "\"headJA_1\" bone - wrong object, or a rig without that name)", cmd);
+            } else {
+                LogLine("Auto:       bone = %p; calling GetBoneMatrix @0x00492B70", bone);
+                memset(boneMtx, 0, sizeof(boneMtx));
+                ((PsyBoneMatrix_t)0x00492B70)(bone, boneMtx);
+
+                LogLine("Auto:       calling GetOwnerWorldMatrix @0x00438390");
+                ownerMtx = ((PsyOwnerWorldMtx_t)0x00438390)(owner);
+
+                if (!PsyPtrLooksSane(ownerMtx)) {
+                    /* No owner transform: the bone matrix is the best we have.
+                     * Say so rather than silently reporting local coordinates
+                     * as if they were world space. */
+                    LogLine("Auto: END   \"%s\" -> bone-LOCAL only (owner world matrix "
+                            "unavailable) trans %.2f %.2f %.2f - NOT an eye height",
+                            cmd, boneMtx[12], boneMtx[13], boneMtx[14]);
+                } else {
+                    LogLine("Auto:       calling MatMul @0x00433E50");
+                    memset(worldMtx, 0, sizeof(worldMtx));
+                    world = ((PsyMatMul_t)0x00433E50)(ownerMtx, worldMtx, boneMtx);
+                    if (!PsyPtrLooksSane(world)) world = worldMtx;
+
+                    LogLine("Auto:       head world %.2f %.2f %.2f", world[12], world[13], world[14]);
+                    if (PsyGetPlayerPos(pp)) {
+                        LogLine("Auto: END   \"%s\" -> head %.2f %.2f %.2f | player %.2f %.2f %.2f "
+                                "| EYE HEIGHT dx %.2f dy %.2f dz %.2f (up axis is Y per notes/71; "
+                                "feed that to fpheight)", cmd,
+                                world[12], world[13], world[14], pp[0], pp[1], pp[2],
+                                world[12] - pp[0], world[13] - pp[1], world[14] - pp[2]);
+                    } else {
+                        LogLine("Auto: END   \"%s\" -> head %.2f %.2f %.2f (no playerpos to "
+                                "difference against)", cmd, world[12], world[13], world[14]);
+                    }
+                }
+            }
+        }
 
     } else if (_strnicmp(cmd, "fpcam ", 6) == 0) {
         /* notes/69: first person by moving the CAMERA (pre-culling), not the
