@@ -144,6 +144,13 @@ than guessed, and needing no conversion to be correct.** Record both during the 
   twice by re-invoking the engine's own top-level render function" is exactly
   the playbook's §5.1 "re-execute recorded work once per eye" pattern, just
   without command lists — CandB *is* the re-invocable unit.
+  **✅ 2026-09-02 (`/pd`, static signature scan, NO LAUNCH): CandB has an engine name.** Astralathe's
+  `GameApp_RenderFrame` signature (`55 8B EC 83 EC 20 89 4D ? 68 ? ? ? ? FF 15`) has exactly one
+  match at `0x004FEDA0` — CandB's own address, independently identified by multiple live sessions
+  before this. `[inferred-static 2026-09-02, n=1 signature match at a previously-independently-
+  identified address]` **CandB is `GameApp_RenderFrame`**, not an inner helper of it — this confirms
+  (rather than assumes) that this mod's whole camera/void/automation stack is hooked on the engine's
+  own top-level per-frame entry point. Detail: `modding-notes/74-…` §3.
 - `IDirect3DDevice9::Present` fires once per real frame; our hook there does
   the eye-composite (StretchRect both private surfaces into the real
   backbuffer side-by-side) and, when the VR submit path is enabled, pumps
@@ -335,6 +342,15 @@ void  *cam = GetCamera(mgr);            /* __thiscall void* @ 0x004FA5A0 */
 
 `SetCameraOrientation` (`0x00569220`) is the same shape, writing a matrix to
 `camera+0x20` via the converter.
+
+**✅ 2026-09-02 (`/pd`, static signature scan, NO LAUNCH): `get camera` (`0x004FA5A0`) re-verified
+byte-for-byte against Astralathe's `GameApp_GetMainChannel` signature** (one match, same address) —
+the engine's own name suggests it exposes camera *channels*, plural (main/cutscene/first-person?),
+of which this is only the main one. `[inferred-static 2026-09-02, n=1 signature match, corroborating
+a pre-existing independent reading]` Also located while scanning: **`GameApp_CallFunctionf`**
+(`__fastcall`, call any of the 1,129 Lua bindings by name with printf-style args, no marshalling) at
+**`0x005CEC10`** — new, not previously in this dossier, and not yet exercised. Detail:
+`modding-notes/74-boxvisible-located-and-three-astralathe-signatures-confirmed.md` §2.
 
 **Consequence:** free camera movement — the project's stated North-Star-adjacent
 goal — needs **no Lua interpreter and no `0x6B0C00`**. The same two-layer trick
@@ -734,7 +750,20 @@ rather than memory-forged DirectInput state:
 >   `55 8B EC 83 EC 28 89 4D ? 8B 45 ? 8A 88 ? ? ? ?`. Sibling:
 >   `ECamera::CalculateScreenDiagonal(EBox3*)` (the LOD metric),
 >   `55 8B EC 83 EC 44 89 4D ? 8B 45 ? 8B 48 ? 89 4D ? C7 45 ? 00 00 00 00`.
->   **Not yet located in our own binary by that pattern — do that before relying on it.**
+>   **✅ LOCATED 2026-09-02 (`/pd`, static signature scan, NO LAUNCH): `BoxVisible` = `0x004CDC60`
+>   (unique match); `CalculateScreenDiagonal` = `0x004D03B0` (unique match).**
+>   `[inferred-static 2026-09-02, n=1 each]`. Disassembling `BoxVisible` beyond the prologue found
+>   two cross-corroborations for free: it tests **bit 4 of `camera+0x530`**, the same flags byte
+>   `SetCameraPosition` sets bit 0 of (dossier §9) — two independent sessions now agree on that
+>   field — and it reads **`engine+0xA1`**, the exact "Visibility Tree Culling" byte the 2026-08-24
+>   A/B test (notes/63) toggled to a measured null result. The disassembly shows *why* that null was
+>   real rather than a broken toggle: the flag gates only one of several branches, and the
+>   `camera+0x530` check above it can return early regardless of the flag's state. It is also
+>   **self-recursive** (calls itself once per box side via a helper at `0x4130B0`, unexamined) —
+>   note this before designing any hook, since a naive counter would double-count per recursion.
+>   Full write-up: `modding-notes/74-boxvisible-located-and-three-astralathe-signatures-confirmed.md`.
+>   **Not yet built: any hook, counter, or mitigation** — deliberately deferred, see that note's
+>   "what is NOT established" section.
 > - **⭐ Culling has TWO gates in series, and only one of them follows the camera matrix.**
 >   The `.plb` level format ships a **`VisibilityTree` separate from the `CollisionTree` and the
 >   `NavMesh`** — an octree plus one bit-buffer per leaf, sized from `LeavesCount − 1`, i.e.
@@ -895,6 +924,13 @@ Phase 7+ sub-project (first-person) and beyond, not the core conversion:
   > would appear as `A1 ?? ?? ?? ?? 05 34 9A 00 00` in `SetTableValue`; it shows up
   > in this function instead, which is a stronger result than the predicted one
   > because it was not the place we went looking.
+  > **⬆️ UPGRADED 2026-09-02 (`/pd`, static signature scan, NO LAUNCH): `n=72`, not `n=1`.**
+  > `[inferred-static 2026-09-02, n=72]` A whole-binary scan for the same operand pattern found
+  > **72 occurrences in `.text`**, and re-running with the operand *fixed* to `0x0078BC20`'s bytes
+  > matched all 72 with none eliminated. There is exactly one `GameApp` global in this binary, so
+  > every site that fetches `EScriptVM` off it necessarily encodes the same address — this is the
+  > strongest corroboration any address in this dossier has. Full scan output:
+  > `modding-notes/74-boxvisible-located-and-three-astralathe-signatures-confirmed.md` §4.
   > **Not established:** that `EScriptVM+8` is the `lua_State*` — that half is still
   > `[reported]` from Astralathe alone, and it is the half that would crash if wrong.
   > Read it and print it before passing it to anything.
