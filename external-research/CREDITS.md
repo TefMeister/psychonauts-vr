@@ -35,6 +35,11 @@ ourselves, plus third-party components whose licenses permit redistribution
 | PsychoRando (Psychonauts randomiser, built on Astralathe) | Akashortstack and contributors | https://github.com/Akashortstack/PsychoRando |
 | Psychonauts Archipelago integration (evidence of deep programmatic reach into the live game) | Akashortstack and contributors | https://github.com/Akashortstack/Psychonauts-AP-Integration |
 | Psychonauts Explorer file-format notes (`.ppf` level pack files, `.plb` scene/model files) | Quick and Easy Software | https://quickandeasysoftware.net/readmes/PsychonautsExplorerHelp/psychonautsfiles.htm |
+| Astralathe source (published offsets, signatures and calling conventions for `psychonauts.exe`, read online via the GitLab REST API, GPLv3 — studied, nothing copied) | Jill (`scrunguscrungus`) | https://gitlab.com/scrunguscrungus/astralathe |
+| Psychonauts Lua API documentation (community, work in progress) | its GitLab contributors | https://psycholuaapi.readthedocs.io/ |
+| "Psychonauts: Camera Control" (the boss-fight first-person note) | Kill Ten Rats | https://www.killtenrats.com/2011/11/10/psychonauts-camera-control/ |
+| injector (pattern-scan / hooking library Astralathe builds on; named for context only) | thelink2012 | https://github.com/thelink2012/injector |
+| PolyHook 2 (hooking library Astralathe builds on; named for context only) | Stevemk14ebr | https://github.com/stevemk14ebr/PolyHook_2_0 |
 
 Development on this project is AI-assisted: much of the research, code, and
 documentation was produced with **Claude (Anthropic)** (https://claude.com)
