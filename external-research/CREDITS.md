@@ -40,6 +40,7 @@ ourselves, plus third-party components whose licenses permit redistribution
 | "Psychonauts: Camera Control" (the boss-fight first-person note) | Kill Ten Rats | https://www.killtenrats.com/2011/11/10/psychonauts-camera-control/ |
 | injector (pattern-scan / hooking library Astralathe builds on; named for context only) | thelink2012 | https://github.com/thelink2012/injector |
 | PolyHook 2 (hooking library Astralathe builds on; named for context only) | Stevemk14ebr | https://github.com/stevemk14ebr/PolyHook_2_0 |
+| PsychoPortal (.NET library for Psychonauts' formats — the `VisibilityTree` / `CollisionTree` / `NavMesh` scene structures; read online via the GitLab REST API, nothing copied) | Jill (`scrunguscrungus`) | https://gitlab.com/scrunguscrungus/psychoportal |
 
 Development on this project is AI-assisted: much of the research, code, and
 documentation was produced with **Claude (Anthropic)** (https://claude.com)
