@@ -35,3 +35,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) — how we credit and link sources, our
 **study-everything-public but write-our-own-code** rule (we copy no one else's
 source code or files, any license or price), the terms for reusing our work
 (free, with credit), and how to request a correction or removal.
+
+## Research toolbox (things that made a source readable)
+
+- **GitLab-hosted projects render client-side**, so every automated fetch of a repo page or wiki returns an empty
+  shell that looks exactly like an empty page. **The REST API returns plain JSON and raw files:**
+  `https://gitlab.com/api/v4/projects/<id>/repository/tree?path=<dir>&recursive=true`,
+  `…/repository/files/<url-encoded path>/raw?ref=<branch>`, `…/wikis/<slug>`. Found by the modding lane on
+  2026-09-01 (Astralathe, project id `34250039`); it turned a "needs a browser" into a ten-second read.

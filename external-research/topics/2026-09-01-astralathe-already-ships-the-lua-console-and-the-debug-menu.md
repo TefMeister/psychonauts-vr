@@ -109,3 +109,24 @@ because no public source states it.)
 - https://github.com/Akashortstack/PsychoRando
 - https://github.com/Akashortstack/Psychonauts-AP-Integration/blob/main/worlds/psychonauts/docs/setup_en.md
 - https://quickandeasysoftware.net/readmes/PsychonautsExplorerHelp/psychonautsfiles.htm
+
+## ✅ Outcome — assessed from its source by the modding lane, 2026-09-01 (home PC, `/pd`)
+
+All three "needs ten minutes in a browser" unknowns are answered, and no browser was needed: **GitLab's
+REST API returns raw files** (`/api/v4/projects/34250039/repository/files/<url-encoded path>/raw?ref=master`)
+even though the web UI renders client-side. Full write-up: `modding-notes/70-…` §2.
+
+- **Injection file: `dsound.dll`**, not `d3d9.dll` — it forwards twelve DirectSound exports and loads
+  `Astralathe.dll` only when the process is `psychonauts.exe`. Shipped set has **no `d3d9.dll`**, so
+  there is no filename clash with our proxy. `[reported 2026-09-01, from source]`
+- **Licence: GPLv3.** Study-only is now a legal requirement, not just our rule.
+- **Same seams, though:** it IAT-hooks `Direct3DCreate9` and `DirectInput8Create` and vtable-swaps
+  `CreateDevice`, `EndScene`/`Reset` and `GetDeviceState`/`GetDeviceData`/`SetCooperativeLevel` — the
+  slots our proxy owns. **Verdict: no file collision, a real functional one. Keep it off the working
+  install; use it on a separate copy only.** Its menu key is F10.
+- Feature claims confirmed by the tree: `ImGui/LuaPad.cpp`, `ImGui/DebugConsole.cpp`,
+  `DebugDraw/EDebugLineManager.cpp`, `EScriptVM.cpp`, `ERenderer.cpp`, `ECamera.cpp`.
+
+The "unassessed proxy-collision risk" wording above is retired. The follow-up read of its source for
+what it *knows* about the binary is a separate topic:
+`2026-09-02-astralathe-source-corroborates-the-dossier-and-fixes-the-lua-state.md`.
