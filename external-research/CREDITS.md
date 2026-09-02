@@ -40,7 +40,9 @@ ourselves, plus third-party components whose licenses permit redistribution
 | "Psychonauts: Camera Control" (the boss-fight first-person note) | Kill Ten Rats | https://www.killtenrats.com/2011/11/10/psychonauts-camera-control/ |
 | injector (pattern-scan / hooking library Astralathe builds on; named for context only) | thelink2012 | https://github.com/thelink2012/injector |
 | PolyHook 2 (hooking library Astralathe builds on; named for context only) | Stevemk14ebr | https://github.com/stevemk14ebr/PolyHook_2_0 |
-| PsychoPortal (.NET library for Psychonauts' formats — the `VisibilityTree` / `CollisionTree` / `NavMesh` scene structures; read online via the GitLab REST API, nothing copied) | Jill (`scrunguscrungus`) | https://gitlab.com/scrunguscrungus/psychoportal |
+| PsychoPortal (.NET library for Psychonauts' formats — the `VisibilityTree` / `CollisionTree` / `NavMesh` scene structures, the `Domain` / `DomainEntityInfo` / `EntityInitData` scene-graph and entity-placement records, and the `Octree` / `OctreeNode` / `OctreeLeaf` / `SSECube` spatial classes; read online via the GitLab REST API, nothing copied. **Licence: GPL-3.0 with a custom exception, Copyright (c) 2022 Jill Nesbit** — studied only) | Jill Nesbit (`scrunguscrungus`) | https://gitlab.com/scrunguscrungus/psychoportal |
+| "Psychonauts custom levels — how we got here" (the `.plb` ↔ glTF round-trip pipeline, and the evidence that the community works natively in game units) | Jill (JillCrungus) | https://cohost.org/JillCrungus/post/5742197-psychonauts-custom-l |
+| "Making Levels" (custom-level reverse-engineering write-up — model import, rigging, animation, collision and octree structures) | Jill (JillCrungus) | https://jillcrungus.com/projects/psychonauts/blog/2024/04/26/making-levels.html |
 
 Development on this project is AI-assisted: much of the research, code, and
 documentation was produced with **Claude (Anthropic)** (https://claude.com)
