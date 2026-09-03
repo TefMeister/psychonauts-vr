@@ -75,3 +75,22 @@ level can land in a leaf with an empty or wrong visible set regardless of how co
 
 - https://gitlab.com/scrunguscrungus/psychoportal — `PsychoPortal/Psychonauts/Common/Octree/{Octree,OctreeNode,OctreeLeaf}.cs`, `PsychoPortal/Psychonauts/Common/SSECube.cs`, and `Packs/MeshPack/Scene/VisibilityTree/` (read online via the GitLab REST API; nothing copied). **Licence: GPL-3.0 with a custom exception, Copyright (c) 2022 Jill Nesbit.**
 - https://jillcrungus.com/projects/psychonauts/blog/2024/04/26/making-levels.html — the same author's account of the custom-level work, which covers the octree structures among the systems that had to be understood.
+
+## ✅ Outcome 2026-09-03 — folded, now the board's `[PD]` row; ⚠️ but the cost estimate was wrong (from `inbox/`)
+
+The reasoning was accepted: "FP is probably unaffected" is downgraded to `[hypothesis]` with the two
+named numbers as its test. **But "a read of a file already in the game install" was wrong**
+`[measured 2026-09-03]`:
+
+- There are **zero loose `.plb` files** anywhere in the Psychonauts install.
+- Levels ship as **`PPAK` containers** — `WorkResource/PCLevelPackFiles/*.ppf`, 50 of them (beside 50
+  `.apf`), up to 33 MB, header magic `50 50 41 4B`, interleaving asset paths with compressed data. A
+  200 KB scan of one found no `.plb` name at all.
+
+So the real shape is *open the PPAK container → locate the level binary inside → walk to the Octree →
+read two fields*. Still `[PD]`, still no game needed, but the modding side recorded it as a
+container-format job so nobody picks it up expecting five minutes. The licensing flag carried across:
+own parsing code, or a third-party tool used *as a tool*.
+
+**That cost has since come down — see the 2026-09-03b topic:** the Steam-era `.ppf` is already
+opened by two public tools, one of them explicitly written for the re-release format.
