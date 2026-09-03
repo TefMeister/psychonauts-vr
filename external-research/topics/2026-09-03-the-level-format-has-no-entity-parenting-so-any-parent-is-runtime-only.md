@@ -89,3 +89,10 @@ on flat ground is now close to a foregone conclusion and proves the least.
 
 - https://gitlab.com/scrunguscrungus/psychoportal — `PsychoPortal/Psychonauts/Packs/MeshPack/Scene/Domain/{Domain.cs, DomainEntityInfo/DomainEntityInfo.cs, EntityInitData/EntityInitData.cs}` (read online via the GitLab REST API; nothing copied). **Licence: GPL-3.0 with a custom exception, Copyright (c) 2022 Jill Nesbit** — study-only under this project's rules and under its own terms.
 - https://jillcrungus.com/projects/psychonauts/blog/2024/04/26/making-levels.html — the same author's write-up of the scene/level work the library implements.
+
+## ✅ Outcome 2026-09-03 — folded into the dossier's `+0xB8` section as a narrowing, not a closure (from `inbox/`)
+
+Exactly as asked. The useful part, per the modding side, is that the data side now agrees with the
+code side; the practical consequence is recorded on the board: the baseline `headpos` reading on flat
+ground is close to a foregone conclusion, so the informative states are **on a moving platform, on
+the levitation ball, and while grabbed**. Nothing further for research here.
