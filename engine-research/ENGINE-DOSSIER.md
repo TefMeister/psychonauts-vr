@@ -796,15 +796,16 @@ rather than memory-forged DirectInput state:
 >     `Vec3`s) + `pVisCache` + `bUseCache`.
 >   - **⭐ The engine ships its own cull-camera override, with a public setter/getter pair.** Every
 >     reference to the global `0x788CB0` resolves: **`0x004D0DA0` = `void __cdecl Set(ECamera*)`**
->     (four instructions), **`0x004D0DB0` = the getter**, `0x004CAD80` = a `__thiscall` teardown
+>     (six instructions, two of substance), **`0x004D0DB0` = the getter**, `0x004CAD80` = a `__thiscall` teardown
 >     guard that clears it if it points at `this`, `0x004D36EF` = a level-teardown clear.
 >     **Culling from one camera while rendering from another is a built-in facility, reachable by
 >     one call and no hook.** ⚠️ Those names are *ours, describing behaviour* — the binary has no
 >     symbols — and nothing about the facility has been exercised.
->   - **Two one-bit disables, both honoured by `BoxVisible` AND by the frustum test `0x004CDB70`
->     (identical three instructions at each prologue):** `[cam+0x530]` **bit 4** clear ⇒ both return
->     "visible" immediately; `[cam+0x531]` **bit 0** clear ⇒ the PVS stage is skipped while the
->     frustum test still runs.
+>   - **Two one-bit disables — one shared, one not.** `[cam+0x530]` **bit 4** clear ⇒ *both*
+>     `BoxVisible` and the frustum test `0x004CDB70` return "visible" immediately (the identical
+>     three instructions open each). `[cam+0x531]` **bit 0** clear ⇒ the PVS stage is skipped while
+>     the frustum test still runs — ⚠️ that bit is **not** referenced anywhere in `0x004CDB70`
+>     `[measured 2026-09-03]`; it gates only the PVS stage, which lives in `BoxVisible` alone.
 >   - **The gate order, fully mapped:** delegation check → (if `bUseCache`) translate both corners →
 >     PVS gate, entered only if `[this+0x514] != -1` **and** `[cam+0x531] & 1` **and**
 >     `byte [[0x78BC20]+0xA1] != 0`, querying `0x00489A60` and caching via `0x00489C00`/`0x00489BB0`
@@ -847,7 +848,7 @@ rather than memory-forged DirectInput state:
 >     engage is a PVS symptom, not a matrix bug.
 >   - ⚠️ **The cost is higher than "a read of a file already in the install"** `[measured 2026-09-03]`:
 >     there are **zero loose `.plb` files** in the install. Levels ship as **`PPAK` containers** —
->     `WorkResource/PCLevelPackFiles/*.ppf`, 100 of them, up to 33 MB, header magic `50 50 41 4B`,
+>     `WorkResource/PCLevelPackFiles/*.ppf`, **50** of them (beside 50 `.apf`), up to 33 MB, header magic `50 50 41 4B`,
 >     interior interleaving asset paths with compressed data. The item stays `[PD]` (no game needed)
 >     but means *parse PPAK → find the level binary → walk to the Octree*, not a two-field read.
 >   - ⚠️ **Licensing:** the format is implemented by a GPL-3.0 library we may study but not copy —
