@@ -57,7 +57,7 @@ Every reference to `0x788CB0` resolves:
 
 | Address | What it is |
 |---|---|
-| `0x004D0DA0` | **`void __cdecl SetCullCamera(ECamera*)`** — four instructions: `mov eax,[ebp+8]; mov [0x788CB0],eax`. |
+| `0x004D0DA0` | **`void __cdecl SetCullCamera(ECamera*)`** — six instructions, two of substance: `mov eax,[ebp+8]; mov [0x788CB0],eax`. |
 | `0x004D0DB0` | **`ECamera* __cdecl GetCullCamera()`** — the matching getter. |
 | `0x004CAD80` | `__thiscall` teardown guard: *if the global points at `this`, clear it.* |
 | `0x004D36EF` | another clear-to-null, on level teardown. |
@@ -73,12 +73,16 @@ control flow. Whether pointing it at the player camera actually keeps the world 
 moves is **untested**, and the delegation only fires when `this` is the manager's element `[0]`, so a
 second camera may not go through this path at all.
 
-## 4. Two one-bit disables, both honoured by both functions
+## 4. Two one-bit disables — one shared, one not
 
 ```
 0x004CDC60  mov cl,[this+0x530]; shr cl,4; and cl,1; test -> if zero, return TRUE
 0x004CDB70  ... the identical three instructions at the top of the frustum test ...
 ```
+
+⚠️ Only the **first** of the two is shared. The frustum test `0x004CDB70` contains **zero**
+references to `+0x531` `[measured 2026-09-03]` — that bit gates the PVS stage, which lives only in
+`BoxVisible`.
 
 - **`[cam+0x530]` bit 4** — master cull enable. Clear it and `BoxVisible` *and* the frustum test both
   return "visible" immediately. Everything draws.
@@ -134,8 +138,9 @@ first test than any trampoline.
 from "a file already in the game install", and suggested it belongs in the `[PD]` queue. The
 reasoning is good and the item is real, but **the `.plb` is not a loose file on disk**
 `[measured 2026-09-03]`: there are zero `.plb` files in the install. Levels ship as **`PPAK`
-containers** — `WorkResource/PCLevelPackFiles/*.ppf`, 100 of them, up to 33 MB — whose headers begin
-`50 50 41 4B` and whose interior interleaves asset paths with compressed data.
+containers** — `WorkResource/PCLevelPackFiles/*.ppf`, **50** of them (beside 50 `.apf`), up to
+33 MB — whose headers begin `50 50 41 4B` and whose interior interleaves asset paths with
+compressed data.
 
 So the item stays `[PD]` (still no game needed) but the true cost is *parse the PPAK container first,
 then locate the level binary inside it, then walk to the Octree* — not a two-field read. Recorded on

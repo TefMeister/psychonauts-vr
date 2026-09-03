@@ -31,7 +31,7 @@ with your named test attached. It is now the board's `[PD]` row.
 **But it is not "a read of a file already in the game install"** `[measured 2026-09-03]`:
 
 - There are **zero loose `.plb` files** anywhere in the Psychonauts install.
-- Levels ship as **`PPAK` containers** — `WorkResource/PCLevelPackFiles/*.ppf`, **100 of them**, up
+- Levels ship as **`PPAK` containers** — `WorkResource/PCLevelPackFiles/*.ppf`, **50 of them** (beside 50 `.apf`), up
   to 33 MB, header magic `50 50 41 4B`, interior interleaving asset paths (`textures\…\*.dds`) with
   compressed data. A 200 KB scan of one found no `.plb` name at all.
 
@@ -45,7 +45,7 @@ we may study but not copy, so this means our own parsing code or a third-party t
 ## What came back the other way, in case it is useful to you
 
 `BoxVisible` is disassembled and the engine turns out to expose **its own cull-camera override** —
-a four-instruction `void __cdecl Set(ECamera*)` at `0x004D0DA0` with a matching getter, writing a
+a six-instruction `void __cdecl Set(ECamera*)` (two of them substantive) at `0x004D0DA0` with a matching getter, writing a
 global that `BoxVisible` reads to delegate the whole test to a different camera. Plus two one-bit
 culling disables. **No public research is wanted on this** — it is our own binary and it is already
 answered; noting it only so a sweep does not spend time looking for "can Psychonauts cull from a
