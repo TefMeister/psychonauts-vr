@@ -424,6 +424,22 @@ pass:
 * **Can Raz ever get a non-null parent? No evidence found; not ruled out.** `[hypothesis]` A scan of
   `.text` for field writes to `+0xB8` found only the generic node cluster plus null-clears, and no
   player-specific parenting path — but the attach machinery is class-generic, so it *could* apply.
+  * **Narrowed again 2026-09-03 (`/gr`, folded by `/pd`): the DATA side has now been checked too, and
+    the two agree.** The other way an entity could acquire a parent is by being *authored* as a child
+    in the level file — and the `.plb` format cannot express that `[reported 2026-09-03]`. `Domain`
+    (the scene-graph container) has `Children`, `Bounds`, `Meshes`, `EntityInitDatas`,
+    `DomainEntityInfos`, `RuntimeReferences` — **no parent back-reference and no transform of its
+    own**; `DomainEntityInfo` (the per-entity placement record) carries `Position`/`Rotation`/`Scale`
+    as bare `Vec3`s with **no parent, attach-to-entity or attach-to-bone field**; `EntityInitData`
+    holds only line-collision data. Entities are placed **absolutely** within a domain, so **any
+    non-null `+0xB8` is assigned at runtime, by code** — exactly the surface the 2026-09-02 `.text`
+    scan already swept.
+    ⚠️ **A narrowing, not a closure:** that is the on-disk format, not the runtime class layout, and
+    a gameplay system (lift, levitation ball, grab) could still reparent through the generic
+    machinery. The practical consequence is about *where* the queued `headpos` reading is worth
+    taking: standing still on flat ground is now close to a foregone conclusion, and **the
+    informative states are on a moving platform, on the levitation ball, and while grabbed** — which
+    is what the board already asks for. This says why those three matter more than the baseline.
   Note the direction of the one attach path we fully decoded: `AttachInventoryEntityToPlayer` →
   `0x00421DD0` → `0x00466DE0` reparents **the inventory item, giving it Raz as parent** — Raz does not
   acquire a parent there. **Two false positives worth recording so nobody re-cites them:**
@@ -762,8 +778,46 @@ rather than memory-forged DirectInput state:
 >   **self-recursive** (calls itself once per box side via a helper at `0x4130B0`, unexamined) —
 >   note this before designing any hook, since a naive counter would double-count per recursion.
 >   Full write-up: `modding-notes/74-boxvisible-located-and-three-astralathe-signatures-confirmed.md`.
->   **Not yet built: any hook, counter, or mitigation** — deliberately deferred, see that note's
->   "what is NOT established" section.
+>
+>   **✅ FULLY DISASSEMBLED 2026-09-03 (`/pd`, static, NO LAUNCH) — and the two sentences above are
+>   both `[disproved 2026-09-03]`.** `[inferred-static 2026-09-03]`
+>   Listings: `dev-archive/recon/2026-09-03-boxvisible-disassembled/`; write-up: `modding-notes/75-…`.
+>   - **The helper `0x004130B0` is a plain `Vec3 += Vec3`** (`__thiscall`, `ret 4`, returns `this`,
+>     three `fld`/`fadd`/`fstp` pairs). It has nothing to do with recursion: `BoxVisible` calls it
+>     twice, once per box **corner** (`0x4CDD11`, `0x4CDD34`), to translate the box by the camera's
+>     `Vec3` at `[this+8]`.
+>   - **The self-call is a one-shot DELEGATION, not recursion.** `0x4CDCE1` re-pushes the by-value
+>     box and calls `0x4CDC60` with `ecx = [0x788CB0]` — **a different camera object** — and only
+>     when that global is non-null, `this` is the camera manager's element `[0]`, and `this` is not
+>     already that camera. It cannot recurse without bound, so "a naive counter would double-count
+>     per recursion" was guarding against the wrong hazard. A hook still has to survive **one**
+>     re-entry.
+>   - **Signature settled:** `ret 0x20` = 24 bytes of by-value box (`[ebp+8]`…`[ebp+0x1c]`, two
+>     `Vec3`s) + `pVisCache` + `bUseCache`.
+>   - **⭐ The engine ships its own cull-camera override, with a public setter/getter pair.** Every
+>     reference to the global `0x788CB0` resolves: **`0x004D0DA0` = `void __cdecl Set(ECamera*)`**
+>     (four instructions), **`0x004D0DB0` = the getter**, `0x004CAD80` = a `__thiscall` teardown
+>     guard that clears it if it points at `this`, `0x004D36EF` = a level-teardown clear.
+>     **Culling from one camera while rendering from another is a built-in facility, reachable by
+>     one call and no hook.** ⚠️ Those names are *ours, describing behaviour* — the binary has no
+>     symbols — and nothing about the facility has been exercised.
+>   - **Two one-bit disables, both honoured by `BoxVisible` AND by the frustum test `0x004CDB70`
+>     (identical three instructions at each prologue):** `[cam+0x530]` **bit 4** clear ⇒ both return
+>     "visible" immediately; `[cam+0x531]` **bit 0** clear ⇒ the PVS stage is skipped while the
+>     frustum test still runs.
+>   - **The gate order, fully mapped:** delegation check → (if `bUseCache`) translate both corners →
+>     PVS gate, entered only if `[this+0x514] != -1` **and** `[cam+0x531] & 1` **and**
+>     `byte [[0x78BC20]+0xA1] != 0`, querying `0x00489A60` and caching via `0x00489C00`/`0x00489BB0`
+>     — **all three keyed by `[this+0x514]`, the camera's leaf index** → frustum test `0x004CDB70`
+>     last. Nothing in the PVS path reads orientation, which is direct structural support for the
+>     "PVS steps with position, frustum varies with yaw" model below. ⚠️ `0x00489A60` is called "the
+>     PVS query" on the strength of its arguments and caching key; **its body is not disassembled**.
+>   - **⚠️ The cheapest first test is now a flag, not a trampoline:** clear `[cam+0x530]` bit 4 on the
+>     active camera and the whole world should draw regardless of aim. **If geometry still vanishes,
+>     `BoxVisible` is not the gate producing the void** and the cause is somewhere this analysis has
+>     not looked.
+>   **Not yet built: any hook, counter, or mitigation** — deliberately deferred, see notes/74's
+>   "what is NOT established" section, and notes/75's.
 > - **⭐ Culling has TWO gates in series, and only one of them follows the camera matrix.**
 >   The `.plb` level format ships a **`VisibilityTree` separate from the `CollisionTree` and the
 >   `NavMesh`** — an octree plus one bit-buffer per leaf, sized from `LeavesCount − 1`, i.e.
@@ -778,6 +832,26 @@ rather than memory-forged DirectInput state:
 >   the shape of the residual left after 2026-08-28 got the void from 92% to 18.5%.
 > - **Bears directly on first person vs. the free camera:** moving the eye to Raz's head is a small
 >   translation that stays inside the same leaf, so **FP is probably unaffected by the PVS gate**.
+>   ⚠️ **Downgraded to `[hypothesis]` 2026-09-03 (`/gr`, folded by `/pd`).** That rests on an
+>   unstated assumption — *that leaves are large compared with the eye offset*. Room-sized leaves and
+>   it holds; a fine-grained tree and moving the eye to Raz's head could cross a leaf boundary and
+>   change the visible set, which would present as geometry popping the instant first person engages
+>   and is **very easy to misdiagnose as a transform bug** — the exact failure shape this project has
+>   hit before.
+>   - **The named static test:** a leaf stores only `PrimitiveIndex`/`PrimitiveCount`, **not its own
+>     bounds**, so it is a regular octree and leaf extent is implied by depth — root `SSECube`
+>     extent / 2^depth, with mean depth following from `LeavesCount` (8^d leaves at depth d)
+>     `[reported 2026-09-03]`. Read those two numbers from one real level and compare the resulting
+>     leaf scale against the ~11.6-unit eye-to-Raz offset. **A few hundred leaves per level** ⇒
+>     room-scale, the FP reasoning holds. **Many thousands over a small level** ⇒ popping on FP
+>     engage is a PVS symptom, not a matrix bug.
+>   - ⚠️ **The cost is higher than "a read of a file already in the install"** `[measured 2026-09-03]`:
+>     there are **zero loose `.plb` files** in the install. Levels ship as **`PPAK` containers** —
+>     `WorkResource/PCLevelPackFiles/*.ppf`, 100 of them, up to 33 MB, header magic `50 50 41 4B`,
+>     interior interleaving asset paths with compressed data. The item stays `[PD]` (no game needed)
+>     but means *parse PPAK → find the level binary → walk to the Octree*, not a two-field read.
+>   - ⚠️ **Licensing:** the format is implemented by a GPL-3.0 library we may study but not copy —
+>     parse the fields with our own code, or use a third-party tool *as a tool*.
 >   A *flown* free camera is affected — outside the level the current leaf's visible set can be
 >   empty, blacking the screen for reasons that have nothing to do with the transform. Worth
 >   remembering before diagnosing a black free-camera frame as a matrix bug.
