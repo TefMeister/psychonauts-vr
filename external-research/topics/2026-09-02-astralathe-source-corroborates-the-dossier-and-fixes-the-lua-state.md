@@ -21,7 +21,7 @@ published offsets land on ours, the dossier's `[inferred-static]` claims gain an
 | --- | --- | --- |
 | `GameApp::pPlayer` at byte **33164 = `0x818C`** (`EEntity*`) | `engine + 0x818C` = the player object, `[inferred-static 2026-09-01, n=3]` | an **independent n=4**, from a different reverser working from different evidence |
 | `DFDInput_WasInputPressed(input)` at **`exe+0x5930`** | `IsKeyJustPressed` **`0x00405930`** (§10) | same function, same reading, independently |
-| `ECameraProxy` exposes exactly one field: **`m_vecPos` at `ECamera+0x8`** | camera position at `camera+0x08` `[verified-live]` | independent match; Astralathe found nothing else on the camera object worth exposing, which fits our "every other matrix is a derived output" finding |
+| `ECameraProxy` exposes exactly one field: **`m_vecPos` at `ECamera+0x8`** | camera position at `camera+0x08` `[verified-live 2026-08-27, n=4 writes, 1 session]` | independent match; Astralathe found nothing else on the camera object worth exposing, which fits our "every other matrix is a derived output" finding |
 | `lua_dobuffer(lua_State*, const char* buff, int size, const char* name)`, **`__cdecl`** | `0x6B0C00(L, buf, len, chunkname_or_NULL)`, traced statically in notes/57 | the shape is identical: our primitive **is the Lua 4.0 API's own `lua_dobuffer`**, which is why it takes a raw buffer and needs no `lua_pushstring`. Signature to check at `0x6B0C00`: `55 8B EC 51 8B 45 ? 50 8B 4D ? 51 8B 55 ? 52 8B 45 ?` |
 | `EMat4` stored `M00 M10 M20 M30 M01 …` with translation at `M03 M13 M23` — i.e. floats 12–14, bytes `+0x30..+0x38` from the matrix start | `+0x40` is the translation row of a 4×4 that starts at `node+0x10` (`0x10 + 0x30 = 0x40`) | the same bytes, read the same way, by both parties |
 
