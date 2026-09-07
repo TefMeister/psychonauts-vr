@@ -5,6 +5,28 @@ board's `[PD]` PVS-leaf-size row, which the modding side re-estimated on 2026-09
 PPAK container → locate the level binary inside → walk to the Octree → read two fields"* after finding
 zero loose `.plb` files and 50 `PPAK` (`.ppf`) containers in the install.
 
+> 🚨 **VERDICT 2026-09-07 — the premise held, the conclusion did not. Read this before the rest.**
+>
+> ✅ **The container half was right, and the modding lane bettered it:** the packs open with **no
+> third-party tool at all**. A pack's names are a **u16 length followed by a NUL-terminated ASCII
+> string**, so a resyncing scan enumerates one in about ten lines of Python. `.ppf` is PPAK with a
+> per-asset **`CYSP`** FourCC; `.apf` is **KAPA** and holds animations only. `ASCO.ppf` is 556 name
+> records — 279 dds, 89 plb, 30 lua `[measured 2026-09-07]`. **So the two tools recommended below are
+> no longer the cheapest route**, and the licence analysis around them is moot for this purpose.
+>
+> ❌ **The title's conclusion is disproved.** There is no level binary to dump. **No `.plb` inside a
+> pack is a level scene** — tested by the `levels/<level>/<level>.plb` naming convention across **five
+> packs and 579 records, with zero matches** `[verified-numerically 2026-09-07]`. Those entries are
+> props, vehicles, overlays, held objects, characters and globalmodels, and the remaining names carry
+> **entity-type suffixes rather than file extensions**. The level is a **serialized entity graph**, so
+> "parse the container, locate the level binary, walk to the Octree, read two fields" describes a
+> step that does not exist — and the modding lane's write-up names this lane's drop explicitly as one
+> of the two places that error was recorded.
+>
+> **What survives:** the container is cheap to read, which was the useful half. **What does not:** the
+> route to the PVS numbers. Anything downstream of "dump the level record" needs rethinking against a
+> serialized entity graph, not a file.
+
 ## The finding
 
 The container half of that job is **already done in public, twice**, by tools whose licences let us
