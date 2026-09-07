@@ -642,6 +642,86 @@ AfterBoth shows the write surviving all of them. The earlier dump was taken
 *before* the write in both the yaw-0 and yaw-90 runs, which shows the engine's
 value either way. Wrong field, not wrong timing.
 
+
+## 9c. The `PPAK` level packs, opened statically — and why the PVS row's middle step was wrong (2026-09-07, `/pd`, no launch)
+
+*Folds `engine-research/inbox/2026-09-03-gr-the-ppf-container-is-already-opened-by-public-tools.md`
+and `…/2026-09-07-gr-a-sibling-built-a-working-directinput-injector-…md`, then adds what a static
+read of the containers actually shows. The game was not launched; nothing here has been run.*
+
+### The container needs no third-party tool to ENUMERATE
+
+`WorkResource/PCLevelPackFiles/` holds **50 `.ppf` + 50 `.apf`** `[measured 2026-09-07]`.
+
+- `.ppf` begins `PPAK`; assets inside carry a per-record FourCC stored little-endian as `CYSP`
+  (i.e. `'PSYC'`), ×91 in `ASCO.ppf`, with `MPAK` ×1.
+- `.apf` begins `KAPA` (`'APAK'`) and is an **animation** pack — `ASCO.apf` is 155 records, **all
+  `.jan`**, nothing else `[measured 2026-09-07]`.
+
+Names are stored as `u16 length` + NUL-terminated ASCII, so a ten-line scan enumerates the contents.
+`ASCO.ppf` (16.7 MB) yields **556 name records: 279 `.dds`, 89 `.plb`, 30 `.lua`**, plus a tail of
+entity-type-suffixed names. Tool: `dev-archive/tools/ppak_scan.py`.
+
+### ⚠️ THE CORRECTION: the `.plb` inside a `.ppf` are MODELS, not the level scene
+
+The board's `[PD]` row reads *"parse PPAK → locate the level binary → walk to Octree → two fields"*,
+and the `/gr` drop re-costed it to *"dump the level record with DoubleFine Explorer → read the two
+Octree fields"*. **Both assume a level record exists as a discrete file inside the pack. In `ASCO`
+it does not** `[measured 2026-09-07]`:
+
+- **Not one `.plb` is a level scene** `[measured 2026-09-07, n=5 packs, 579 records]`. Tested by
+  the naming convention itself — a level scene would be `levels\<level>\<level>.plb` — across
+  `ASCO` (89), `MMI1` (170), `NIMP` (100), `WWMA` (213) and `common` (7). **Zero matches in any.**
+  ⚠️ An earlier, cruder test (exclude anything under `props/`, `globalmodels/`, `characters/`)
+  produced **false positives** — it flagged `blacksedan.plb` and `ww_overlaydefault.plb`, which are
+  models that simply do not sit under `props/`. The pack's `MPAK` magic agrees: model pack.
+- The `.apf` sibling is animations only, so the level is not there either.
+- The remaining names end in **entity type** suffixes, not file extensions — `.domaincontroller`,
+  `.splineobject`, `.tightrope`, `.brainjar`, `.teleporter`, `.animator`, `.psichallengecard`,
+  `.heldobject`, `.as_bucket`, `.as_straightjacket`.
+
+⇒ **The level appears to be a serialized entity graph inside the `.ppf`, not a level file you can
+carve out.** So "locate the level binary" is not a step that exists, and the Octree's root `SSECube`
+extent and `LeavesCount` have to be recovered from that serialization. That is exactly the part the
+public tools implement, which is why the `/gr` recommendation still stands — but the *reason* is
+different from the one recorded, and anyone carving for a `.plb` level file will not find one.
+`[measured 2026-09-07]`
+
+### Tool status, carried from the `/gr` drop (unchanged, still unrun by this lane)
+
+- **DoubleFine Explorer** (bgbennyboy, MPL-2.0) — its README claims support for the Steam/GOG
+  re-release's changed `.ppf`; the original-version Psychonauts Explorer explicitly does not.
+  `[reported 2026-09-03]`
+- **PsychonautsStudio** (RayCarrot, MIT, C#) — carries a `FileType_PPF` reader, claims all versions;
+  export listed as upcoming, so a viewer with a serialization log for now. `[reported 2026-09-03]`
+
+Both are *tools* under the no-copy rule and may be used directly; **neither has been run by this
+lane**, and running one needs the user (a download, and it is not `/pd`'s to install unasked).
+
+### Pointer for the `GetDeviceData` continuation (from the 2026-09-07 `/gr` drop)
+
+Beside §11's *"hooking `GetDeviceData` is the untested continuation"*: a sibling project now has a
+**working DirectInput injector, host-tested** — `staging/prince-of-persia-2008-vr/proxy-dinput8/`
+with harness `tools/pop_input.py` (`on`, `tap`, `down`/`up`, `mouse`, `status`).
+
+⚠️ **It is not a drop-in: it hooks `GetDeviceState`; we need `GetDeviceData`.** That difference *is*
+our dead end and is unchanged. What transfers is the **apply logic**, a pure function testable on the
+host with no launch (36 checks, 0 failures) — treat these four as requirements for our version:
+
+1. **One-shot relative mouse motion**, so a written delta cannot re-serve on every poll. Load-bearing
+   here: we measured **3598 `GetDeviceData` calls while the mouse moved**, so a naive delta either
+   spins the camera forever or is consumed once and lost. `GetDeviceData` is *buffered* — a queue of
+   events, not a state snapshot — so it needs its own equivalent of the one-shot rule.
+2. **OR semantics**, so a physically held key is never cleared.
+3. **Both `DIMOUSESTATE` sizes handled, and refusal on an unrecognised size** — a "big enough" check
+   is precisely how this project's Escape-synthesis incident happened.
+4. **Bit-for-bit no-op when disabled**, so the hook can stay installed and be *proved* inert.
+
+⚠️ **A tempting wrong idea, already disproved by the filer:** their shared-vtable fix does **not**
+explain our 2026-08-27 negative. Our record establishes the mouse arrives via buffered
+`GetDeviceData` with `WM_MOUSEMOVE` and `WM_INPUT` both at zero `[verified-live]`; the dead end's
+stated cause stands.
+
 ## 10. Autonomous harness recipe (this game)
 
 - **Foreground-focus grab, FIXED session 54 (durable infrastructure, applies to ALL future input
