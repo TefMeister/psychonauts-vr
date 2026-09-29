@@ -1,6 +1,8 @@
 # Research index
 
-**Last `/gr` pass: 2026-09-23 (estate sweep) — CHECK-IN.** Checked phunkaeg's *VR Modding Playbook*: it lists this project's public repos as studied sources; no other entry for this engine. Nothing new.
+**Last `/gr` pass: 2026-09-29 (estate sweep) — CHECK-IN.** Nothing new. The open rows are internal (camfollow worse when worn, menu-scene void, the `headpos` run); no public source stands in front of any of them.
+
+_Previous: **Last `/gr` pass: 2026-09-23 (estate sweep) — CHECK-IN.** Checked phunkaeg's *VR Modding Playbook*: it lists this project's public repos as studied sources; no other entry for this engine. Nothing new._
 
 _Previous: **Last `/gr` pass: 2026-09-11 (estate sweep, evening, home PC) — CHECK-IN** (board `OPEN` block + INDEX + dossier open items; one attempted freshness check of the Astralathe release page, which the automated fetch could not read — not a negative)**.** Inbox empty. **Nothing new.** The top rows are internal: why the camfollow build is worse when worn than without it (`[PD]`, our own register-6 image path), the menu-scene void (`[PD]`, our own FOV-scale plumbing), the `headpos` launch (`[FLAT]`), and the pack-viewer decision (`[USER]`). None is a question a public source answers, and the 2026-09-03 world-scale negative still stands._
 
