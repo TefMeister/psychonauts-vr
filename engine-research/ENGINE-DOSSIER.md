@@ -1108,3 +1108,8 @@ Phase 7+ sub-project (first-person) and beyond, not the core conversion:
   spot this whole project), `CA*` = Campgrounds and `CAJA` = Sasha's Lab
   (both confirmed via embedded strings), others inferred from animation-path
   evidence but unconfirmed. See notes/55 for the full table and caveats.
+
+## Inbox folds, 2026-09-29
+
+**Our `d3d9` proxy exports only `Direct3DCreate9`: a latent start-up crash (from `dead-space-2-vr`, 2026-09-14).** A game that calls `D3DPERF_GetStatus`, `D3DPERF_SetOptions` or `DebugSetMute` crashes at start through a NULL pointer unless all seventeen exports are forwarded `[verified-live 2026-09-14, n=1, dead-space-2-vr]`. This game runs today, so the defect is latent; forward all seventeen at the next rebuild. Board row added.
+
