@@ -27,3 +27,11 @@ log line from `Hook_BuildProjectionMatrix` with a counter shows whether it fired
 the same size at 3.0 and 1.0, it is 1.
 
 The `[PD]` fallback row that 76 queued is withdrawn: it would have fixed a cause that was not active.
+
+## Narrowed the same session `[inferred-static 2026-10-01]`
+
+`D3DXMatrixPerspectiveFovRH` (import stub `0x6ECD00`) has exactly **one** caller in the exe, `0x692520`, which is
+inside the hooked `BuildProjectionMatrix` (`0x6924D0`). So every D3DX perspective projection the game builds passes
+through the FOV widening, the menu's included. Possibility 1 now survives only as "the menu builds its projection by
+hand, without D3DX" (less likely). Possibilities 2 (the scene is empty there by design) and 3 (its culling) lead.
+The monitor check above still decides it.
