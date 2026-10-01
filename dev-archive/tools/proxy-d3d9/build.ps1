@@ -26,6 +26,8 @@ if (-not $clang) {
 Write-Host "Using compiler: $clang"
 
 $src = Join-Path $PSScriptRoot "proxy_d3d9.c"
+# 2026-10-01: forwarders for the sixteen other d3d9 exports (see d3d9_thunks.c)
+$thunks = Join-Path $PSScriptRoot "d3d9_thunks.c"
 $def = Join-Path $PSScriptRoot "proxy_d3d9.def"
 $out = Join-Path $PSScriptRoot "d3d9.dll"
 
@@ -42,7 +44,7 @@ if (-not (Test-Path $importLib)) {
 }
 
 & $clang --target=i686-w64-mingw32 -shared -O2 -municode `
-    -o $out $src $def $importLib `
+    -o $out $src $thunks $def $importLib "-Wl,--no-insert-timestamp" `
     -ld3d11 -ldxgi -lgdi32 -luser32 -lkernel32
 
 if ($LASTEXITCODE -ne 0) {
