@@ -1,6 +1,8 @@
 # Research index
 
-**Last `/gr` pass: 2026-09-29 (estate sweep) — CHECK-IN.** Nothing new. The open rows are internal (camfollow worse when worn, menu-scene void, the `headpos` run); no public source stands in front of any of them.
+**Last `/gr` pass: 2026-10-04 (estate sweep, second pass) — CHECK-IN.** Inbox empty; board `OPEN` rows read: install bookkeeping and a code-shape decision. Nothing new.
+
+_Previous: **Last `/gr` pass: 2026-09-29 (estate sweep) — CHECK-IN.** Nothing new. The open rows are internal (camfollow worse when worn, menu-scene void, the `headpos` run); no public source stands in front of any of them._
 
 _Previous: **Last `/gr` pass: 2026-09-23 (estate sweep) — CHECK-IN.** Checked phunkaeg's *VR Modding Playbook*: it lists this project's public repos as studied sources; no other entry for this engine. Nothing new._
 
