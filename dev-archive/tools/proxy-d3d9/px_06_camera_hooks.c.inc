@@ -329,6 +329,8 @@ static void ApplyCameraYaw(void);
  * definitions, which need AutoGetCamera. */
 static void ApplyCameraYawAt(int site);
 static void CamProbe(const char *where);
+/* 2026-10-08 (px_07b): head-follow checks at BeforeEye2. */
+static void PsyCamFollowCheckEye2(void);
 /* notes/67: defined with the DirectInput hooks further down; called from the
  * env-var config function, which sits earlier in this file. */
 static void InstallMouseInject(void);
@@ -376,6 +378,7 @@ void __cdecl CandB_BeforeEye2_asm(void)
      * attempt could not do. Probe first, then write, so the log shows both the
      * engine's value and ours. */
     CamProbe("BeforeEye2");
+    PsyCamFollowCheckEye2();
     ApplyCameraYawAt(2);
     CamProbe("post-write-2");
 }
