@@ -271,9 +271,15 @@ static void AutoRunCommand(const char *cmd)
         /* notes/68 part 3: drive the game's own camera transform from live head
          * yaw, before culling. This is the void fix as a player experiences it. */
         g_camFollowHead = (cmd[10] == '1');
-        if (!g_camFollowHead) { g_basisSnapValid = 0; g_basisLastWriteValid = 0; }
+        if (!g_camFollowHead) { g_basisSnapValid = 0; g_basisLastWriteValid = 0; PsyCamFollowReset(); }
         LogLine("Auto: END   \"%s\" -> camera follows head = %d (scale %.2f, head yaw now %.1f deg)",
                 cmd, g_camFollowHead, g_camFollowScale, g_headYawDeg);
+
+    } else if (_strnicmp(cmd, "camfollowrestore ", 17) == 0) {
+        /* 2026-10-08: 1 = give the engine its own camera back after each frame (the fix for the
+         * 2026-09-10 wear, if the fault was feedback); 0 = the old behaviour, for comparison. */
+        g_camFollowRestore = (cmd[17] == '1');
+        LogLine("Auto: END   \"%s\" -> restore engine camera after each frame = %d", cmd, g_camFollowRestore);
 
     } else if (_strnicmp(cmd, "camfollowscale ", 15) == 0) {
         /* Sign/gain, tunable live: the correct sign is a convention question and

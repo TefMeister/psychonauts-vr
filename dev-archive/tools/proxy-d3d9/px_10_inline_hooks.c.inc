@@ -7,6 +7,7 @@ void __cdecl CandB_AfterBoth_asm(void)
      * log shows the engine's own end-of-frame value, not one the harness just
      * poked. */
     CamProbe("AfterBoth");
+    PsyCamFollowAfterBoth();   /* 2026-10-08: engine gets its own camera back before its next update */
     ApplyCameraYawAt(3);
     CamProbe("post-write-3");
     if (g_camProbeFrames > 0) {

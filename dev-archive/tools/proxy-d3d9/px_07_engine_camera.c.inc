@@ -536,6 +536,10 @@ static void PsyApplyBasisYaw(void *cam, float deg)
 /* Follow live head yaw. Re-snapshots only when the engine itself moved the
  * camera, detected by comparing against our own last write - so a stationary
  * camera does not compound, and a moving one still tracks. */
+/* 2026-10-08: defined in px_07b_camfollow_restore.c.inc (included right after this file). */
+static void PsyCamFollowMeasure(void *cam, int engineMoved);
+static void PsyCamFollowRemember(float yawDeg);
+
 static void PsyBasisFollowHead(void *cam)
 {
     const char *B = (const char *)cam + PSY_CAM_BASIS_OFF;
@@ -551,8 +555,10 @@ static void PsyBasisFollowHead(void *cam)
                 if (d > 1e-5f) { engineMoved = 1; break; }
             }
     }
+    PsyCamFollowMeasure(cam, engineMoved);
     if (engineMoved) PsyBasisSnapshot(cam);
     PsyApplyBasisYaw(cam, g_headYawDeg * g_camFollowScale);
+    PsyCamFollowRemember(g_headYawDeg * g_camFollowScale);
 }
 
 /* ===================================================================== *

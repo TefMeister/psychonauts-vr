@@ -13,6 +13,7 @@
 #include "px_05_headtrack.c.inc"   /* lines 1900-2573: engine addresses, camera cache, submit crop, matrix maths, head tracking, render-level first person */
 #include "px_06_camera_hooks.c.inc"   /* lines 2574-2954: trampolines, BuildViewMatrix/BuildProjectionMatrix entries, per-eye targets, CandB before eye 1/2 */
 #include "px_07_engine_camera.c.inc"   /* lines 2955-3690: engine camera/player/bone access, look/basis/fpcam/follow writes (automation-driven) */
+#include "px_07b_camfollow_restore.c.inc"   /* 2026-10-08: head-follow gives the engine its camera back after each frame, and counts why the 09-10 wear broke */
 #include "px_08_dinput.c.inc"   /* lines 3691-3990: DirectInput hooks: mouse injection, pad override, input probe */
 #include "px_09_automation.c.inc"   /* lines 3991-4639: the automation command-file interpreter and tick */
 #include "px_10_inline_hooks.c.inc"   /* lines 4640-5031: AfterBoth, debug hotkeys, naked asm hooks, inline-hook install, eye surfaces */
