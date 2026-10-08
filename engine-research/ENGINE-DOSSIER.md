@@ -1113,3 +1113,15 @@ Phase 7+ sub-project (first-person) and beyond, not the core conversion:
 
 **Our `d3d9` proxy exports only `Direct3DCreate9`: a latent start-up crash (from `dead-space-2-vr`, 2026-09-14).** A game that calls `D3DPERF_GetStatus`, `D3DPERF_SetOptions` or `DebugSetMute` crashes at start through a NULL pointer unless all seventeen exports are forwarded `[verified-live 2026-09-14, n=1, dead-space-2-vr]`. This game runs today, so the defect is latent; forward all seventeen at the next rebuild. Board row added.
 
+
+## Inbox folds and /pd, 2026-10-08 - head-follow (camfollow) gives the engine its camera back
+
+After the 2026-09-10 wear went "crazy glitchy", two faults are possible, both `[hypothesis]`: FEEDBACK (the engine's
+next camera update starts from our turned `+0x150`, so the head yaw compounds every frame) and OVERWRITE (the engine
+rewrites `+0x150` inside the first CandB, after our BeforeEye1 write). The 2026-08-28 desk check ran with a still
+camera, where the engine does not rewrite `+0x150`, so it could not see either. Proxy `76630f3641c8` restores the
+engine's basis at AfterBoth (`camfollowrestore 1`, default) and prints a `CAMFOLLOW stats` line that sums the
+engine's own camera turn toward/away from the head's side and counts rewrites during eye 1's pass. Against three
+model engines, running the shipped code, the restore turns a 162.6 deg view (head 20 deg) into exactly 20 deg
+`[verified-numerically 2026-10-08, n=16 cases]` (`tests/build_camfollow_test.sh`). Which model Psychonauts is: one
+monitor run. Notes/78.
