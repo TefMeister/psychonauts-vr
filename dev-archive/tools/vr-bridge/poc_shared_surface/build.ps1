@@ -9,14 +9,16 @@
 $ErrorActionPreference = "Stop"
 
 $candidates = @(
-    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-20260616-ucrt-x86_64\bin\i686-w64-mingw32-clang.exe",
+    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-*-ucrt-x86_64\bin\i686-w64-mingw32-clang.exe",
     "$env:LOCALAPPDATA\Programs\llvm-mingw\bin\i686-w64-mingw32-clang.exe",
     "C:\Program Files\llvm-mingw\bin\i686-w64-mingw32-clang.exe"
 )
 
 $clang = $null
 foreach ($c in $candidates) {
-    if (Test-Path $c) { $clang = $c; break }
+    # Resolve-Path takes the wildcard, so any installed llvm-mingw version is found (newest last)
+    $hit = Resolve-Path $c -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($hit) { $clang = $hit.Path; break }
 }
 if (-not $clang) {
     $cmd = Get-Command i686-w64-mingw32-clang.exe -ErrorAction SilentlyContinue
