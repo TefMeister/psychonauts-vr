@@ -11,6 +11,7 @@
 #include "px_03_config.c.inc"   /* lines 1011-1306: the PSYVR_* environment-variable reader (VRBridge_ReadEnableFlag) */
 #include "px_04_vrbridge.c.inc"   /* lines 1307-1899: the OpenVR/D3D11 bridge: eye buffers, real IPD/projection, init, submit, poses, teardown */
 #include "px_05_headtrack.c.inc"   /* lines 1900-2573: engine addresses, camera cache, submit crop, matrix maths, head tracking, render-level first person */
+#include "px_05b_xrbridge.c.inc"   /* 2026-10-17: the OpenXR headset output (PSYVR_OPENXR=1), fed to xr/ - Hard Reset's headset thread */
 #include "px_06_camera_hooks.c.inc"   /* lines 2574-2954: trampolines, BuildViewMatrix/BuildProjectionMatrix entries, per-eye targets, CandB before eye 1/2 */
 #include "px_07_engine_camera.c.inc"   /* lines 2955-3690: engine camera/player/bone access, look/basis/fpcam/follow writes (automation-driven) */
 #include "px_07b_camfollow_restore.c.inc"   /* 2026-10-08: head-follow gives the engine its camera back after each frame, and counts why the 09-10 wear broke */
