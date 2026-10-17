@@ -9,6 +9,14 @@ static void VRBridge_ReadEnableFlag(void)
     LogLine("VRBridge: PSYVR_ENABLE_SUBMIT=%s -> g_vrSubmitEnabled=%d",
             (len > 0 && len < sizeof(buf)) ? buf : "(unset)", g_vrSubmitEnabled ? 1 : 0);
 
+    /* 2026-10-17: PSYVR_OPENXR=1 switches the VR path on through OpenXR (px_05b) instead of OpenVR. */
+    len = GetEnvironmentVariableA("PSYVR_OPENXR", buf, sizeof(buf));
+    g_vrUseXR = (len > 0 && len < sizeof(buf) && buf[0] == '1');
+    if (g_vrUseXR) {
+        g_vrSubmitEnabled = TRUE;
+        LogLine("VRBridge: PSYVR_OPENXR=1 -> the VR path is ON and talks to the headset through OpenXR, not OpenVR");
+    }
+
     /* notes/31 diagnostic-only A/B toggles - see the comment on g_vrSkipWaitPoses above. */
     len = GetEnvironmentVariableA("PSYVR_SKIP_WAITPOSES", buf, sizeof(buf));
     g_vrSkipWaitPoses = (len > 0 && len < sizeof(buf) && buf[0] == '1');

@@ -504,6 +504,7 @@ typedef struct {
 } VRBridgeEyeState;
 
 static BOOL g_vrSubmitEnabled = FALSE;   /* runtime flag: env var PSYVR_ENABLE_SUBMIT=1, read once at DllMain */
+static BOOL g_vrUseXR = FALSE;           /* 2026-10-17: PSYVR_OPENXR=1 - the headset through OpenXR (px_05b) instead of OpenVR */
 static BOOL g_vrBridgeInitAttempted = FALSE;
 static BOOL g_vrBridgeReady = FALSE;     /* Device A + D3D11 + OpenVR all initialized OK */
 static IDirect3D9Ex *g_pVRD3D9Ex = NULL;

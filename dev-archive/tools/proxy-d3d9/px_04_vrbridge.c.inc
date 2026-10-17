@@ -1,4 +1,11 @@
 
+/* 2026-10-17: the OpenXR output (px_05b, defined after the head-tracking globals it needs). With PSYVR_OPENXR=1 the
+ * five entry points below hand straight over to these; nothing of OpenVR is started. */
+static void XRBridge_Init(UINT w, UINT h);
+static void XRBridge_PumpPoses(void);
+static void XRBridge_OnFrameComposited(void);
+static void XRBridge_Shutdown(void);
+
 static void VRBridge_ReleaseEyeBuffers(VRBridgeEyeState *eye)
 {
     int s;
@@ -160,6 +167,7 @@ static void VRBridge_Init(IDirect3DDevice9 *pGameDevice, UINT w, UINT h)
     UINT i;
 
     g_vrBridgeInitAttempted = TRUE;
+    if (g_vrUseXR) { XRBridge_Init(w, h); return; }
 
     /* notes/33 §4: once SteamVR has asked us to quit, never re-connect (e.g. via a later Reset
      * re-running SetupStereoSurfaces after the quit-time teardown cleared the attempted flag). */
@@ -325,6 +333,7 @@ static void VRBridge_OnStereoSurfacesReady(IDirect3DDevice9 *pGameDevice, UINT w
         VRBridge_Init(pGameDevice, w, h);
         return;
     }
+    if (g_vrUseXR) { g_vrBufWidth = w; g_vrBufHeight = h; return; } /* px_05b follows the eye size by itself */
     if (!g_pVRDeviceA || !g_pVRDevice11) return; /* init failed earlier - stay inert, don't retry every frame */
 
     if (g_vrBridgeReady && (w != g_vrBufWidth || h != g_vrBufHeight)) {
@@ -519,6 +528,7 @@ static void VRBridge_PollQuitEvents(void)
 static void VRBridge_PumpPoses(void)
 {
     if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
+    if (g_vrUseXR) { XRBridge_PumpPoses(); return; }
     VRBridge_PollQuitEvents();
     if (!g_vrBridgeReady) return; /* quit-time teardown may have just run */
     if (!g_pVRWaitGetPoses || g_vrSkipWaitPoses) return;
@@ -547,6 +557,7 @@ static void VRBridge_OnFrameComposited(void)
 {
     if (!g_vrSubmitEnabled || !g_vrBridgeReady) return;
     if (!g_pEye1Surf || !g_pEye2Surf) return;
+    if (g_vrUseXR) { if (!g_vrSkipPumpEye) XRBridge_OnFrameComposited(); return; }
 
     if (!g_vrSkipPumpEye) {
         VRBridge_PumpEye(&g_vrEye1, g_pEye1Surf);
@@ -558,6 +569,7 @@ static void VRBridge_Shutdown(void)
 {
     if (!g_vrBridgeInitAttempted) return;
     LogLine("VRBridge_Shutdown: releasing VR bridge resources");
+    if (g_vrUseXR) XRBridge_Shutdown();
 
     VRBridge_ReleaseEyeBuffers(&g_vrEye1);
     VRBridge_ReleaseEyeBuffers(&g_vrEye2);

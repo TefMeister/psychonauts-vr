@@ -1,0 +1,5 @@
+[xr]
+; Copy beside Psychonauts.exe as psyvr_xr.ini. Dev PC: the OpenXR Simulator's 32-bit runtime, for this game only.
+; Leave runtime_json out (or delete this file) to use the PC's active OpenXR runtime, e.g. a real headset's.
+runtime_json=D:\claude video game stuff\tools\OpenXR-Simulator\openxr_simulator-32.json
+test_pattern=0
