@@ -45,8 +45,12 @@ if (-not (Test-Path $importLib)) {
     throw "OpenVR import lib not found at $importLib - is tools/vr-bridge/openvr-sdk vendored?"
 }
 
-& $clang --target=i686-w64-mingw32 -shared -O2 -municode `
-    -o $out $src $thunks $def $importLib "-Wl,--no-insert-timestamp" `
+# 2026-10-17: the OpenXR headset output (PSYVR_OPENXR=1) - Hard Reset's headset thread, copied into xr/
+$xrDir = Join-Path $PSScriptRoot "xr"
+$xrSrc = @("hxr.c", "hxr_frame.c", "hxr_format.c", "hxr_buttons.c", "hr_pose.c") | ForEach-Object { Join-Path $xrDir $_ }
+
+& $clang --target=i686-w64-mingw32 -shared -O2 -municode "-I$xrDir" `
+    -o $out $src $xrSrc $thunks $def $importLib "-Wl,--no-insert-timestamp" `
     -ld3d11 -ldxgi -lgdi32 -luser32 -lkernel32
 
 if ($LASTEXITCODE -ne 0) {
