@@ -70,7 +70,7 @@ another 20 s. Read `%TEMP%\psychonautsvr_proxy.log`:
 
 ## Also done
 
-- The dev PC's installed `d3d9.dll` (`a7b6ad976e00`) was identified as the 2026-09-01 build (commit `43173a1`, same
+- The dev PC's installed `d3d9.dll` (`a7b6ad976e00`) was identified as the 2026-09-01 build (commit `01f1c96`, same
   minute, has camfollow and fpcam but no "THUNK" forwarding table) `[inferred-static 2026-10-08]`. It and eight old
   backups were taken out of the game folder into `dev-archive/deployed-history/2026-10-08-dev-pc-game-folder/`
   (with a hash manifest). The duplicate `openvr_api.dll` backup (identical to the installed one) went to the local
