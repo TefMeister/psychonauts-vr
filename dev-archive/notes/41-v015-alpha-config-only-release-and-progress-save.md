@@ -5,7 +5,7 @@
 
 ## What shipped in v0.1.5-alpha
 
-Release: https://github.com/TefMeister/psychonauts-vr/releases/tag/v0.1.5-alpha (commits `a45d30f`, `d8cc847`, `2f6f7bd` on main).
+Release: https://github.com/TefMeister/psychonauts-vr/releases/tag/v0.1.5-alpha (commits `14ff1bd`, `fb8c630`, `878954f` on main).
 
 - `proxy-d3d9/Launch-Psychonauts-VR.bat` — the generic launcher now lives in the repo instead of being a release-asset orphan; header points Quest 3 owners at the tuned variant.
 - `proxy-d3d9/Launch-Psychonauts-VR-Quest3.bat` — **new**: Quest 3 pre-tuned launcher (`PSYVR_FOV_SCALE=1.5`, `PSYVR_RENDER_SCALE=3`), values derived in notes/40 from the real headset's projRaw geometry.
