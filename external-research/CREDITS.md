@@ -69,3 +69,9 @@ please tell us: **open a GitHub issue on this repo**. We'll act on that
 request promptly — no argument, no delay — and we'll find another way to get
 the job done that doesn't rely on your material. This is your work; we're
 just grateful to have learned from it.
+
+## Sources (2026-10-26)
+
+- **DrDecki**, psychonauts-decomp — https://github.com/DrDecki/psychonauts-decomp
+- **CosmicMatt**, PsychonautsFix — https://github.com/CosmicMatt/PsychonautsFix
+- **Fancy2209**, Open-Li-Po — https://github.com/Fancy2209/Open-Li-Po
