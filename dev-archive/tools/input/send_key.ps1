@@ -22,6 +22,19 @@ public class PsySendKey {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int dwProcessId);
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+    public static IntPtr FindExact(string title) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            var sb = new System.Text.StringBuilder(256);
+            GetWindowTextW(h, sb, 256);
+            if (sb.ToString() == title) { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
     [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public KEYBDINPUT ki; public ulong pad; }
     [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
     [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
@@ -37,6 +50,12 @@ public class PsySendKey {
 
 $p = Get-Process -Name $ProcessName -ErrorAction Stop
 
+# 2026-10-29: with PSYVR_OPENXR=1 and the OpenXR Simulator, the simulator's preview window lives in the
+# game's own process and can become its MainWindowHandle, so keys went to the preview. Use the window
+# titled exactly "Psychonauts" when there is one.
+$hwnd = [PsySendKey]::FindExact("Psychonauts")
+if ($hwnd -eq [IntPtr]::Zero) { $hwnd = $p.MainWindowHandle }
+
 # notes/53: the foreground-lock grant is consumed by the NEXT SetForegroundWindow call, not durable
 # across multiple future sends - and the current environment has ANOTHER process (the tool-execution
 # harness's own console) actively contending for foreground, so a single attempt is unreliable even
@@ -45,12 +64,12 @@ $p = Get-Process -Name $ProcessName -ErrorAction Stop
 # this session each addressed a different wrong layer of the problem).
 $ok = $false
 for ($i = 0; $i -lt 5; $i++) {
-    if ([PsySendKey]::GetForegroundWindow() -eq $p.MainWindowHandle) { $ok = $true; break }
+    if ([PsySendKey]::GetForegroundWindow() -eq $hwnd) { $ok = $true; break }
     [PsySendKey]::AllowSetForegroundWindow($p.Id) | Out-Null
-    [PsySendKey]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+    [PsySendKey]::SetForegroundWindow($hwnd) | Out-Null
     Start-Sleep -Milliseconds 300
 }
-if (-not $ok -and [PsySendKey]::GetForegroundWindow() -eq $p.MainWindowHandle) { $ok = $true }
+if (-not $ok -and [PsySendKey]::GetForegroundWindow() -eq $hwnd) { $ok = $true }
 if (-not $ok) {
     throw "could not bring $ProcessName to foreground after 5 attempts - aborting (key would land elsewhere)"
 }

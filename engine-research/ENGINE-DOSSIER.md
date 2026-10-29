@@ -1125,3 +1125,23 @@ engine's own camera turn toward/away from the head's side and counts rewrites du
 model engines, running the shipped code, the restore turns a 162.6 deg view (head 20 deg) into exactly 20 deg
 `[verified-numerically 2026-10-08, n=16 cases]` (`tests/build_camfollow_test.sh`). Which model Psychonauts is: one
 monitor run. Notes/78.
+
+## Inbox folds, 2026-10-29 - a public matching decompilation
+
+`DrDecki/psychonauts-decomp` (MIT, 2026-10-10) decompiles all 106,607 Lua functions of the Steam exe to
+byte-identical source, and matches 3,252 of 10,930 engine functions (about 10 % of code bytes), with the Lua 4.0
+runtime complete `[reported 2026-10-26, its README]`. Use it as the cross-check for any function this dossier names by
+address only, and for the unmined built-in first-person camera (the Lua side is all there). Running its decompiler on
+our install is Tefa's call. Also seen: `CosmicMatt/PsychonautsFix`, a d3d9 hook DLL (XInput, borderless window); a
+player running it beside our proxy may clash `[hypothesis]`. From `/gr` 2026-10-26, topic
+`external-research/topics/2026-10-26-a-matching-decomp-with-every-lua-script.md`.
+
+## 2026-10-29 - the camera block at +0x150 is a view-projection, and head-follow broke its depth constant
+
+Measured live in Sasha's Lab: the 4x4 at camera `+0x150` is world-to-CLIP, columns c0..c3 = clip x, y, z, w;
+`c2 = A*c3` and `row3[2] = A*row3[3] + B` with A = 1.0002, B = -10.002 (zn 10, zf 50000) `[measured 2026-10-29]`.
+Only c2 has a constant. Head-follow solved the camera origin with c2 and so took 10 off w for every vertex even at
+zero yaw: that was the 2026-09-10 "crazy glitchy". Fixed by solving from c0, c1, c3 and keeping each column's
+constant; reproduced and cleared on the OpenXR Simulator `[verified-live 2026-10-29, n=1 launch]`. Notes/79.
+Also: a 32-bit OpenXR game fails `xrCreateInstance` (-32) when 64-bit implicit API layers are registered; switch them
+off with their `disable_environment` variables (notes/79 §1).

@@ -121,8 +121,87 @@ static void suite(float yaw)
     expect(r.lost > FRAMES / 2 && r.late > FRAMES / 2, "OVERWRITE is counted as lost in the pass");
 }
 
+/* 2026-10-29: the REAL block, dumped live in Sasha's Lab (camera +0x150, rows r0..r3). It is a
+ * view-projection: c2 = A*c3 and row3[2] = A*row3[3] + B (A 1.0002, B -10.002). The 2026-10-08 model
+ * engines above had no such constant, which is why they passed while the game shredded. */
+static const float kLab[4][4] = {
+    { -1.3317f,    -0.2480f,    -0.4852f,   -0.4851f },
+    { -0.0000f,     1.9894f,    -0.2420f,   -0.2419f },
+    { -0.7689f,     0.4296f,     0.8405f,    0.8403f },
+    { -16.3133f, -1678.7822f,  2995.0203f, 3004.4211f },
+};
+
+static float cell(int row, int col)
+{
+    return *(float *)(g_cam + PSY_CAM_BASIS_OFF + row * PSY_CAM_BASIS_RSTRIDE + col * 4);
+}
+
+static float clip(int col, const double p[3])   /* clip coordinate `col` of world point p */
+{
+    return (float)(p[0] * cell(0, col) + p[1] * cell(1, col) + p[2] * cell(2, col) + cell(3, col));
+}
+
+static void real_block(void)
+{
+    double eye[3], a[3][3], b[3], det;
+    const int cols[3] = { 0, 1, 3 };
+    float before[4][4], B0;
+    int r, c, i;
+    memset(g_cam, 0, sizeof g_cam);
+    for (r = 0; r < 4; r++)
+        for (c = 0; c < 4; c++)
+            *(float *)(g_cam + PSY_CAM_BASIS_OFF + r * PSY_CAM_BASIS_RSTRIDE + c * 4) = kLab[r][c];
+    /* The eye is where clip x = y = w = 0; solved here by Cramer's rule, independently of the proxy. */
+    for (i = 0; i < 3; i++) {
+        for (r = 0; r < 3; r++) a[i][r] = kLab[r][cols[i]];
+        b[i] = -kLab[3][cols[i]];
+    }
+    det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    for (i = 0; i < 3; i++) {
+        double m[3][3]; int k;
+        for (r = 0; r < 3; r++) for (k = 0; k < 3; k++) m[r][k] = (k == i) ? b[r] : a[r][k];
+        eye[i] = (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+               + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+    }
+    for (r = 0; r < 4; r++) for (c = 0; c < 4; c++) before[r][c] = cell(r, c);
+
+    g_basisSnapValid = g_basisLastWriteValid = 0;
+    PsyBasisSnapshot(g_cam);
+    PsyApplyBasisYaw(g_cam, 0.0f);
+    {
+        float worst = 0;
+        for (r = 0; r < 4; r++) for (c = 0; c < 4; c++) {
+            float d = fabsf(cell(r, c) - before[r][c]);
+            if (d > worst) worst = d;
+        }
+        printf("real block, yaw 0: largest change %.5f (w at the eye %.4f)\n", worst, clip(3, eye));
+        expect(worst < 0.01f, "real block: zero yaw writes back what the engine had");
+    }
+    {
+        float A0 = sqrtf(before[0][2] * before[0][2] + before[1][2] * before[1][2] + before[2][2] * before[2][2])
+                 / sqrtf(before[0][3] * before[0][3] + before[1][3] * before[1][3] + before[2][3] * before[2][3]);
+        B0 = before[3][2] - A0 * before[3][3];
+    }
+    for (i = 0; i < 2; i++) {
+        float yaw = i ? -20.0f : 20.0f, A, Bc;
+        PsyApplyBasisYaw(g_cam, yaw);
+        A = sqrtf(cell(0, 2) * cell(0, 2) + cell(1, 2) * cell(1, 2) + cell(2, 2) * cell(2, 2))
+          / sqrtf(cell(0, 3) * cell(0, 3) + cell(1, 3) * cell(1, 3) + cell(2, 3) * cell(2, 3));
+        Bc = cell(3, 2) - A * cell(3, 3);
+        printf("real block, yaw %+.0f: eye stays at x %.3f y %.3f w %.3f; depth constant %.3f\n",
+               yaw, clip(0, eye), clip(1, eye), clip(3, eye), Bc);
+        expect(fabsf(clip(0, eye)) < 0.05f && fabsf(clip(1, eye)) < 0.05f && fabsf(clip(3, eye)) < 0.05f,
+               "real block: turning keeps the camera where it is");
+        /* Measured against the same calculation on the untouched block: the dump has four decimals, so
+         * A (and with it B) is only good to about 0.2 here; what matters is that the turn keeps it. */
+        expect(fabsf(Bc - B0) < 0.05f, "real block: the depth constant survives the turn");
+    }
+}
+
 int main(void)
 {
+    real_block();
     suite(HEAD_YAW);
     suite(-HEAD_YAW);         /* a left turn must read as toward the head too */
     g_upSign = -1.0f;         /* and a level whose up column points down */

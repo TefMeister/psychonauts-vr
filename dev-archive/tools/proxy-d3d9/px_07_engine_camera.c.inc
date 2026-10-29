@@ -420,15 +420,26 @@ static int   g_basisLastWriteValid = 0;
  * wrecked by 15+, and completely unaffected by preserving column magnitudes.
  *
  * O is SOLVED from the engine's own basis and row 3 rather than assumed from
- * camera position, so no handedness or Y-flip convention has to be guessed. */
+ * camera position, so no handedness or Y-flip convention has to be guessed.
+ *
+ * ⚠️ 2026-10-29: NOT FROM c2. The block is a view-PROJECTION matrix and c2 is
+ * the depth column, which carries the projection's own constant:
+ * c2 = A*c3 and row3[2] = A*row3[3] + B, measured A = 1.0002, B = -10.002
+ * (zn 10, zf 50000) [measured 2026-10-29]. Solving with c2 put O about 10 units
+ * off along the view (the "few units" above), and rewriting row3[3] from that O
+ * shrank w by 10 for every vertex, even at zero yaw: near geometry (Raz, the
+ * floor) shredded. That was the 2026-09-10 "crazy glitchy" after camfollow 1,
+ * reproduced on the simulator 2026-10-29. So solve from c0, c1, c3 (no
+ * constant), and PsyApplyBasisYaw keeps every column's constant. */
 static int PsySolveOrigin(void)
 {
-    /* Solve M O = t, where the rows of M are c0, c1, c2. */
+    /* Solve M O = t, where the rows of M are c0, c1, c3. */
+    static const int kCols[3] = { 0, 1, 3 };
     double m[3][4], f;
     int i, j, r, p;
     for (i = 0; i < 3; i++) {
-        for (j = 0; j < 3; j++) m[i][j] = g_basisSnap[i][j];
-        m[i][3] = g_basisSnapT[i];
+        for (j = 0; j < 3; j++) m[i][j] = g_basisSnap[kCols[i]][j];
+        m[i][3] = g_basisSnapT[kCols[i]];
     }
     for (i = 0; i < 3; i++) {
         p = i;
@@ -522,10 +533,15 @@ static void PsyApplyBasisYaw(void *cam, float deg)
         *(float *)(B + 1 * PSY_CAM_BASIS_RSTRIDE + col * 4) = ny;
         *(float *)(B + 2 * PSY_CAM_BASIS_RSTRIDE + col * 4) = nz;
         /* Row 3 must follow: row3[col] = dot(origin, rotated column). Leaving it
-         * on the OLD axes is what wrecked every angle above ~5 degrees. */
+         * on the OLD axes is what wrecked every angle above ~5 degrees. Written
+         * as the snapshot's own row 3 plus the change, so the depth column's
+         * projection constant survives and zero yaw writes back exactly what
+         * the engine had. */
         if (g_basisOriginOk)
             *(float *)(B + 3 * PSY_CAM_BASIS_RSTRIDE + col * 4) =
-                g_basisOrigin[0] * nx + g_basisOrigin[1] * ny + g_basisOrigin[2] * nz;
+                g_basisSnapT[col] + g_basisOrigin[0] * (nx - g_basisSnap[col][0])
+                                  + g_basisOrigin[1] * (ny - g_basisSnap[col][1])
+                                  + g_basisOrigin[2] * (nz - g_basisSnap[col][2]);
         g_basisLastWrite[col][0] = nx;
         g_basisLastWrite[col][1] = ny;
         g_basisLastWrite[col][2] = nz;
