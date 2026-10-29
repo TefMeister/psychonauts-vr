@@ -1,0 +1,60 @@
+[2026-10-29 17:07:50.619] xr: ON - headset thread started (own D3D11 device, projection layers, CPU handover)
+[2026-10-29 17:07:50.620] xr: runtime for this game only: D:\claude video game stuff\tools\OpenXR-Simulator\openxr_simulator-32.json
+[2026-10-29 17:07:50.787] xr: controllers ON: grip and aim poses asked for every frame (5 of 5 controller families accepted, 5 with buttons and sticks)
+[2026-10-29 17:07:50.787] xr: session created on the headset thread's own D3D11 device; waiting for the runtime to start it
+[2026-10-29 17:07:50.825] xr: session running
+[2026-10-29 17:08:02.952] xr: two 1280x960 eye swapchains, format 91
+[2026-10-29 17:08:02.979] xr: 1 headset frames submitted
+[2026-10-29 17:08:17.915] xr: 900 headset frames submitted
+[2026-10-29 17:08:18.632] Auto: BEGIN "level CAJA"
+[2026-10-29 17:08:18.632] Auto: END   "level CAJA" -> SetPendingLevel("workresource\levels\CAJA.plb")
+[2026-10-29 17:08:32.916] xr: 1800 headset frames submitted
+[2026-10-29 17:08:47.617] xr: 2700 headset frames submitted
+[2026-10-29 17:09:02.616] xr: 3600 headset frames submitted
+[2026-10-29 17:09:12.496] Auto: BEGIN "camfollow 1"
+[2026-10-29 17:09:12.496] Auto: END   "camfollow 1" -> camera follows head = 1 (scale 1.00, head yaw now 0.0 deg)
+[2026-10-29 17:09:12.501] CAMBASIS snapshot: origin solved (-1265.00 -1317.00 1607.00)
+[2026-10-29 17:09:14.495] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:16.513] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:17.503] xr: 4500 headset frames submitted
+[2026-10-29 17:09:18.512] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:20.561] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:22.647] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:24.665] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:26.682] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 1 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:28.682] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:30.273] CAMBASIS snapshot: origin solved (-1349.55 -1521.31 2358.56)
+[2026-10-29 17:09:30.369] CAMBASIS snapshot: origin solved (-995.00 -1374.00 1488.00)
+[2026-10-29 17:09:30.699] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 3 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:32.389] xr: 5400 headset frames submitted
+[2026-10-29 17:09:32.750] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 2 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:34.750] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 2 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:36.766] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:38.783] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 2 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:39.234] Auto: BEGIN "camhold 1"
+[2026-10-29 17:09:39.234] Auto: END   "camhold 1" -> camhold=1 target 962.0 1321.0 -1606.0
+[2026-10-29 17:09:40.783] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 1 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:42.803] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 82 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:44.810] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 0.0 deg; engine rewrote the camera between frames 120 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:46.810] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 21.5 deg; engine rewrote the camera between frames 37 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:47.310] xr: 6300 headset frames submitted
+[2026-10-29 17:09:48.814] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 1 times; its own camera turned 0.0 deg TOWARD the head's side, 118.1 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:51.245] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:53.410] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 1 times; its own camera turned 121.1 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:55.416] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:56.003] CAMBASIS snapshot: origin solved (-1349.36 -1521.31 2358.38)
+[2026-10-29 17:09:56.020] CAMBASIS snapshot: origin solved (-958.74 -1331.02 1591.71)
+[2026-10-29 17:09:57.415] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 15 times; its own camera turned 25.5 deg TOWARD the head's side, 155.7 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:09:59.415] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:01.560] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:01.831] xr: 7200 headset frames submitted
+[2026-10-29 17:10:03.562] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:05.679] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:07.729] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:09.750] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 35 times; its own camera turned 0.0 deg TOWARD the head's side, 19.5 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:11.764] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 90 times; its own camera turned 0.0 deg TOWARD the head's side, 18.4 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:13.763] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 94 times; its own camera turned 0.7 deg TOWARD the head's side, 0.7 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:15.780] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:16.736] xr: 8100 headset frames submitted
+[2026-10-29 17:10:17.780] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
+[2026-10-29 17:10:19.815] CAMFOLLOW stats (restore 1): 120 frames, mean |yaw| 30.0 deg; engine rewrote the camera between frames 0 times; its own camera turned 0.0 deg TOWARD the head's side, 0.0 away; rewritten during eye 1's pass 0; restored 120, engine had already replaced it 0
