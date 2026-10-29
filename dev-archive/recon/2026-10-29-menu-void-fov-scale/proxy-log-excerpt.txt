@@ -1,0 +1,8 @@
+﻿[2026-10-29 17:19:36.226] VRBridge: FOV scale = 1.00 (PSYVR_FOV_SCALE, 0.5..4.0 - ceiling raised from 2.5 for notes/59's void-test headroom; 1.0 = game default)
+[2026-10-29 17:19:38.304] BPM cache SET: rawFov=104.000 aspect=1.3333 fovy=0.9076 xScale=1.5377 zn=10.000 zf=50000.000
+[2026-10-29 17:19:49.901] BPM cache SET: rawFov=104.000 aspect=1.3333 fovy=0.9076 xScale=1.5377 zn=10.000 zf=50000.000
+[2026-10-29 17:19:51.893] BPM cache SET: rawFov=104.000 aspect=1.3333 fovy=0.9076 xScale=1.5377 zn=10.000 zf=50000.000
+[2026-10-29 17:20:35.729] VRBridge: FOV scale = 3.00 (PSYVR_FOV_SCALE, 0.5..4.0 - ceiling raised from 2.5 for notes/59's void-test headroom; 1.0 = game default)
+[2026-10-29 17:20:37.583] BPM cache SET: rawFov=312.000 aspect=1.3333 fovy=2.7227 xScale=0.1594 zn=10.000 zf=50000.000
+[2026-10-29 17:20:49.411] BPM cache SET: rawFov=312.000 aspect=1.3333 fovy=2.7227 xScale=0.1594 zn=10.000 zf=50000.000
+[2026-10-29 17:20:51.402] BPM cache SET: rawFov=312.000 aspect=1.3333 fovy=2.7227 xScale=0.1594 zn=10.000 zf=50000.000
