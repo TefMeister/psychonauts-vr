@@ -1,6 +1,8 @@
 # Research index
 
-**Last `/gr` pass: 2026-10-26 (estate sweep) — CHECK-IN.** Inbox empty. New public decompilation of the Steam exe (all Lua scripts byte-matched, ~30 % of engine functions) for the first-person goal, plus PsychonautsFix, a d3d9 hook that may clash with our proxy; one topic, pointer sent to the dossier.
+**Last `/gr` pass: 2026-11-07 (estate sweep) — CHECK-IN.** Inbox empty; one search found no fan VR mod (only the official Rhombus of Ruin); DrDecki's decomp last moved 2026-10-26 (README and one merged PR) and PsychonautsFix is unchanged since 2026-10-03. Nothing new.
+
+_Previous: **Last `/gr` pass: 2026-10-26 (estate sweep) — CHECK-IN.** Inbox empty. New public decompilation of the Steam exe (all Lua scripts byte-matched, ~30 % of engine functions) for the first-person goal, plus PsychonautsFix, a d3d9 hook that may clash with our proxy; one topic, pointer sent to the dossier._
 
 _Previous: **Last `/gr` pass: 2026-10-04 (estate sweep, second pass) — CHECK-IN.** Inbox empty; board `OPEN` rows read: install bookkeeping and a code-shape decision. Nothing new._
 
